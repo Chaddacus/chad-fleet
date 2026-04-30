@@ -242,12 +242,15 @@ version = "0.1.0"
 source = { editable = "apps/chad-captain" }
 dependencies = [
     { name = "captain-core" },
+    { name = "fastapi" },
     { name = "fastmcp" },
+    { name = "httpx" },
     { name = "notifier-hub-core" },
     { name = "notifier-hub-dashboard-inbox" },
     { name = "notifier-hub-ntfy" },
     { name = "pydantic" },
     { name = "state-aggregator" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -259,7 +262,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "captain-core", editable = "packages/captain-core" },
+    { name = "fastapi", specifier = ">=0.110" },
     { name = "fastmcp", specifier = ">=0.2" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "notifier-hub-core", editable = "packages/notifier-hub/core" },
     { name = "notifier-hub-dashboard-inbox", editable = "packages/notifier-hub/adapters/dashboard-inbox" },
     { name = "notifier-hub-ntfy", editable = "packages/notifier-hub/adapters/ntfy" },
@@ -267,6 +272,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "state-aggregator", editable = "packages/state-aggregator" },
+    { name = "uvicorn", specifier = ">=0.27" },
 ]
 provides-extras = ["dev"]
 

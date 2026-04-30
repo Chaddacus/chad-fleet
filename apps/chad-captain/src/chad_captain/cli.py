@@ -91,6 +91,128 @@ def cmd_actions(args: argparse.Namespace) -> None:
         print(f"   {a.rationale}")
 
 
+def cmd_tick(args: argparse.Namespace) -> None:
+    """Run one captain_tick for an app — what launchd invokes daily.
+
+    For observe_only apps we run the *validation* half of the tick (so any
+    slice_complete written by an external workflow gets processed) but
+    skip dispatching new slices into current_slice.json — the admiral
+    drives changes manually for those apps.
+    """
+    from chad_captain.apps_registry import load_registry
+    from chad_captain.protocol import AppWorkspace
+    from chad_captain.validator import captain_tick
+
+    reg = load_registry()
+    app = reg.by_id(args.app)
+    repo = args.repo or (app.repo_path if app else None)
+    if not repo:
+        print(f"Unknown app {args.app!r} and no --repo provided", file=sys.stderr)
+        sys.exit(2)
+
+    mode = (app.mode if app else "autonomous")
+    ws = AppWorkspace(args.app)
+    ws.ensure()
+
+    if mode == "observe_only":
+        # Validation only: process completion if present, no dispatch and no replan.
+        from chad_captain.protocol import read_slice_complete
+        if read_slice_complete(ws) is None:
+            # Cheapest signal of life: refresh scorecard + ensure roadmap exists.
+            from chad_captain.replanner import replan_if_needed
+            new_rm = replan_if_needed(ws, repo)
+            print(f"[{args.app}] observe_only: " + (
+                f"replanned ({len(new_rm.slices)} slices)" if new_rm else "idle"
+            ))
+            return
+        # If a completion exists, run only the validate half — pass auto_replan=False
+        # and pre-clear roadmap dispatch by leaving current_slice on file.
+        status = captain_tick(ws, repo_path=repo, auto_replan=False)
+        print(f"[{args.app}] observe_only: {status or 'idle'}")
+        return
+
+    status = captain_tick(ws, repo_path=repo, auto_replan=not args.no_replan)
+    print(f"[{args.app}] {status or 'idle'}")
+
+
+def cmd_register(args: argparse.Namespace) -> None:
+    from chad_captain.apps_registry import (
+        RegisteredApp,
+        load_registry,
+        save_registry,
+        seed_default_registry,
+    )
+
+    if args.seed_defaults:
+        reg = seed_default_registry(force=args.force)
+        print(f"Seeded {len(reg.apps)} apps:")
+        for a in reg.apps:
+            print(f"  {a.app_id} → {a.repo_path} ({a.mode}, {a.schedule_hour}:00 {a.schedule_tz})")
+        return
+
+    if not args.app or not args.repo:
+        print("--app and --repo are required (or use --seed-defaults)", file=sys.stderr)
+        sys.exit(2)
+
+    reg = load_registry()
+    app = RegisteredApp(
+        app_id=args.app,
+        name=args.name or args.app,
+        repo_path=args.repo,
+        mode=args.mode,
+        schedule_hour=args.hour,
+        schedule_tz=args.tz,
+        notes=args.notes,
+    )
+    reg.upsert(app)
+    save_registry(reg)
+    print(f"Registered {app.app_id} ({app.mode}); registry has {len(reg.apps)} apps total.")
+
+
+def cmd_install_plists(args: argparse.Namespace) -> None:
+    from pathlib import Path as _Path
+
+    from chad_captain.apps_registry import load_registry
+    from chad_captain.launchd import bootstrap_command, render_plist, write_plist
+
+    reg = load_registry()
+    if not reg.apps:
+        print("No apps registered yet. Run `chad-captain register --seed-defaults` first.")
+        sys.exit(1)
+    target = _Path(args.target_dir).expanduser() if args.target_dir else None
+    for app in reg.apps:
+        if args.dry_run:
+            print(f"=== {app.app_id} ===")
+            print(render_plist(app))
+            continue
+        path = write_plist(app, target_dir=target)
+        print(f"Wrote {path}")
+        print("  Bootstrap with:")
+        print("    " + " ".join(bootstrap_command(app)))
+
+
+def cmd_init_workspace(args: argparse.Namespace) -> None:
+    """Scaffold the per-app workspace and (optionally) bootstrap a roadmap."""
+    from chad_captain.apps_registry import load_registry
+    from chad_captain.protocol import AppWorkspace
+
+    reg = load_registry()
+    apps_to_init = [reg.by_id(args.app)] if args.app else reg.apps
+    apps_to_init = [a for a in apps_to_init if a is not None]
+    if not apps_to_init:
+        print("No matching app in registry.", file=sys.stderr)
+        sys.exit(1)
+    for app in apps_to_init:
+        ws = AppWorkspace(app.app_id)
+        ws.ensure()
+        print(f"Initialized workspace for {app.app_id} at {ws.root}")
+        if args.replan:
+            from chad_captain.replanner import replan
+            roadmap = replan(ws, app.repo_path, trigger="initial",
+                              use_llm=not args.no_llm)
+            print(f"  Wrote initial roadmap: {len(roadmap.slices)} slices")
+
+
 def cmd_replan(args: argparse.Namespace) -> None:
     from chad_captain.protocol import AppWorkspace
     from chad_captain.replanner import replan
@@ -198,6 +320,42 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("status", help="Print scheduler and fleet status as JSON")
 
+    tick_p = sub.add_parser("tick", help="Run one captain_tick for an app")
+    tick_p.add_argument("--app", required=True, metavar="APP_ID")
+    tick_p.add_argument("--repo", default=None,
+                         help="Repo path; defaults to registry entry")
+    tick_p.add_argument("--no-replan", action="store_true",
+                         help="Disable auto-replan when roadmap is exhausted")
+
+    register_p = sub.add_parser("register", help="Register an app in the captain registry")
+    register_p.add_argument("--app", default=None, metavar="APP_ID")
+    register_p.add_argument("--repo", default=None, metavar="PATH")
+    register_p.add_argument("--name", default=None)
+    register_p.add_argument("--mode", default="observe_only",
+                             choices=("autonomous", "observe_only"))
+    register_p.add_argument("--hour", type=int, default=9)
+    register_p.add_argument("--tz", default="America/New_York")
+    register_p.add_argument("--notes", default="")
+    register_p.add_argument("--seed-defaults", action="store_true",
+                             help="Write the Spark + author-toolkit default seeds")
+    register_p.add_argument("--force", action="store_true",
+                             help="With --seed-defaults: overwrite existing registry")
+
+    install_p = sub.add_parser("install-plists",
+                                help="Generate launchd plists for registered apps")
+    install_p.add_argument("--target-dir", default=None,
+                            help="Override target dir (default: ~/Library/LaunchAgents)")
+    install_p.add_argument("--dry-run", action="store_true",
+                            help="Print plist contents instead of writing")
+
+    init_p = sub.add_parser("init-workspace",
+                             help="Scaffold per-app workspace and optional initial roadmap")
+    init_p.add_argument("--app", default=None,
+                         help="Specific app to init (defaults to all registered)")
+    init_p.add_argument("--replan", action="store_true",
+                         help="After init, run the replanner")
+    init_p.add_argument("--no-llm", action="store_true")
+
     replan_p = sub.add_parser("replan", help="Run the replanner and write a fresh roadmap")
     replan_p.add_argument("--app", required=True, metavar="APP_ID")
     replan_p.add_argument("--repo", required=True, metavar="PATH")
@@ -231,6 +389,10 @@ def main(argv: list[str] | None = None) -> None:
         "status": cmd_status,
         "research": cmd_research,
         "replan": cmd_replan,
+        "tick": cmd_tick,
+        "register": cmd_register,
+        "install-plists": cmd_install_plists,
+        "init-workspace": cmd_init_workspace,
     }
     dispatch[args.command](args)
 
