@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+.env
+*.env
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+htmlcov/
+
+# Node / JS
+node_modules/
+.next/
+.nuxt/
+.output/
+dist/
+*.tsbuildinfo
+.npm
+.eslintcache
+.parcel-cache
+.turbo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.DocumentRevisions-V100
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.direnv/
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+secrets/
+
+# Playwright probe artifacts (host-local, captured per-run)
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Logs
+*.log
+logs/

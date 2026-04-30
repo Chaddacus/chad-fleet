@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "notifier-hub-email"
+version = "0.0.0"
+description = "Notifier adapter: sends events as email via SMTP"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.5",
+    "notifier-hub-core",
+]
+
+[tool.uv.sources]
+notifier-hub-core = { path = "../../core", editable = true }
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/notifier_hub_email"]

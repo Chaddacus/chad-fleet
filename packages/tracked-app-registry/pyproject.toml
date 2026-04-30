@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracked-app-registry"
+version = "0.0.0"
+description = "Registry of apps and agents Chad is monitoring or managing"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.5",
+    "fastmcp>=0.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+tracked-app-registry = "tracked_app_registry.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracked_app_registry"]

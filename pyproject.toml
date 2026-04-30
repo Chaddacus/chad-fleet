@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chad-fleet"
+version = "0.0.0"
+description = "Monorepo root — not a publishable package"
+requires-python = ">=3.11"
+
+# uv workspace: include all Python packages under packages/ and apps/
+[tool.uv.workspace]
+members = [
+    "packages/tracked-app-registry",
+    "packages/voice-drafter",
+    "packages/state-aggregator",
+    "packages/notifier-hub/core",
+    "packages/notifier-hub/adapters/dashboard-inbox",
+    "packages/notifier-hub/adapters/ntfy",
+    "packages/notifier-hub/adapters/email",
+    "packages/captain-core",
+    "apps/chad-captain",
+]
