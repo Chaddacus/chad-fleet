@@ -12,6 +12,7 @@ const navLinks = [
   { href: '/inbox', label: 'Inbox' },
   { href: '/apps', label: 'Apps' },
   { href: '/views', label: 'Views' },
+  { href: '/captain', label: 'Captain' },
 ];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -22,12 +22,14 @@ at least a roadmap.json or current_slice.json.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from chad_captain.apps_registry import load_registry
 from chad_captain.extras import get_extras
 from chad_captain.protocol import (
     AdmiralNote,
@@ -117,20 +119,34 @@ def create_app() -> FastAPI:
 
     @app.get("/apps")
     def apps() -> dict:
-        ids = _list_app_ids()
-        return {
-            "count": len(ids),
-            "apps": [{"app_id": app_id} for app_id in ids],
-        }
+        """List apps. Merges filesystem-discovered IDs with the registry so
+        the dashboard sees registered-but-not-yet-scaffolded apps too."""
+        fs_ids = _list_app_ids()
+        reg = load_registry()
+        reg_ids = {a.app_id for a in reg.apps}
+        all_ids = sorted(set(fs_ids) | reg_ids)
+        out: list[dict] = []
+        for app_id in all_ids:
+            entry = reg.by_id(app_id)
+            out.append({
+                "app_id": app_id,
+                "name": entry.name if entry else app_id,
+                "mode": entry.mode if entry else "autonomous",
+                "repo_path": entry.repo_path if entry else None,
+                "schedule_hour": entry.schedule_hour if entry else None,
+            })
+        return {"count": len(out), "apps": out}
 
-    @app.get("/apps/{app_id}")
-    def app_state(app_id: str) -> dict[str, Any]:
-        ws = _ws_or_404(app_id)
-        roadmap = read_roadmap(ws)
-        current = read_current_slice(ws)
-        log = read_captain_log(ws, limit=20)
-        unread = [p.name for p in list_unread_admiral_notes(ws)]
-        # Slice progress (best-effort tail of last 10 progress events)
+    def _bundle(app_id: str, *, include_scorecard: bool = True) -> dict[str, Any]:
+        """Build the full per-app state bundle. Optionally attaches the live
+        scorecard when the app's repo_path is registered. Tolerates apps
+        that exist in the registry but haven't been scaffolded yet — those
+        return a bundle with empty roadmap/log/progress."""
+        ws = AppWorkspace(app_id)
+        roadmap = read_roadmap(ws) if ws.root.exists() else None
+        current = read_current_slice(ws) if ws.root.exists() else None
+        log = read_captain_log(ws, limit=20) if ws.root.exists() else []
+        unread = [p.name for p in list_unread_admiral_notes(ws)] if ws.root.exists() else []
         progress_tail: list[dict] = []
         if ws.progress_path.exists():
             for line in ws.progress_path.read_text().splitlines()[-10:]:
@@ -140,13 +156,57 @@ def create_app() -> FastAPI:
                         progress_tail.append(json.loads(line))
                     except Exception:
                         continue
-        return {
+        reg = load_registry()
+        entry = reg.by_id(app_id)
+        bundle: dict[str, Any] = {
             "app_id": app_id,
+            "name": entry.name if entry else app_id,
+            "mode": entry.mode if entry else "autonomous",
+            "repo_path": entry.repo_path if entry else None,
             "current_slice": current.model_dump(mode="json") if current else None,
             "roadmap": roadmap.model_dump(mode="json") if roadmap else None,
             "captain_log_tail": [e.model_dump(mode="json") for e in log],
             "progress_tail": progress_tail,
             "unread_admiral_notes": unread,
+            "scorecard": None,
+        }
+        if include_scorecard and entry and entry.repo_path and Path(entry.repo_path).exists():
+            try:
+                sc = score_repo(entry.repo_path, extras=get_extras(app_id))
+                bundle["scorecard"] = sc.model_dump(mode="json")
+            except Exception as e:
+                logger.warning("inline scorecard for %s failed: %s", app_id, e)
+        return bundle
+
+    @app.get("/apps/{app_id}")
+    def app_state(app_id: str) -> dict[str, Any]:
+        # 404 if neither the filesystem nor the registry knows this app.
+        reg = load_registry()
+        if app_id not in _list_app_ids() and reg.by_id(app_id) is None:
+            raise HTTPException(404, f"unknown app: {app_id}")
+        return _bundle(app_id, include_scorecard=True)
+
+    @app.get("/fleet")
+    def fleet() -> dict[str, Any]:
+        """One-shot bundle for the dashboard L1 view. Returns every registered
+        app with its full state + scorecard so the dashboard can render
+        without N+1 fetches."""
+        reg = load_registry()
+        fs_ids = _list_app_ids()
+        all_ids = sorted({a.app_id for a in reg.apps} | set(fs_ids))
+        bundles: list[dict[str, Any]] = []
+        for app_id in all_ids:
+            try:
+                bundles.append(_bundle(app_id, include_scorecard=True))
+            except HTTPException:
+                continue
+            except Exception as e:
+                logger.warning("fleet bundle for %s failed: %s", app_id, e)
+                bundles.append({"app_id": app_id, "error": str(e)})
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "count": len(bundles),
+            "apps": bundles,
         }
 
     @app.get("/apps/{app_id}/roadmap")

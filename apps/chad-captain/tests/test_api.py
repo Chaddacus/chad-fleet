@@ -27,6 +27,8 @@ def fleet_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     base = tmp_path / "fleet"
     base.mkdir()
     monkeypatch.setenv("CHAD_FLEET_APPS_DIR", str(base))
+    # Isolate the apps registry so tests don't pick up the real ~/.chad/captain/apps_registry.json.
+    monkeypatch.setenv("CHAD_CAPTAIN_APPS_REGISTRY", str(tmp_path / "captain" / "apps_registry.json"))
     return base
 
 
@@ -68,6 +70,9 @@ def test_apps_list_discovers_workspace_with_roadmap(client: TestClient, ws: AppW
     body = r.json()
     assert body["count"] == 1
     assert body["apps"][0]["app_id"] == "alpha"
+    # Enriched fields when registry doesn't know the app
+    assert body["apps"][0]["mode"] == "autonomous"
+    assert body["apps"][0]["repo_path"] is None
 
 
 def test_apps_list_discovers_workspace_with_admiral_notes_only(
@@ -77,6 +82,22 @@ def test_apps_list_discovers_workspace_with_admiral_notes_only(
     r = client.get("/apps")
     body = r.json()
     assert body["count"] == 1
+
+
+def test_fleet_endpoint_returns_bundles(client: TestClient, ws: AppWorkspace) -> None:
+    write_roadmap(ws, Roadmap(app_id=ws.app_id, slices=[
+        RoadmapSlice(slice_id="s1", objective="o", status="queued"),
+    ]))
+    r = client.get("/fleet")
+    assert r.status_code == 200
+    body = r.json()
+    assert "generated_at" in body
+    assert body["count"] == 1
+    bundle = body["apps"][0]
+    assert bundle["app_id"] == "alpha"
+    assert bundle["roadmap"]["slices"][0]["slice_id"] == "s1"
+    # Scorecard is None because no repo_path is registered
+    assert bundle["scorecard"] is None
 
 
 # ---------------------------------------------------------------------------
