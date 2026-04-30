@@ -234,9 +234,22 @@ def captain_tick(
     ws: AppWorkspace,
     *,
     repo_path: str,
-    score_delta: Callable[[CurrentSlice, SliceComplete], float | None] = _no_score_delta,
+    score_delta: Callable[[CurrentSlice, SliceComplete], float | None] | None = None,
+    use_baseline_scorecard: bool = True,
 ) -> str | None:
-    """One captain tick for one app. Returns a one-line status for logs."""
+    """One captain tick for one app. Returns a one-line status for logs.
+
+    If ``score_delta`` is None and ``use_baseline_scorecard`` is True (default),
+    we use a baseline-scorecard adapter: pre-slice snapshot is written at
+    dispatch, post-slice score is computed at validate, delta is in pp.
+    """
+    if score_delta is None:
+        if use_baseline_scorecard:
+            from chad_captain.scorecard import make_baseline_score_delta
+            score_delta = make_baseline_score_delta(ws.slice_baseline_path, repo_path)
+        else:
+            score_delta = _no_score_delta
+
     # 1. Validate any pending completion.
     completion = read_slice_complete(ws)
     if completion is not None:
@@ -289,6 +302,9 @@ def captain_tick(
             ),
         )
         clear_slice_complete(ws)
+        # Baseline snapshot was specific to this completed slice — drop it.
+        from chad_captain.scorecard import clear_baseline
+        clear_baseline(ws.slice_baseline_path)
 
         # Retry path — we re-queue the slice in advance_roadmap, so the
         # next dispatch step picks it up automatically.
@@ -317,6 +333,15 @@ def captain_tick(
             parent_slice_id=parent_id,
         )
         write_current_slice(ws, new_slice)
+
+        # Snapshot pre-slice scorecard so we can compute a real delta when
+        # the slice completes. Best-effort — failures shouldn't block dispatch.
+        if use_baseline_scorecard:
+            try:
+                from chad_captain.scorecard import score_repo, write_baseline
+                write_baseline(ws.slice_baseline_path, score_repo(repo_path))
+            except Exception as e:
+                logger.warning("baseline scorecard write failed for %s: %s", ws.app_id, e)
 
         # Mark in-flight in roadmap.
         rs.status = "in_flight"

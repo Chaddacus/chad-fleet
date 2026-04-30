@@ -87,6 +87,12 @@ class AppWorkspace:
     def scorecard_history_path(self) -> Path:
         return self.root / "scorecard-history.jsonl"
 
+    @property
+    def slice_baseline_path(self) -> Path:
+        """Pre-slice scorecard snapshot. Captain writes at dispatch,
+        reads at validate to compute the rubric delta."""
+        return self.root / "slice_baseline.json"
+
     def ensure(self) -> None:
         """Create the workspace directory tree if missing."""
         for d in (

@@ -133,7 +133,9 @@ def test_tracer_three_slice_loop(tmp_path: Path) -> None:
     validates = [e for e in log if e.kind == "validate"]
     assert len(dispatches) == 3, f"got {len(dispatches)} dispatches: {[e.slice_id for e in dispatches]}"
     assert len(validates) == 3, f"got {len(validates)} validates"
-    assert all(v.verdict == "accept" for v in validates), [v.verdict for v in validates]
+    # Either accept (delta >= 0.5pp) or soft_accept (small positive delta) is OK —
+    # both close out the roadmap slice. Tiny test repos typically produce small deltas.
+    assert all(v.verdict in ("accept", "soft_accept") for v in validates), [v.verdict for v in validates]
 
     # Each slice should have a slice_started + slice_completing in progress.jsonl.
     progress_lines = ws.progress_path.read_text().splitlines()
@@ -213,6 +215,6 @@ def test_tracer_handles_failed_first_attempt_then_succeeds(tmp_path: Path) -> No
 
     log = read_captain_log(ws)
     verdicts = [e.verdict for e in log if e.kind == "validate"]
-    # Should see at least one reject_retry then an accept.
+    # Should see at least one reject_retry then a successful verdict (accept or soft_accept).
     assert "reject_retry" in verdicts, verdicts
-    assert "accept" in verdicts, verdicts
+    assert any(v in ("accept", "soft_accept") for v in verdicts), verdicts
