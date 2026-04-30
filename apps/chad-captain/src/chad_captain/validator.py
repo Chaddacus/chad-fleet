@@ -236,6 +236,7 @@ def captain_tick(
     repo_path: str,
     score_delta: Callable[[CurrentSlice, SliceComplete], float | None] | None = None,
     use_baseline_scorecard: bool = True,
+    auto_replan: bool = False,
 ) -> str | None:
     """One captain tick for one app. Returns a one-line status for logs.
 
@@ -321,10 +322,19 @@ def captain_tick(
     if not ws.current_slice_path.exists():
         roadmap = read_roadmap(ws)
         if roadmap is None:
-            return status or "no roadmap"
+            if auto_replan:
+                from chad_captain.replanner import replan
+                roadmap = replan(ws, repo_path, trigger="initial")
+            else:
+                return status or "no roadmap"
         rs = next_queued_slice(roadmap)
         if rs is None:
-            return (status + "; " if status else "") + "roadmap exhausted (replan needed)"
+            if auto_replan:
+                from chad_captain.replanner import replan
+                roadmap = replan(ws, repo_path, trigger="exhausted")
+                rs = next_queued_slice(roadmap)
+            if rs is None:
+                return (status + "; " if status else "") + "roadmap exhausted (replan needed)"
 
         # Detect retry: is this a re-queue of a slice we just rejected?
         log_tail = list(_recent_validate_for(ws, rs.slice_id, limit=5))
