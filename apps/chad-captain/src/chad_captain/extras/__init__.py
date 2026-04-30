@@ -1,0 +1,66 @@
+"""Per-app dimension overlays for the compliance rubric scorer.
+
+The baseline scorer in ``scorecard.py`` runs the same seven dimensions on
+every app. Each app *also* gets a small set of app-specific dimensions
+that capture what "good" looks like for *this* app — e.g. Spark of
+Defiance cares about chapter word counts and voice-guide presence,
+author-toolkit cares about TypeScript typecheck cleanliness.
+
+Registry pattern: each app maps to a list of callables
+``(repo: Path) -> DimensionScore``. The captain calls ``get_extras(app_id)``
+to fetch them and threads them into ``score_repo(repo, extras=...)``.
+
+Add new apps by importing their module and adding to ``EXTRAS_REGISTRY``.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+from chad_captain.scorecard import DimensionScore
+
+ExtraDimension = Callable[[Path], DimensionScore]
+
+# Lazy imports keep the registry cheap when only one app is being scored.
+def _spark_extras() -> list[ExtraDimension]:
+    from chad_captain.extras.spark import (
+        chapters_word_count_target,
+        voice_guide_intact,
+    )
+    return [voice_guide_intact, chapters_word_count_target]
+
+
+def _author_toolkit_extras() -> list[ExtraDimension]:
+    from chad_captain.extras.author_toolkit import (
+        sentinel_present,
+        typescript_typecheck_clean,
+    )
+    return [sentinel_present, typescript_typecheck_clean]
+
+
+def _captain_self_extras() -> list[ExtraDimension]:
+    from chad_captain.extras.captain_self import captain_test_count_growing
+    return [captain_test_count_growing]
+
+
+EXTRAS_FACTORIES: dict[str, Callable[[], list[ExtraDimension]]] = {
+    "spark-of-defiance": _spark_extras,
+    "spark": _spark_extras,
+    "author-toolkit": _author_toolkit_extras,
+    "author_toolkit": _author_toolkit_extras,
+    "captain-self": _captain_self_extras,
+}
+
+
+def get_extras(app_id: str) -> list[ExtraDimension]:
+    """Return registered extras for an app, or [] if none."""
+    factory = EXTRAS_FACTORIES.get(app_id)
+    return factory() if factory else []
+
+
+__all__ = [
+    "ExtraDimension",
+    "EXTRAS_FACTORIES",
+    "get_extras",
+]

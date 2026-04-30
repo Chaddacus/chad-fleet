@@ -245,8 +245,13 @@ def captain_tick(
     """
     if score_delta is None:
         if use_baseline_scorecard:
+            from chad_captain.extras import get_extras
             from chad_captain.scorecard import make_baseline_score_delta
-            score_delta = make_baseline_score_delta(ws.slice_baseline_path, repo_path)
+            score_delta = make_baseline_score_delta(
+                ws.slice_baseline_path,
+                repo_path,
+                extras=get_extras(ws.app_id),
+            )
         else:
             score_delta = _no_score_delta
 
@@ -338,8 +343,12 @@ def captain_tick(
         # the slice completes. Best-effort — failures shouldn't block dispatch.
         if use_baseline_scorecard:
             try:
+                from chad_captain.extras import get_extras
                 from chad_captain.scorecard import score_repo, write_baseline
-                write_baseline(ws.slice_baseline_path, score_repo(repo_path))
+                write_baseline(
+                    ws.slice_baseline_path,
+                    score_repo(repo_path, extras=get_extras(ws.app_id)),
+                )
             except Exception as e:
                 logger.warning("baseline scorecard write failed for %s: %s", ws.app_id, e)
 

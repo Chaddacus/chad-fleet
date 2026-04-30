@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from pydantic import BaseModel, Field
 
@@ -95,8 +95,15 @@ class Scorecard(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def score_repo(repo_path: str | Path) -> Scorecard:
-    """Score the repo against the seven baseline dimensions."""
+def score_repo(
+    repo_path: str | Path,
+    *,
+    extras: list[Callable[[Path], "DimensionScore"]] | None = None,
+) -> Scorecard:
+    """Score the repo against the seven baseline dimensions, plus any
+    app-specific ``extras`` (callables that take repo Path and return a
+    DimensionScore). Extras failing with an exception are surfaced as a
+    score=0 dimension named after the callable rather than swallowed."""
     repo = Path(repo_path).expanduser().resolve()
     if not repo.exists() or not repo.is_dir():
         # Empty/missing repo → all-zero scorecard with explanatory dim.
@@ -116,6 +123,17 @@ def score_repo(repo_path: str | Path) -> Scorecard:
         _dim_file_size_health(files),
         _dim_docs_present(repo),
     ]
+    if extras:
+        for fn in extras:
+            try:
+                dims.append(fn(repo))
+            except Exception as e:
+                logger.warning("extra dimension %s failed: %s", getattr(fn, "__name__", fn), e)
+                dims.append(DimensionScore(
+                    name=getattr(fn, "__name__", "extra_dimension"),
+                    score=0.0,
+                    rationale=f"extra dimension raised: {e}",
+                ))
     aggregate = sum(d.score for d in dims) / len(dims) if dims else 0.0
     return Scorecard(repo_path=str(repo), dimensions=dims, aggregate=aggregate)
 
@@ -358,11 +376,18 @@ def clear_baseline(path: Path) -> None:
         path.unlink()
 
 
-def make_baseline_score_delta(baseline_path: Path, repo_path: str | Path):
+def make_baseline_score_delta(
+    baseline_path: Path,
+    repo_path: str | Path,
+    *,
+    extras: list[Callable[[Path], DimensionScore]] | None = None,
+):
     """Return a ``score_delta`` callable for ``captain_tick``.
 
     Computes ``after - before`` where ``before`` is loaded from the cached
-    baseline at ``baseline_path`` and ``after`` is the live repo's score.
+    baseline at ``baseline_path`` and ``after`` is the live repo's score
+    (with the same ``extras`` applied so dimensions match).
+
     Returns ``None`` (so the validator falls back to its files-changed
     heuristic) if no baseline is on file.
     """
@@ -370,7 +395,7 @@ def make_baseline_score_delta(baseline_path: Path, repo_path: str | Path):
         before = read_baseline(baseline_path)
         if before is None:
             return None
-        after = score_repo(repo_path)
+        after = score_repo(repo_path, extras=extras)
         return score_delta(before, after)
 
     return _delta
