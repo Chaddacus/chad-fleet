@@ -10,6 +10,9 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.5",
     "fastmcp>=0.2",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
     "captain-core",
     "state-aggregator",
     "notifier-hub-core",
@@ -29,6 +32,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 chad-captain = "chad_captain.cli:main"
+chad-captain-api = "chad_captain.api:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chad_captain"]
