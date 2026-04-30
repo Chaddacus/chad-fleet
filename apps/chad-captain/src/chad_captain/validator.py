@@ -28,6 +28,7 @@ Replan triggers (caller — the daemon — handles these):
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
@@ -141,6 +142,75 @@ def validate_slice(
         verdict="soft_accept",
         rationale=f"low-yield rubric delta {delta:+.2f}pp",
         rubric_delta_pp=delta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-app verify gate (C1)
+# ---------------------------------------------------------------------------
+
+
+def run_verify_gate(
+    *,
+    repo_path: str,
+    verify_cmd: str | None,
+    timeout_seconds: int = 300,
+) -> tuple[bool, str]:
+    """Run the per-app verify command (e.g. 'make check', 'npm test').
+
+    Returns ``(passed, summary)`` — when ``verify_cmd`` is None/empty the gate
+    is skipped (passed=True). Tails stderr/stdout on failure so the captain
+    log captures *why* CI failed without dumping the full build log.
+    """
+    if not verify_cmd or not verify_cmd.strip():
+        return True, "no verify_cmd configured"
+    try:
+        proc = subprocess.run(  # noqa: S602 — operator-configured local cmd
+            verify_cmd,
+            shell=True,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"verify_cmd timed out after {timeout_seconds}s"
+    except OSError as e:
+        return False, f"verify_cmd failed to launch: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1024:].strip()
+        return False, f"verify_cmd exit {proc.returncode}: {tail[:500]}"
+    return True, f"verify_cmd passed ({verify_cmd!r})"
+
+
+def apply_verify_gate(
+    result: ValidationResult,
+    *,
+    is_retry: bool,
+    repo_path: str,
+    verify_cmd: str | None,
+    timeout_seconds: int = 300,
+) -> ValidationResult:
+    """Run the verify gate against an accepted slice and downgrade if CI fails.
+
+    Only runs for verdicts where goose claims success (``accept``, ``soft_accept``).
+    For already-rejecting verdicts the gate is a no-op — the slice is going to
+    be retried/escalated regardless.
+    """
+    if result.verdict not in ("accept", "soft_accept"):
+        return result
+    passed, summary = run_verify_gate(
+        repo_path=repo_path,
+        verify_cmd=verify_cmd,
+        timeout_seconds=timeout_seconds,
+    )
+    if passed:
+        return result
+    new_verdict: CaptainVerdict = "reject_hard" if is_retry else "reject_retry"
+    return ValidationResult(
+        verdict=new_verdict,
+        rationale=f"goose {result.verdict} but {summary}",
+        rubric_delta_pp=result.rubric_delta_pp,
     )
 
 
@@ -290,6 +360,21 @@ def captain_tick(
             parent_slice_id="parent" if was_retry else None,
         )
         result = validate_slice(complete=completion, slice_=proxy_slice, score_delta=score_delta)
+
+        # C1 verify gate: if the registered app has a verify_cmd, run it
+        # against the repo. Goose's exit-code is local to the slice; the
+        # verify gate is global ("does the project still build/test?").
+        # Failure downgrades accept/soft_accept → reject_retry/reject_hard.
+        from chad_captain.apps_registry import load_registry
+        reg_app = load_registry().by_id(ws.app_id)
+        if reg_app is not None:
+            result = apply_verify_gate(
+                result,
+                is_retry=was_retry,
+                repo_path=repo_path,
+                verify_cmd=reg_app.verify_cmd,
+                timeout_seconds=reg_app.verify_timeout_seconds,
+            )
 
         rs_id_in_roadmap = completion.slice_id.removesuffix("-retry")
         advance_roadmap(roadmap, rs_id_in_roadmap, result.verdict)

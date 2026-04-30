@@ -19,10 +19,13 @@ from chad_captain.protocol import (
     write_slice_complete,
 )
 from chad_captain.validator import (
+    ValidationResult,
     advance_roadmap,
+    apply_verify_gate,
     build_current_slice,
     captain_tick,
     next_queued_slice,
+    run_verify_gate,
     validate_slice,
 )
 
@@ -139,6 +142,107 @@ def test_regression_after_retry_reverts() -> None:
         score_delta=lambda *_: -0.5,
     )
     assert r.verdict == "revert"
+
+
+# ---------------------------------------------------------------------------
+# C1 — verify gate (per-app CI command)
+# ---------------------------------------------------------------------------
+
+
+def test_run_verify_gate_no_cmd_passes(tmp_path: Path) -> None:
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd=None, timeout_seconds=10,
+    )
+    assert passed is True
+    assert "no verify_cmd" in summary
+
+
+def test_run_verify_gate_empty_cmd_passes(tmp_path: Path) -> None:
+    passed, _ = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd="   ", timeout_seconds=10,
+    )
+    assert passed is True
+
+
+def test_run_verify_gate_zero_exit_passes(tmp_path: Path) -> None:
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd="true", timeout_seconds=10,
+    )
+    assert passed is True
+    assert "passed" in summary
+
+
+def test_run_verify_gate_nonzero_exit_fails(tmp_path: Path) -> None:
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path),
+        verify_cmd="echo 'failure tail' >&2; exit 7",
+        timeout_seconds=10,
+    )
+    assert passed is False
+    assert "exit 7" in summary
+    assert "failure tail" in summary
+
+
+def test_run_verify_gate_timeout_fails(tmp_path: Path) -> None:
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd="sleep 5", timeout_seconds=1,
+    )
+    assert passed is False
+    assert "timed out" in summary
+
+
+def test_apply_verify_gate_passes_through_rejecting_verdicts(tmp_path: Path) -> None:
+    """Already-rejecting verdicts shouldn't trigger CI — the slice is going
+    to retry/escalate regardless."""
+    for v in ("reject_retry", "reject_hard", "escalate", "kill_replan", "revert"):
+        result = ValidationResult(verdict=v, rationale="x", rubric_delta_pp=None)
+        out = apply_verify_gate(
+            result, is_retry=False, repo_path=str(tmp_path),
+            verify_cmd="exit 1", timeout_seconds=10,
+        )
+        assert out.verdict == v, f"verdict {v} should pass through but became {out.verdict}"
+
+
+def test_apply_verify_gate_passes_accept_through_when_ci_green(tmp_path: Path) -> None:
+    result = ValidationResult(verdict="accept", rationale="ok", rubric_delta_pp=1.5)
+    out = apply_verify_gate(
+        result, is_retry=False, repo_path=str(tmp_path),
+        verify_cmd="true", timeout_seconds=10,
+    )
+    assert out.verdict == "accept"
+    assert out.rubric_delta_pp == 1.5
+
+
+def test_apply_verify_gate_downgrades_accept_on_ci_failure(tmp_path: Path) -> None:
+    result = ValidationResult(verdict="accept", rationale="ok", rubric_delta_pp=1.5)
+    out = apply_verify_gate(
+        result, is_retry=False, repo_path=str(tmp_path),
+        verify_cmd="exit 1", timeout_seconds=10,
+    )
+    assert out.verdict == "reject_retry"
+    assert "verify_cmd" in out.rationale
+    # Rubric delta is preserved for visibility into "what goose claimed it did"
+    assert out.rubric_delta_pp == 1.5
+
+
+def test_apply_verify_gate_downgrades_to_reject_hard_on_retry(tmp_path: Path) -> None:
+    result = ValidationResult(verdict="soft_accept", rationale="ok", rubric_delta_pp=0.1)
+    out = apply_verify_gate(
+        result, is_retry=True, repo_path=str(tmp_path),
+        verify_cmd="exit 1", timeout_seconds=10,
+    )
+    assert out.verdict == "reject_hard"
+
+
+def test_apply_verify_gate_no_cmd_is_noop(tmp_path: Path) -> None:
+    """Apps with no verify_cmd preserve the original verdict (back-compat)."""
+    result = ValidationResult(verdict="accept", rationale="ok", rubric_delta_pp=2.0)
+    out = apply_verify_gate(
+        result, is_retry=False, repo_path=str(tmp_path),
+        verify_cmd=None, timeout_seconds=10,
+    )
+    assert out.verdict == "accept"
+    assert out.rubric_delta_pp == 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +396,99 @@ def test_tick_validates_completion_and_dispatches_next(ws: AppWorkspace) -> None
     assert "validate" in kinds
     assert "dispatch" in kinds
     assert "accept" in [e.verdict for e in log if e.verdict]
+
+
+def test_tick_verify_gate_downgrades_when_ci_fails(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: registered app with verify_cmd that fails → captain
+    issues reject_retry instead of accept and re-queues the slice."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Stub the registry lookup so the validator sees a verify_cmd.
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        verify_cmd="exit 1",
+        verify_timeout_seconds=10,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validate_entries = [e for e in log if e.kind == "validate"]
+    assert len(validate_entries) == 1
+    assert validate_entries[0].verdict == "reject_retry"
+    assert "verify_cmd" in validate_entries[0].rationale
+
+    # Slice was re-queued (advance_roadmap set queued) and then re-dispatched
+    # as a retry by captain_tick's dispatch step. Roadmap shows in_flight again
+    # but the new current_slice carries a parent_slice_id marking it as a retry.
+    cs = read_current_slice(ws)
+    assert cs is not None
+    assert cs.parent_slice_id == "s1"
+    assert cs.slice_id == "s1-retry"
+
+
+def test_tick_verify_gate_passes_through_when_ci_green(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify gate green → accept verdict preserved."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        verify_cmd="true",
+        verify_timeout_seconds=10,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validate_entries = [e for e in log if e.kind == "validate"]
+    assert validate_entries[0].verdict == "accept"
+
+    rm2 = read_roadmap(ws)
+    assert rm2.slices[0].status == "done"
 
 
 def test_tick_replan_reports_when_roadmap_exhausted(ws: AppWorkspace) -> None:

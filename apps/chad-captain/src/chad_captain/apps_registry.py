@@ -42,6 +42,16 @@ class RegisteredApp(BaseModel):
     schedule_tz: str = "America/New_York"
     notes: str = ""
 
+    # Optional shell command run inside repo_path after a slice's goose run,
+    # BEFORE the captain issues a verdict. Non-zero exit downgrades the verdict
+    # to reject_retry — protects main from "captain landed a slice that broke
+    # the build." Examples: "make check", "npm test", "uv run pytest -q".
+    # When None/empty, the verify gate is skipped (back-compat default).
+    verify_cmd: str | None = None
+    # Wall-clock cap for verify_cmd (seconds). Slow CI shouldn't deadlock
+    # the captain tick; if verify times out, treat as reject_retry.
+    verify_timeout_seconds: int = 300
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)
