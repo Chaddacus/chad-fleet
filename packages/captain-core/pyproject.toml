@@ -20,4 +20,4 @@ dev = ["pytest>=8.0"]
 packages = ["src/captain_core"]
 
 [tool.uv.sources]
-state-aggregator = { path = "../state-aggregator", editable = true }
+state-aggregator = { workspace = true }

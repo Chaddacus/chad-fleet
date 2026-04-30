@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-tracked-app-registry = { path = "../tracked-app-registry", editable = true }
+tracked-app-registry = { workspace = true }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27"]

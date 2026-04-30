@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-notifier-hub-core = { path = "../../core", editable = true }
+notifier-hub-core = { workspace = true }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
