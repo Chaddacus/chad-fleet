@@ -120,6 +120,45 @@ def test_secret_hygiene_skips_test_files(tmp_path: Path) -> None:
     assert sc.by_name("secret_hygiene").score == 1.0
 
 
+def test_secret_hygiene_skips_root_conftest(tmp_path: Path) -> None:
+    """Regression: root-level conftest.py was being scanned (no /tests/ in path),
+    flagging Django-style test fixtures like password='testpassword123' as
+    leaks. conftest.py at any depth is pytest fixture code, not source."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "conftest.py").write_text(
+        'def make_user():\n'
+        '    return User.objects.create_user(\n'
+        '        email="t@example.com", password="testpassword123",\n'
+        '    )\n'
+    )
+    sc = score_repo(repo)
+    assert sc.by_name("secret_hygiene").score == 1.0
+
+
+def test_secret_hygiene_skips_nested_conftest(tmp_path: Path) -> None:
+    """Nested conftest.py (e.g. tenants/conftest.py) is also test code."""
+    repo = tmp_path / "r"
+    (repo / "apps" / "tenants").mkdir(parents=True)
+    (repo / "apps" / "tenants" / "conftest.py").write_text(
+        'PASSWORD = "tenant-fixture-pw-12345"\n'
+    )
+    sc = score_repo(repo)
+    assert sc.by_name("secret_hygiene").score == 1.0
+
+
+def test_secret_hygiene_does_not_skip_misnamed_conftest(tmp_path: Path) -> None:
+    """Belt-and-suspenders: a file named myconftest.py is NOT a pytest
+    conftest and must still be scanned."""
+    repo = tmp_path / "r"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "myconftest.py").write_text(
+        'PASSWORD = "leaked-real-secret-12345"\n'
+    )
+    sc = score_repo(repo)
+    assert sc.by_name("secret_hygiene").score == 0.0
+
+
 def test_secret_hygiene_catches_private_key(tmp_path: Path) -> None:
     repo = tmp_path / "r"
     (repo / "src").mkdir(parents=True)

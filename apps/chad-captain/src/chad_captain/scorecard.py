@@ -43,7 +43,13 @@ SKIP_DIRS = {
 }
 SOURCE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".java",
                ".kt", ".rb", ".swift", ".c", ".h", ".cpp", ".cc", ".hpp"}
-TEST_PATH_HINTS = ("test_", "_test.", "/tests/", "/test/", ".spec.", ".test.")
+TEST_PATH_HINTS = (
+    "test_", "_test.", "/tests/", "/test/", ".spec.", ".test.",
+    # pytest fixtures live in conftest.py (root or nested). They commonly
+    # embed fake credentials and must be treated as test code. Leading "/"
+    # avoids false positives like "/foo/myconftest.py".
+    "/conftest.py",
+)
 TODO_PATTERN = re.compile(r"\b(TODO|FIXME|XXX|HACK)\b")
 SKIP_PATTERN = re.compile(
     r"@(?:pytest\.mark\.)?skip\b|@unittest\.skip\b|it\.skip\(|describe\.skip\(",
