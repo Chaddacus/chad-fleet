@@ -181,6 +181,13 @@ class GooseRunner:
         diff_path = self._capture_diff(slice_, pre_commit, post_commit, files_changed)
         summary = _extract_summary(slice_log)
 
+        # Auto-commit any uncommitted changes so the *next* slice starts from
+        # a clean working tree. Without this, slice N+1's `pre_dirty` set
+        # already contains slice N's mutations and `_files_changed` reports
+        # an empty diff, which the validator misreads as "no files changed".
+        if files_changed and post_commit == pre_commit:
+            _git_autocommit(self.repo_path, slice_.slice_id)
+
         append_progress(
             self.ws,
             ProgressEvent(
@@ -347,6 +354,23 @@ def _git_dirty_files(repo: Path) -> set[str]:
         if len(line) > 3:
             files.add(line[3:].strip())
     return files
+
+
+def _git_autocommit(repo: Path, slice_id: str) -> None:
+    """Stage + commit all uncommitted changes under a captain-runner author.
+
+    No-op if the repo isn't a git checkout, has nothing staged, or commit
+    fails for any reason — slice success doesn't depend on this.
+    """
+    if not (repo / ".git").exists():
+        return
+    _run_capture(["git", "-C", str(repo), "add", "-A"])
+    _run_capture([
+        "git", "-C", str(repo),
+        "-c", "user.email=captain-runner@local",
+        "-c", "user.name=captain-runner",
+        "commit", "-qm", f"captain-runner: {slice_id}",
+    ])
 
 
 def _files_changed(
