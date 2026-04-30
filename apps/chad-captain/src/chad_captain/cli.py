@@ -91,6 +91,45 @@ def cmd_actions(args: argparse.Namespace) -> None:
         print(f"   {a.rationale}")
 
 
+def cmd_research(args: argparse.Namespace) -> None:
+    from chad_captain.protocol import AppWorkspace
+    from chad_captain.research import load_profile, synthesize_profile
+
+    ws = AppWorkspace(args.app)
+    if args.show and not args.refresh:
+        profile = load_profile(ws)
+        if profile is None:
+            print(f"No cached research for app {args.app}.")
+            sys.exit(1)
+    else:
+        if not args.repo:
+            print("--repo is required when generating research", file=sys.stderr)
+            sys.exit(2)
+        profile = synthesize_profile(
+            ws,
+            args.repo,
+            refresh=args.refresh,
+            do_web=not args.no_web,
+        )
+    if args.json:
+        print(profile.model_dump_json(indent=2))
+        return
+    print(f"App: {profile.app_id}")
+    print(f"Generated: {profile.generated_at}")
+    print(f"Repo: {profile.local.repo_path}")
+    print(f"Languages: {', '.join(f'{k}:{v}' for k, v in list(profile.local.languages.items())[:5]) or '(none)'}")
+    print(f"Recent commits: {len(profile.local.recent_commits)}")
+    print()
+    print("Summary:")
+    print(profile.summary or "(none)")
+    print()
+    print(f"Web research: {profile.web.status}")
+    if profile.web.status == "ok":
+        print(profile.web.landscape_md)
+    elif profile.web.reason:
+        print(f"  reason: {profile.web.reason}")
+
+
 def cmd_status(_args: argparse.Namespace) -> None:
     from datetime import datetime
 
@@ -138,6 +177,19 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("status", help="Print scheduler and fleet status as JSON")
 
+    research_p = sub.add_parser("research", help="Build or read app research profile")
+    research_p.add_argument("--app", required=True, metavar="APP_ID")
+    research_p.add_argument("--repo", default=None, metavar="PATH",
+                            help="Repo path (required unless --show)")
+    research_p.add_argument("--refresh", action="store_true",
+                            help="Force rebuild even if cache is fresh")
+    research_p.add_argument("--no-web", action="store_true",
+                            help="Skip the web research call")
+    research_p.add_argument("--show", action="store_true",
+                            help="Print existing cached profile (no rebuild)")
+    research_p.add_argument("--json", action="store_true",
+                            help="Output the full profile as JSON")
+
     args = parser.parse_args(argv)
     dispatch = {
         "run": cmd_run,
@@ -146,6 +198,7 @@ def main(argv: list[str] | None = None) -> None:
         "alerts": cmd_alerts,
         "actions": cmd_actions,
         "status": cmd_status,
+        "research": cmd_research,
     }
     dispatch[args.command](args)
 
