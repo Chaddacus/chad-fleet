@@ -16,7 +16,7 @@ LOG_DIR=/tmp
 
 # service-name port start-cmd-relative-to-ROOT
 SERVICES=(
-  "state-aggregator|8106|cd packages/state-aggregator && $PYTHON -m uvicorn state_aggregator.api:app --host 127.0.0.1 --port 8106"
+  "state-aggregator|8106|cd packages/state-aggregator && $PYTHON -m uvicorn state_aggregator.server:app --host 127.0.0.1 --port 8106"
   "view-registry|8108|cd packages/view-registry && $PYTHON -m uvicorn view_registry.api:app --host 127.0.0.1 --port 8108"
   "genui-renderer|8107|cd packages/genui-renderer && PORT=8107 npx tsx src/server.ts"
   "chad-dashboard|3000|cd apps/chad-dashboard && npm run dev"
