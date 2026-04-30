@@ -326,6 +326,12 @@ def captain_tick(
         else:
             score_delta = _no_score_delta
 
+    # Look up the registered app once — used by C1 (verify gate) and C2
+    # (auto-push, auto-PR on roadmap_complete). Tolerated when missing so
+    # tests that don't install a fake registry still drive the basic path.
+    from chad_captain.apps_registry import load_registry
+    reg_app = load_registry().by_id(ws.app_id)
+
     # 1. Validate any pending completion.
     completion = read_slice_complete(ws)
     if completion is not None:
@@ -365,8 +371,6 @@ def captain_tick(
         # against the repo. Goose's exit-code is local to the slice; the
         # verify gate is global ("does the project still build/test?").
         # Failure downgrades accept/soft_accept → reject_retry/reject_hard.
-        from chad_captain.apps_registry import load_registry
-        reg_app = load_registry().by_id(ws.app_id)
         if reg_app is not None:
             result = apply_verify_gate(
                 result,
@@ -397,6 +401,31 @@ def captain_tick(
         from chad_captain.scorecard import clear_baseline
         clear_baseline(ws.slice_baseline_path)
 
+        # C2 — auto-push captain branch on accept/soft_accept. Idempotent;
+        # subsequent pushes are fast-forward. Silent on success (per-slice
+        # pushes are side-effect, not reportable events). Only log on failure
+        # so admiral knows the branch is out of sync.
+        if reg_app is not None and reg_app.auto_push and reg_app.captain_branch \
+                and result.verdict in ("accept", "soft_accept"):
+            from chad_captain.merge_facilitator import push_captain_branch
+            pres = push_captain_branch(
+                repo_path=repo_path, branch=reg_app.captain_branch,
+            )
+            if not pres.ok:
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id,
+                        slice_id=completion.slice_id,
+                        kind="escalation_raised",
+                        rationale=f"auto-push failed: {pres.summary}",
+                        references={
+                            "branch": reg_app.captain_branch,
+                            "event": "auto_push_failed",
+                        },
+                    ),
+                )
+
         # Retry path — we re-queue the slice in advance_roadmap, so the
         # next dispatch step picks it up automatically.
         status = f"validate {completion.slice_id} → {result.verdict}: {result.rationale}"
@@ -414,6 +443,15 @@ def captain_tick(
                 return status or "no roadmap"
         rs = next_queued_slice(roadmap)
         if rs is None:
+            # C2 — roadmap_complete: emit event + auto-PR if configured.
+            # When auto_open_pr is set, captain does NOT auto-replan here —
+            # admiral merges first, then NEXT tick replans against new main.
+            from chad_captain.merge_facilitator import is_roadmap_complete
+            if is_roadmap_complete(roadmap):
+                _handle_roadmap_complete(ws, repo_path, roadmap, reg_app)
+                if reg_app is not None and reg_app.auto_open_pr:
+                    return (status + "; " if status else "") + "roadmap_complete (PR opened)"
+
             if auto_replan:
                 from chad_captain.replanner import replan
                 roadmap = replan(ws, repo_path, trigger="exhausted")
@@ -472,6 +510,103 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     entries = read_captain_log(ws, limit=50)
     matches = [e for e in entries if e.kind == "validate" and (e.slice_id == slice_id or (e.slice_id or "").startswith(slice_id))]
     return matches[-limit:]
+
+
+def _handle_roadmap_complete(
+    ws: AppWorkspace,
+    repo_path: str,
+    roadmap: Roadmap,
+    reg_app,  # RegisteredApp | None
+) -> None:
+    """Emit roadmap_complete event; push branch + open PR if configured.
+
+    Idempotent — re-running on an already-complete roadmap may try to push
+    again (no-op fast-forward) and re-open a PR (gh detects existing PR
+    and the merge_facilitator surfaces it as success). Safe.
+    """
+    # Always emit the roadmap_complete log entry, even when auto_open_pr is
+    # off — admiral observes via dashboard / log tail and can take manual action.
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id,
+            slice_id=None,
+            kind="roadmap_complete",
+            rationale=(
+                f"{len(roadmap.slices)} slices reached terminal state "
+                f"({sum(1 for s in roadmap.slices if s.status == 'done')} done, "
+                f"{sum(1 for s in roadmap.slices if s.status == 'skipped')} skipped)"
+            ),
+            references={"event": "roadmap_complete"},
+        ),
+    )
+
+    if reg_app is None or not reg_app.auto_open_pr:
+        return
+    if not reg_app.captain_branch:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale="auto_open_pr=true but captain_branch is unset; cannot open PR",
+                references={"event": "roadmap_complete"},
+            ),
+        )
+        return
+
+    from chad_captain.merge_facilitator import (
+        format_pr_body,
+        format_pr_title,
+        open_pull_request,
+        push_captain_branch,
+    )
+
+    # Push first — PR creation requires the branch on origin.
+    push_res = push_captain_branch(
+        repo_path=repo_path, branch=reg_app.captain_branch,
+    )
+    if not push_res.ok:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=f"roadmap_complete push failed: {push_res.summary}",
+                references={"event": "roadmap_complete", "branch": reg_app.captain_branch},
+            ),
+        )
+        return
+
+    body = format_pr_body(
+        app_id=ws.app_id,
+        roadmap=roadmap,
+        verify_cmd=reg_app.verify_cmd,
+    )
+    title = format_pr_title(app_id=ws.app_id, roadmap=roadmap)
+    pr_res = open_pull_request(
+        repo_path=repo_path,
+        base=reg_app.pr_base_branch,
+        head=reg_app.captain_branch,
+        title=title,
+        body=body,
+    )
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id,
+            slice_id=None,
+            kind="pull_request_opened" if pr_res.ok else "escalation_raised",
+            rationale=(
+                f"PR opened: {pr_res.stdout.strip()}" if pr_res.ok
+                else f"PR open failed: {pr_res.summary}"
+            ),
+            references={
+                "event": "roadmap_complete_pr",
+                "branch": reg_app.captain_branch,
+                "base": reg_app.pr_base_branch,
+                "pr_url": pr_res.stdout.strip() if pr_res.ok else "",
+            },
+        ),
+    )
 
 
 __all__ = [

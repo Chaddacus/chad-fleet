@@ -199,6 +199,10 @@ class CaptainLogEntry(BaseModel):
         "note_response",
         "escalation_raised",
         "escalation_resolved",
+        # Captain → main integration (C2): emitted when all roadmap slices
+        # reach terminal state and when the captain auto-opens a PR.
+        "roadmap_complete",
+        "pull_request_opened",
     ]
     verdict: CaptainVerdict | None = None
     rubric_delta_pp: float | None = None

@@ -52,6 +52,19 @@ class RegisteredApp(BaseModel):
     # the captain tick; if verify times out, treat as reject_retry.
     verify_timeout_seconds: int = 300
 
+    # --- Integration model: captain branch + auto-PR (C2) ---
+    # The branch goose-runner commits land on. Captain assumes this branch is
+    # checked out before tick (admiral creates it from main once per app, then
+    # captain owns it for the lifetime of the roadmap-merge cycle).
+    captain_branch: str | None = None
+    # PR base branch when auto-opening a PR on roadmap_complete.
+    pr_base_branch: str = "main"
+    # On accept verdict, push the captain branch to origin. Cheap idempotent op.
+    auto_push: bool = False
+    # On roadmap_complete (all slices done/skipped), push + open a draft PR
+    # via `gh pr create`. Admiral merges; captain never auto-merges.
+    auto_open_pr: bool = False
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)

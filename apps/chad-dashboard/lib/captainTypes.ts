@@ -26,7 +26,9 @@ export type CaptainLogKind =
   | 'note_received'
   | 'note_response'
   | 'escalation_raised'
-  | 'escalation_resolved';
+  | 'escalation_resolved'
+  | 'roadmap_complete'
+  | 'pull_request_opened';
 
 export type ProgressKind =
   | 'slice_started'

@@ -449,6 +449,143 @@ def test_tick_verify_gate_downgrades_when_ci_fails(
     assert cs.slice_id == "s1-retry"
 
 
+def test_tick_roadmap_complete_emits_event_and_opens_pr(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: last queued slice completes → captain emits roadmap_complete,
+    pushes branch, opens PR. Subprocess calls are mocked."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    push_calls: list[dict] = []
+    pr_calls: list[dict] = []
+
+    def fake_push(*, repo_path: str, branch: str, **_kw):
+        push_calls.append({"repo_path": repo_path, "branch": branch})
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_open_pr(*, repo_path: str, base: str, head: str,
+                     title: str, body: str, **_kw):
+        pr_calls.append({
+            "base": base, "head": head, "title": title, "body": body,
+        })
+        return mf.CmdResult(
+            ok=True, summary="ok",
+            stdout="https://github.com/owner/repo/pull/42",
+        )
+
+    monkeypatch.setattr(mf, "push_captain_branch", fake_push)
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    # Roadmap with one slice that's about to be marked done.
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    status = captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # Slice marked done → roadmap complete → no further dispatch
+    rm2 = read_roadmap(ws)
+    assert rm2.slices[0].status == "done"
+    assert "roadmap_complete" in status
+
+    log = read_captain_log(ws)
+    kinds = [e.kind for e in log]
+    rationales = [e.rationale for e in log]
+    # roadmap_complete event landed with the right kind
+    assert "roadmap_complete" in kinds
+    assert "pull_request_opened" in kinds
+    # PR url logged
+    assert any("github.com/owner/repo/pull/42" in r for r in rationales)
+
+    # Push happened twice — once on accept (auto_push), once on roadmap_complete
+    assert len(push_calls) >= 1
+    assert all(c["branch"] == "codex/captain-test-app" for c in push_calls)
+
+    # Exactly one PR open call with the right shape
+    assert len(pr_calls) == 1
+    assert pr_calls[0]["base"] == "main"
+    assert pr_calls[0]["head"] == "codex/captain-test-app"
+    assert "test-app" in pr_calls[0]["title"]
+
+
+def test_tick_no_pr_when_auto_open_pr_disabled(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """auto_open_pr=False → roadmap_complete event is logged but no PR opened."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        auto_push=False,
+        auto_open_pr=False,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pr_called = False
+
+    def fake_open_pr(**_kw):
+        nonlocal pr_called
+        pr_called = True
+        return mf.CmdResult(ok=True, summary="ok")
+
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    kinds = [e.kind for e in log]
+    # Event still logged
+    assert "roadmap_complete" in kinds
+    # But no PR was opened
+    assert pr_called is False
+    assert "pull_request_opened" not in kinds
+
+
 def test_tick_verify_gate_passes_through_when_ci_green(
     ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
