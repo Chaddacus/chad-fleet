@@ -1,7 +1,7 @@
 GOOSE_PROVIDER: codex-acp
 GOOSE_MODEL: gpt-5.4
 GOOSE_DISABLE_SESSION_NAMING: true
-GOOSE_MODE: smart_approve
+GOOSE_MODE: auto
 GOOSE_TOKEN_LIMIT: 200000
 extensions:
   developer:
