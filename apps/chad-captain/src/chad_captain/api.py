@@ -34,6 +34,9 @@ from chad_captain.extras import get_extras
 from chad_captain.protocol import (
     AdmiralNote,
     AppWorkspace,
+    CaptainLogEntry,
+    append_captain_log,
+    clear_current_slice,
     fleet_base,
     list_unread_admiral_notes,
     read_captain_log,
@@ -243,9 +246,10 @@ def create_app() -> FastAPI:
     def app_note(app_id: str, payload: NoteIn) -> dict:
         ws = AppWorkspace(app_id)
         ws.ensure()
-        from datetime import datetime, timezone
+        # Microsecond precision avoids id collisions when two notes land in
+        # the same wall-clock second (UI ⌘↵ double-fire, scripted clients).
         note = AdmiralNote(
-            note_id=payload.note_id or f"note-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}",
+            note_id=payload.note_id or f"note-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",
             app_id=app_id,
             body=payload.body,
             expects_response=payload.expects_response,
@@ -259,6 +263,29 @@ def create_app() -> FastAPI:
 
         ws = AppWorkspace(app_id)
         ws.ensure()
+
+        # If a slice is in flight, replan would produce a roadmap whose slice
+        # ids may collide with the in-flight current_slice (same id, different
+        # objective). Clear the in-flight slice first and log the abort, so
+        # validate doesn't later score the wrong objective. Admiral-driven
+        # replan implies "abort and reroute."
+        existing = read_current_slice(ws)
+        if existing is not None:
+            clear_current_slice(ws)
+            append_captain_log(
+                ws,
+                CaptainLogEntry(
+                    app_id=app_id,
+                    slice_id=existing.slice_id,
+                    kind="dispatch",
+                    rationale=(
+                        f"in-flight slice {existing.slice_id} aborted by "
+                        f"replan (trigger={payload.trigger})"
+                    ),
+                    references={"aborted_by": "replan", "trigger": payload.trigger},
+                ),
+            )
+
         roadmap = replan(
             ws,
             payload.repo_path,

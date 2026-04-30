@@ -181,6 +181,25 @@ def test_post_note_writes_file_and_lists_unread(client: TestClient, ws: AppWorks
     assert any(note_id in u for u in state["unread_admiral_notes"])
 
 
+def test_post_note_twice_in_same_second_yields_distinct_ids(
+    client: TestClient, ws: AppWorkspace,
+) -> None:
+    """Regression: second-precision timestamps caused id collisions and
+    silent overwrite when two notes landed in the same wall-clock second."""
+    write_roadmap(ws, Roadmap(app_id=ws.app_id, slices=[]))
+    r1 = client.post(f"/apps/{ws.app_id}/note", json={"body": "first"})
+    r2 = client.post(f"/apps/{ws.app_id}/note", json={"body": "second"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    id1 = r1.json()["note_id"]
+    id2 = r2.json()["note_id"]
+    assert id1 != id2, f"note_ids collided: {id1!r} == {id2!r}"
+
+    # Both notes must exist on disk with distinct content
+    state = client.get(f"/apps/{ws.app_id}").json()
+    unread = state["unread_admiral_notes"]
+    assert len(unread) == 2, f"expected 2 unread notes, got {unread!r}"
+
+
 # ---------------------------------------------------------------------------
 # /apps/{id}/replan + /apps/{id}/tick
 # ---------------------------------------------------------------------------
@@ -218,3 +237,56 @@ def test_post_tick_returns_status(client: TestClient, ws: AppWorkspace, tmp_path
     r = client.post(f"/apps/{ws.app_id}/tick", json={"repo_path": str(repo)})
     assert r.status_code == 200
     assert "status" in r.json()
+
+
+def test_post_replan_aborts_in_flight_slice(
+    client: TestClient, ws: AppWorkspace, tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression: replan during in-flight slice must clear current_slice so
+    the new roadmap doesn't collide with stale current_slice.json (same id,
+    different objective)."""
+    from chad_captain.protocol import (
+        CurrentSlice,
+        read_captain_log,
+        read_current_slice,
+        write_current_slice,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# r")
+
+    # Stub the live web research call
+    from chad_captain.research import synthesize as syn_mod, web as web_mod
+    monkeypatch.setattr(syn_mod, "research_web",
+                         lambda **_kw: web_mod.WebProfile.skipped("test"))
+
+    write_roadmap(ws, Roadmap(app_id=ws.app_id, slices=[
+        RoadmapSlice(slice_id="s1", objective="o", status="in_flight"),
+    ]))
+    write_current_slice(ws, CurrentSlice(
+        slice_id="s1",
+        app_id=ws.app_id,
+        objective="OLD objective",
+        system_prompt="",
+        user_prompt="",
+        repo_path=str(repo),
+    ))
+
+    assert read_current_slice(ws) is not None  # precondition
+
+    r = client.post(
+        f"/apps/{ws.app_id}/replan",
+        json={"trigger": "manual", "repo_path": str(repo), "no_llm": True},
+    )
+    assert r.status_code == 200, r.text
+
+    # current_slice cleared
+    assert read_current_slice(ws) is None
+
+    # Abort log entry written
+    log = list(read_captain_log(ws))
+    aborted = [e for e in log if "aborted" in (e.rationale or "")]
+    assert len(aborted) == 1
+    assert aborted[0].slice_id == "s1"
+    assert aborted[0].references.get("aborted_by") == "replan"
