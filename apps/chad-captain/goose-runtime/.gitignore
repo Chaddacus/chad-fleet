@@ -1,0 +1,9 @@
+# Captain's goose runtime — runtime state is host-local, never check in.
+state/
+data/
+
+# But DO check in config (the source of truth for how captain runs goose),
+# recipes (curated), and skills (curated).
+!config/
+!recipes/
+!skills/
