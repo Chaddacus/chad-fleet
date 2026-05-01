@@ -303,6 +303,100 @@ def test_rubric_is_stalled_resets_on_real_accept() -> None:
     assert _rubric_is_stalled(decisions) is False
 
 
+def test_build_code_inventory_finds_django_apps(tmp_path: Path) -> None:
+    """Inventory must list directories with models.py declaring
+    `models.Model`. Live failure: replanner was blind to existing
+    `apps/billing/` and shipped a parallel top-level `billing/`."""
+    from chad_captain.replanner import _build_code_inventory
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "apps").mkdir()
+    (repo / "apps" / "billing").mkdir()
+    (repo / "apps" / "billing" / "models.py").write_text(
+        "from django.db import models\n\nclass Plan(models.Model):\n    pass\n"
+    )
+    (repo / "apps" / "tenants").mkdir()
+    (repo / "apps" / "tenants" / "models.py").write_text(
+        "from django.db import models\n\nclass Tenant(models.Model):\n    pass\n"
+    )
+    inv = _build_code_inventory(repo)
+    assert "apps/billing" in inv["django_apps"]
+    assert "apps/tenants" in inv["django_apps"]
+
+
+def test_build_code_inventory_lists_service_and_view_modules(tmp_path: Path) -> None:
+    from chad_captain.replanner import _build_code_inventory
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    svc = repo / "apps" / "billing" / "services"
+    svc.mkdir(parents=True)
+    (svc / "billing_service.py").write_text("def x(): pass\n")
+    (repo / "apps" / "billing" / "views.py").write_text("def view(): pass\n")
+    inv = _build_code_inventory(repo)
+    assert any("billing_service.py" in s for s in inv["service_modules"])
+    assert any("billing/views.py" in v for v in inv["view_modules"])
+
+
+def test_build_code_inventory_skips_vendor_and_hidden(tmp_path: Path) -> None:
+    from chad_captain.replanner import _build_code_inventory
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    vend = repo / "vendor" / "thirdparty"
+    vend.mkdir(parents=True)
+    (vend / "models.py").write_text(
+        "from django.db import models\n\nclass X(models.Model): pass\n"
+    )
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "models.py").write_text(
+        "from django.db import models\n\nclass X(models.Model): pass\n"
+    )
+    inv = _build_code_inventory(repo)
+    assert all("vendor" not in a for a in inv["django_apps"])
+    assert all(".venv" not in a for a in inv["django_apps"])
+
+
+def test_build_code_inventory_missing_repo_returns_empty(tmp_path: Path) -> None:
+    from chad_captain.replanner import _build_code_inventory
+    inv = _build_code_inventory(tmp_path / "nope")
+    assert inv == {
+        "top_level_dirs": [], "django_apps": [],
+        "service_modules": [], "view_modules": [],
+    }
+
+
+def test_build_prompt_includes_inventory_when_present() -> None:
+    from chad_captain.replanner import _build_prompt, ReplanContext
+    from chad_captain.research.synthesize import AppProfile, LocalProfile, WebProfile
+    from chad_captain.scorecard import Scorecard, DimensionScore
+
+    profile = AppProfile(
+        app_id="x", local=LocalProfile(repo_path="/tmp/x"),
+        web=WebProfile(), summary="A SaaS thing.",
+    )
+    sc = Scorecard(
+        repo_path="/tmp/x",
+        dimensions=[DimensionScore(name="x", score=0.5)],
+        aggregate=0.5,
+    )
+    ctx = ReplanContext(
+        trigger="exhausted", profile=profile, scorecard=sc,
+        recent_decisions=[], admiral_notes=[],
+        code_inventory={
+            "top_level_dirs": [], "django_apps": ["apps/billing", "apps/tenants"],
+            "service_modules": ["apps/billing/services/svc.py"],
+            "view_modules": ["apps/billing/views.py"],
+        },
+    )
+    prompt = _build_prompt(ctx)
+    assert "Existing code inventory" in prompt
+    assert "apps/billing" in prompt
+    assert "apps/tenants" in prompt
+    assert "REUSE" in prompt or "EXTEND" in prompt
+
+
 def test_build_prompt_adds_stall_warning_when_deltas_tiny() -> None:
     """When trailing deltas are all near zero, the prompt must instruct
     the LLM to pivot to feature work instead of more remediation."""

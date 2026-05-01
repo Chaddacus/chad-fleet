@@ -35,6 +35,7 @@ def test_score_repo_returns_seven_dimensions(tmp_path: Path) -> None:
         "docs_present",
         "test_density",
         "migrations_consistent",
+        "reuse_consistency",
     ]
     assert 0.0 <= sc.aggregate <= 1.0
 
@@ -359,6 +360,86 @@ def test_migrations_consistent_partial_credit(tmp_path: Path) -> None:
 
     sc = score_repo(repo)
     assert sc.by_name("migrations_consistent").score == pytest.approx(0.5, abs=0.01)
+
+
+def test_reuse_consistency_clean_repo_scores_1(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "apps").mkdir()
+    (repo / "apps" / "billing").mkdir()
+    (repo / "apps" / "billing" / "models.py").write_text("x = 1\n")
+    sc = score_repo(repo)
+    assert sc.by_name("reuse_consistency").score == 1.0
+
+
+def test_reuse_consistency_detects_parallel_packages(tmp_path: Path) -> None:
+    """Top-level `billing/` AND `apps/billing/` both contain code →
+    parallel package, score drops. This is the live PR #142 failure."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    # apps/billing
+    (repo / "apps").mkdir()
+    (repo / "apps" / "billing").mkdir()
+    (repo / "apps" / "billing" / "views.py").write_text("def view(): pass\n")
+    # top-level billing
+    (repo / "billing").mkdir()
+    (repo / "billing" / "models.py").write_text("class Plan: pass\n")
+    sc = score_repo(repo)
+    score = sc.by_name("reuse_consistency").score
+    assert score < 1.0
+    assert score == pytest.approx(0.8, abs=0.01)  # 1 - 1/5
+    detail = sc.by_name("reuse_consistency").detail
+    assert any(d["name"] == "billing" for d in detail["duplicates"])
+
+
+def test_reuse_consistency_ignores_tests_mirror(tmp_path: Path) -> None:
+    """`tests/billing/` mirroring `apps/billing/` is convention, not
+    duplication. Don't flag."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "apps").mkdir()
+    (repo / "apps" / "billing").mkdir()
+    (repo / "apps" / "billing" / "models.py").write_text("class Plan: pass\n")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "billing").mkdir()
+    (repo / "tests" / "billing" / "test_billing.py").write_text("def test(): pass\n")
+    sc = score_repo(repo)
+    assert sc.by_name("reuse_consistency").score == 1.0
+
+
+def test_reuse_consistency_ignores_django_convention_subpackages(tmp_path: Path) -> None:
+    """`apps/A/api/` and `apps/B/api/` are the standard Django REST
+    Framework pattern. `apps/A/management/commands/` ditto. Don't flag."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for app in ("billing", "tenants"):
+        a = repo / "apps" / app
+        a.mkdir(parents=True)
+        api = a / "api"
+        api.mkdir()
+        (api / "views.py").write_text("def x(): pass\n")
+        mgmt = a / "management" / "commands"
+        mgmt.mkdir(parents=True)
+        (mgmt / "do_thing.py").write_text("# x\n")
+    sc = score_repo(repo)
+    assert sc.by_name("reuse_consistency").score == 1.0
+
+
+def test_reuse_consistency_skips_tests_migrations_dirs(tmp_path: Path) -> None:
+    """`tests/` and `migrations/` exist in many places — they're not
+    a parallel-package smell. Don't flag them."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "apps" / "billing" / "tests").mkdir(parents=True)
+    (repo / "apps" / "billing" / "tests" / "test_x.py").write_text("def test(): pass\n")
+    (repo / "apps" / "tenants" / "tests").mkdir(parents=True)
+    (repo / "apps" / "tenants" / "tests" / "test_y.py").write_text("def test(): pass\n")
+    (repo / "apps" / "billing" / "migrations").mkdir()
+    (repo / "apps" / "billing" / "migrations" / "0001_initial.py").write_text("# x\n")
+    (repo / "apps" / "tenants" / "migrations").mkdir()
+    (repo / "apps" / "tenants" / "migrations" / "0001_initial.py").write_text("# x\n")
+    sc = score_repo(repo)
+    assert sc.by_name("reuse_consistency").score == 1.0
 
 
 def test_migrations_consistent_skips_abstract_only_models(tmp_path: Path) -> None:

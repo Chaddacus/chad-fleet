@@ -66,6 +66,111 @@ def _complete(
     )
 
 
+def test_persistence_required_rejects_in_memory_log(tmp_path: Path) -> None:
+    """Live failure: PR #144 shipped author_toolkit/agent/decision_log.py
+    with `_DECISIONS: list[AgentDecision] = []` — module-level mutable
+    state, lost on restart, claimed to 'log every cover-variant decision'.
+    Validator now catches the mismatch."""
+    diff_path = tmp_path / "slice.diff"
+    diff_path.write_text(
+        "diff --git a/x/decision_log.py b/x/decision_log.py\n"
+        "+++ b/x/decision_log.py\n"
+        "@@ +0,0 @@\n"
+        "+from dataclasses import dataclass\n"
+        "+\n"
+        "+_DECISIONS: list = []\n"
+        "+\n"
+        "+def log_decision(t, k, p):\n"
+        "+    _DECISIONS.append((t, k, p))\n"
+    )
+    sl = CurrentSlice(
+        slice_id="s1", app_id="t", system_prompt="s", user_prompt="u",
+        objective="Log every cover-variant approval decision with rationale and tenant",
+        repo_path="/tmp/r",
+    )
+    cm = SliceComplete(
+        slice_id="s1", app_id="t", duration_seconds=5,
+        goose_exit_code=0, summary="ok", files_changed=["x/decision_log.py"],
+        diff_path=str(diff_path),
+    )
+    r = validate_slice(complete=cm, slice_=sl)
+    assert r.verdict == "reject_retry"
+    assert "in-memory" in r.rationale
+    assert "_DECISIONS" in r.rationale
+
+
+def test_persistence_required_passes_when_using_db(tmp_path: Path) -> None:
+    """Same objective phrasing, but the diff uses a Django model — no
+    module-level state, persistence is real. Don't reject."""
+    diff_path = tmp_path / "slice.diff"
+    diff_path.write_text(
+        "diff --git a/x/models.py b/x/models.py\n"
+        "+++ b/x/models.py\n"
+        "+from django.db import models\n"
+        "+\n"
+        "+class AgentDecision(models.Model):\n"
+        "+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE)\n"
+        "+    rationale = models.TextField()\n"
+    )
+    sl = CurrentSlice(
+        slice_id="s1", app_id="t", system_prompt="s", user_prompt="u",
+        objective="Log every cover-variant approval decision with rationale and tenant",
+        repo_path="/tmp/r",
+    )
+    cm = SliceComplete(
+        slice_id="s1", app_id="t", duration_seconds=5,
+        goose_exit_code=0, summary="ok", files_changed=["x/models.py"],
+        diff_path=str(diff_path),
+    )
+    r = validate_slice(complete=cm, slice_=sl)
+    # Without rubric scorer this falls into the "no delta" path → accept.
+    assert r.verdict == "accept"
+
+
+def test_persistence_required_inert_for_unrelated_objectives(tmp_path: Path) -> None:
+    """Objective not about logging/tracking — even if module-level
+    state is added, don't reject. The dim is a targeted gate, not a
+    blanket ban."""
+    diff_path = tmp_path / "slice.diff"
+    diff_path.write_text(
+        "+++ b/x/cache.py\n"
+        "+_CACHE: dict = {}\n"  # legit cache pattern
+    )
+    sl = CurrentSlice(
+        slice_id="s1", app_id="t", system_prompt="s", user_prompt="u",
+        objective="Add a fast in-memory cache for parsed API responses",
+        repo_path="/tmp/r",
+    )
+    cm = SliceComplete(
+        slice_id="s1", app_id="t", duration_seconds=5,
+        goose_exit_code=0, summary="ok", files_changed=["x/cache.py"],
+        diff_path=str(diff_path),
+    )
+    r = validate_slice(complete=cm, slice_=sl)
+    # Falls through to no-delta accept path
+    assert r.verdict == "accept"
+
+
+def test_persistence_required_retries_then_hard_rejects(tmp_path: Path) -> None:
+    diff_path = tmp_path / "slice.diff"
+    diff_path.write_text(
+        "+++ b/x/log.py\n+_AUDIT: list = []\n"
+    )
+    sl = CurrentSlice(
+        slice_id="s1-retry", app_id="t", system_prompt="s", user_prompt="u",
+        objective="Persist audit trail of every login",
+        repo_path="/tmp/r",
+        parent_slice_id="s1",  # retry
+    )
+    cm = SliceComplete(
+        slice_id="s1-retry", app_id="t", duration_seconds=5,
+        goose_exit_code=0, summary="ok", files_changed=["x/log.py"],
+        diff_path=str(diff_path),
+    )
+    r = validate_slice(complete=cm, slice_=sl)
+    assert r.verdict == "reject_hard"
+
+
 def test_cheat_flags_escalate() -> None:
     r = validate_slice(
         complete=_complete(cheats=["assert-true-only:tests/test_x.py"]),

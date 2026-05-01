@@ -28,9 +28,11 @@ Replan triggers (caller — the daemon — handles these):
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable
 
 from chad_captain.protocol import (
@@ -122,6 +124,33 @@ def validate_slice(
         return ValidationResult(
             verdict="reject_retry",
             rationale="no files changed despite success exit",
+        )
+
+    # Persistence-required gate (C13): if the objective claims to "log",
+    # "track", "audit", or "store" and the diff introduces module-level
+    # mutable state at module scope (e.g. `_DECISIONS: list = []`), the
+    # work is in-memory only — passes tests via clear_X() between cases
+    # but loses everything on restart and races under multi-worker.
+    # Live failure: PR #144 shipped author_toolkit/agent/decision_log.py
+    # with `_DECISIONS: list[AgentDecision] = []`. Looked like a
+    # feature, isn't production-grade.
+    persist_violation = _detect_persistence_violation(slice_, complete)
+    if persist_violation:
+        if is_retry:
+            return ValidationResult(
+                verdict="reject_hard",
+                rationale=(
+                    f"persistence required but in-memory only "
+                    f"({persist_violation}) after retry"
+                ),
+            )
+        return ValidationResult(
+            verdict="reject_retry",
+            rationale=(
+                f"persistence required by objective but implementation "
+                f"is in-memory only: {persist_violation}; retry with "
+                f"DB / file / queue persistence"
+            ),
         )
 
     delta = score_delta(slice_, complete)
@@ -741,6 +770,52 @@ def _maybe_trip_circuit_breaker(ws: AppWorkspace, reg_app) -> None:
 
 
 _LOW_YIELD_PP_FLOOR = 0.5
+
+
+# Objective phrases that require real persistence. Conservative — false
+# positives are OK (worker just makes it persistent), false negatives
+# silently ship in-memory features.
+_PERSISTENCE_OBJECTIVE_RE = re.compile(
+    r"\b(log\s+(?:every|each|all|the|to)|"
+    r"track(?:ing|ed)?|audit\s+(?:trail|log)|"
+    r"persist(?:ed|s)?|store\s+(?:a|the|all|each)|"
+    r"record\s+(?:every|each|all|the))\b",
+    re.IGNORECASE,
+)
+# Detect module-level mutable state at file scope (start of line, no
+# indent). Matches lines added in the diff (`+` prefix).
+_MODULE_LEVEL_STATE_RE = re.compile(
+    r"^\+(_[A-Z][A-Z0-9_]*)\s*(?::\s*[^=]+)?\s*=\s*(\[\s*\]|\{\s*\}|set\(\s*\))\s*$",
+    re.MULTILINE,
+)
+
+
+def _detect_persistence_violation(
+    slice_: CurrentSlice, complete: SliceComplete,
+) -> str | None:
+    """Return a short string describing the violation if the slice's
+    objective implies persistence and the diff introduces module-level
+    mutable state. Else None.
+
+    See C13 comment in validate_slice for context."""
+    objective = (slice_.objective or "") + " " + (slice_.user_prompt or "")
+    if not _PERSISTENCE_OBJECTIVE_RE.search(objective):
+        return None
+
+    diff_path_str = complete.diff_path
+    if not diff_path_str:
+        return None
+    try:
+        diff_text = Path(diff_path_str).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    matches = _MODULE_LEVEL_STATE_RE.findall(diff_text)
+    if not matches:
+        return None
+    # First match's variable name is the most actionable signal.
+    first_var = matches[0][0]
+    return f"module-level mutable state introduced: {first_var}"
 
 
 def _maybe_trip_low_yield_streak(ws: AppWorkspace, reg_app) -> None:

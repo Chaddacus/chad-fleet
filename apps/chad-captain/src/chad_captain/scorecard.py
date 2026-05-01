@@ -27,6 +27,12 @@ The seven baseline dimensions:
                           file. Catches the failure mode where the
                           captain accepts a model change but the worker
                           forgot to run makemigrations.
+    reuse_consistency   — penalize parallel module names. If two
+                          directories share the same package name in
+                          different namespaces (e.g. top-level
+                          `billing/` and `apps/billing/`) the worker
+                          built parallel instead of extending. Live
+                          failure: captain shipped duplicate billing.
 """
 
 from __future__ import annotations
@@ -142,6 +148,7 @@ def score_repo(
         _dim_docs_present(repo),
         _dim_test_density(files, test_files),
         _dim_migrations_consistent(repo),
+        _dim_reuse_consistency(repo),
     ]
     if extras:
         for fn in extras:
@@ -357,6 +364,118 @@ def _dim_test_density(files: list[Path], test_files: list[Path]) -> DimensionSco
         name="test_density", score=score,
         rationale=f"{test_loc} test LOC / {source_loc} source LOC (ratio {ratio:.3f})",
         detail={"source_loc": source_loc, "test_loc": test_loc, "ratio": round(ratio, 4)},
+    )
+
+
+def _dim_reuse_consistency(repo: Path) -> DimensionScore:
+    """Detect parallel modules that share a package name across two
+    different namespaces — the symptom of a worker that didn't survey
+    existing code and built a duplicate package.
+
+    The check: walk depth ≤ 3, collect every dir name that contains a
+    Python module (`__init__.py` or any `.py` file). If the same name
+    appears in two different parents, that's a parallel-package smell.
+
+    Concrete example from author-toolkit: top-level `billing/` AND
+    `apps/billing/` — score drops to flag the duplicate. Captain didn't
+    notice apps/billing/ existed when it shipped billing/.
+
+    Returns score = 1.0 - (parallel_pairs / 5), clamped at 0. Five
+    duplicate packages = score 0; zero = 1.0."""
+    if not repo.is_dir():
+        return DimensionScore(name="reuse_consistency", score=1.0,
+                              rationale="repo not present")
+    # Conventional Django subpackages — every app SHOULD have its own.
+    # These are nested-by-design and must NOT be flagged as parallel.
+    CONVENTION_NAMES = {
+        "api", "management", "commands", "models", "tests", "test",
+        "fixtures", "migrations", "templates", "static", "templatetags",
+        "services", "viewsets", "serializers", "permissions",
+        "middleware", "signals", "urls", "validators", "forms",
+        "admin", "utils", "helpers",
+    }
+    SKIP_DIRS = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+        "target", ".next", ".turbo", "out", "coverage", ".cache",
+        ".idea", ".vscode", ".artifacts", "vendor",
+    }
+
+    # We only care about TOP-level duplication: same package name living
+    # under two different "parent contexts" — e.g. top-level `billing/`
+    # vs `apps/billing/`. We don't care that `apps/A/api/` and
+    # `apps/B/api/` both exist (Django convention).
+    #
+    # A "parent context" is either the repo root or the top-level dir
+    # under the repo (e.g. `apps`, `services`, `dashboard`). Anything
+    # deeper than that gets normalized to the same parent context.
+    name_to_parents: dict[str, set[str]] = {}
+
+    def parent_context(d: Path) -> str:
+        rel = d.relative_to(repo)
+        parts = rel.parts
+        if not parts:
+            return "."
+        return parts[0]
+
+    def walk(d: Path, depth: int) -> None:
+        if depth > 3:
+            return
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            return
+        for child in entries:
+            if not child.is_dir():
+                continue
+            if child.name in SKIP_DIRS or child.name.startswith("."):
+                continue
+            if child.name in CONVENTION_NAMES:
+                # Conventional Django subpackage — descend (so nested
+                # packages we DO care about can still be detected) but
+                # don't record this name as a candidate.
+                walk(child, depth + 1)
+                continue
+            # Treat as a package candidate if it has any .py file
+            # directly inside.
+            try:
+                has_py = any(
+                    p.is_file() and p.suffix == ".py" and p.name != "__init__.py"
+                    for p in child.iterdir()
+                )
+            except OSError:
+                has_py = False
+            if has_py:
+                ctx = parent_context(d)
+                name_to_parents.setdefault(child.name, set()).add(ctx)
+            walk(child, depth + 1)
+
+    walk(repo, 0)
+
+    # `tests/` mirrors source structure by convention — `tests/billing`
+    # is the test counterpart of `apps/billing`, not a parallel package.
+    # Strip `tests` and `test` from parent contexts before checking.
+    TEST_PARENTS = {"tests", "test"}
+
+    # A "parallel pair" = same package name appears under 2+ different
+    # NON-test top-level parent contexts. Cap per-name contribution at 1.
+    duplicates: list[dict] = []
+    for name, parents in name_to_parents.items():
+        non_test = sorted(p for p in parents if p not in TEST_PARENTS)
+        if len(non_test) >= 2:
+            duplicates.append({"name": name, "parents": non_test[:5]})
+
+    if not duplicates:
+        return DimensionScore(
+            name="reuse_consistency", score=1.0,
+            rationale="no parallel package names detected",
+            detail={"duplicates": []},
+        )
+    score = max(0.0, 1.0 - len(duplicates) / 5.0)
+    return DimensionScore(
+        name="reuse_consistency", score=score,
+        rationale=f"{len(duplicates)} parallel package name(s) detected",
+        detail={"duplicates": duplicates[:5]},
     )
 
 

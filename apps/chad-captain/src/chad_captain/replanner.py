@@ -69,6 +69,7 @@ class ReplanContext(BaseModel):
     scorecard: Scorecard
     recent_decisions: list[dict] = Field(default_factory=list)
     admiral_notes: list[str] = Field(default_factory=list)
+    code_inventory: dict = Field(default_factory=dict)
 
 
 REPLAN_SCHEMA = {
@@ -150,6 +151,7 @@ def replan(
     ]
 
     notes = _collect_admiral_notes(ws)
+    inventory = _build_code_inventory(repo_path)
 
     ctx = ReplanContext(
         trigger=trigger,
@@ -157,6 +159,7 @@ def replan(
         scorecard=scorecard,
         recent_decisions=recent_decisions,
         admiral_notes=notes,
+        code_inventory=inventory,
     )
 
     roadmap = (
@@ -265,6 +268,96 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
     )
 
 
+def _build_code_inventory(repo_path: str | Path) -> dict:
+    """Survey the repo's existing modules so the planner doesn't generate
+    slices that build parallel modules to ones that already exist.
+
+    Live failure mode that motivated this: PR #142 shipped a top-level
+    `billing/` Plan/Subscription module while `apps/billing/` already
+    existed with a Stripe webhook stub. Captain didn't see the existing
+    package and built a parallel one. New `billing/` models are not
+    wired to the existing webhook → Stripe pings stay no-op.
+
+    Returns ``{"top_level_dirs": [...], "django_apps": [...],
+    "service_modules": [...], "view_modules": [...]}``. Lightweight —
+    walks 3 levels and a curated set of names. Excludes vendor/.venv etc.
+
+    All paths are repo-relative."""
+    repo = Path(repo_path).expanduser().resolve()
+    out: dict[str, list[str]] = {
+        "top_level_dirs": [],
+        "django_apps": [],
+        "service_modules": [],
+        "view_modules": [],
+    }
+    if not repo.is_dir():
+        return out
+
+    SKIP = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+        "target", ".next", ".turbo", "out", "coverage", ".cache",
+        ".idea", ".vscode", ".artifacts", "vendor",
+    }
+
+    # Top-level dirs (1 level deep, alphabetical, capped).
+    try:
+        entries = sorted(p.name for p in repo.iterdir() if p.is_dir() and p.name not in SKIP and not p.name.startswith("."))
+        out["top_level_dirs"] = entries[:25]
+    except OSError:
+        pass
+
+    # Django apps: directory containing models.py with a non-abstract
+    # Django Model class. Same heuristic the rubric uses, surfaced here
+    # for the planner.
+    apps_root = repo / "apps"
+    candidates = [apps_root] if apps_root.is_dir() else []
+    candidates.extend(p for p in repo.iterdir() if p.is_dir() and p.name not in SKIP and not p.name.startswith("."))
+
+    seen: set[str] = set()
+    for root in candidates:
+        try:
+            for child in root.iterdir():
+                if not child.is_dir() or child.name in SKIP or child.name.startswith("."):
+                    continue
+                models_py = child / "models.py"
+                if models_py.exists():
+                    try:
+                        text = models_py.read_text(encoding="utf-8", errors="replace")[:8_000]
+                    except OSError:
+                        continue
+                    if re.search(r"\bmodels\.Model\b", text):
+                        rel = str(child.relative_to(repo))
+                        if rel not in seen:
+                            out["django_apps"].append(rel)
+                            seen.add(rel)
+        except OSError:
+            continue
+
+    # Service / view modules — single-file presence is enough signal.
+    for pat in ("**/services/*.py", "**/services.py"):
+        for p in repo.glob(pat):
+            if any(part in SKIP for part in p.parts):
+                continue
+            if p.name == "__init__.py":
+                continue
+            rel = str(p.relative_to(repo))
+            out["service_modules"].append(rel)
+    for pat in ("**/views.py", "**/views/*.py", "**/api/views.py", "**/api/viewsets/*.py"):
+        for p in repo.glob(pat):
+            if any(part in SKIP for part in p.parts):
+                continue
+            if p.name == "__init__.py":
+                continue
+            rel = str(p.relative_to(repo))
+            out["view_modules"].append(rel)
+
+    out["django_apps"] = sorted(set(out["django_apps"]))[:30]
+    out["service_modules"] = sorted(set(out["service_modules"]))[:30]
+    out["view_modules"] = sorted(set(out["view_modules"]))[:30]
+    return out
+
+
 def _rubric_is_stalled(recent_decisions: list[dict]) -> bool:
     """Heuristic: if the last 4 validate entries are all soft_accept with
     abs(delta_pp) < 0.5, the rubric isn't responding to the work being
@@ -326,6 +419,36 @@ def _build_prompt(ctx: ReplanContext) -> str:
     if p.web.status == "ok" and p.web.landscape_md:
         lines.append("## Competitive landscape (excerpt)")
         lines.append(p.web.landscape_md[:1200])
+        lines.append("")
+
+    inv = ctx.code_inventory or {}
+    if inv:
+        lines.append("## Existing code inventory — REUSE these, do not parallel")
+        lines.append(
+            "Before generating any FEATURE slice that creates a new "
+            "package or module, check this list. If the same domain "
+            "(billing, tenants, launch_ops, arc, etc.) already has a "
+            "module here, EXTEND it rather than creating a parallel "
+            "package elsewhere in the tree. Live failure: a previous "
+            "cycle shipped top-level `billing/` while `apps/billing/` "
+            "already existed; the new module's models were never wired "
+            "to the existing webhook handler. Don't repeat this."
+        )
+        if inv.get("django_apps"):
+            lines.append("")
+            lines.append("Django apps with existing models.py:")
+            for a in inv["django_apps"]:
+                lines.append(f"- {a}")
+        if inv.get("service_modules"):
+            lines.append("")
+            lines.append("Existing service modules:")
+            for s in inv["service_modules"][:20]:
+                lines.append(f"- {s}")
+        if inv.get("view_modules"):
+            lines.append("")
+            lines.append("Existing view modules:")
+            for v in inv["view_modules"][:20]:
+                lines.append(f"- {v}")
         lines.append("")
 
     # Add cycle-progress context. If trailing rubric deltas have been
