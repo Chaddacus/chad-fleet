@@ -538,3 +538,126 @@ def test_replan_picks_up_seeded_backlog(ws: AppWorkspace, repo: Path) -> None:
     # when a backlog file exists.
     assert rm is not None
     assert len(rm.slices) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Saturation gate — captain pauses when backlog is empty
+# ---------------------------------------------------------------------------
+
+
+def test_replan_if_needed_pauses_when_backlog_empty(
+    ws: AppWorkspace, repo: Path
+) -> None:
+    """When all features are shipped and roadmap is exhausted, the
+    captain should pause with backlog_saturated rather than dispatch
+    rubric-only filler."""
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        CaptainLogEntry, append_captain_log, read_captain_log,
+        write_feature_backlog,
+    )
+    from chad_captain.replanner import replan_if_needed
+    # Empty backlog (all shipped, none queued)
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="test-app",
+        items=[FeatureBacklogItem(
+            id="fb-001", title="Already shipped", status="shipped",
+            shipped_in="PR#1", priority=0.5,
+        )],
+    ))
+    # Roadmap exhausted (so trigger fires)
+    write_roadmap(ws, Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="S1", objective="x", status="done")],
+    ))
+
+    result = replan_if_needed(ws, repo)
+    assert result is None, "saturated app should NOT replan"
+    assert ws.pause_until_path.exists(), "saturation pause file should exist"
+
+    import json as _json
+    pause_data = _json.loads(ws.pause_until_path.read_text())
+    assert pause_data.get("reason") == "backlog_saturated"
+
+    log = read_captain_log(ws, limit=5)
+    assert any(
+        e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "backlog_saturated"
+        for e in log
+    ), "escalation log entry should be written"
+
+
+def test_admiral_note_overrides_saturation(
+    ws: AppWorkspace, repo: Path
+) -> None:
+    """If Chad sends an admiral note, replan honoring it even if backlog is empty."""
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        write_feature_backlog,
+    )
+    from chad_captain.replanner import replan_if_needed
+    write_feature_backlog(ws, FeatureBacklog(app_id="test-app", items=[]))
+    write_roadmap(ws, Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="S1", objective="x", status="done")],
+    ))
+    write_admiral_note(ws, AdmiralNote(
+        note_id="n1", app_id="test-app",
+        body="Replan: ship a hotfix for X",
+    ))
+    result = replan_if_needed(ws, repo)
+    # admiral steering wins — replan ran (use_llm fallback path),
+    # no saturation pause file written
+    assert result is not None
+    assert not ws.pause_until_path.exists()
+
+
+def test_saturation_skips_double_log_within_window(
+    ws: AppWorkspace, repo: Path
+) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, write_feature_backlog,
+        read_captain_log,
+    )
+    from chad_captain.replanner import replan_if_needed
+    write_feature_backlog(ws, FeatureBacklog(app_id="test-app", items=[]))
+    write_roadmap(ws, Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="S1", objective="x", status="done")],
+    ))
+    replan_if_needed(ws, repo)
+    replan_if_needed(ws, repo)  # should not double-log
+    log = read_captain_log(ws, limit=20)
+    saturation_logs = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "backlog_saturated"
+    ]
+    assert len(saturation_logs) == 1
+
+
+def test_backlog_add_clears_saturation_pause(ws: AppWorkspace) -> None:
+    from chad_captain.cli import _clear_saturation_pause
+    import json as _json
+    ws.pause_until_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.pause_until_path.write_text(
+        _json.dumps({"until": "2099-01-01T00:00:00+00:00",
+                      "reason": "backlog_saturated"})
+    )
+    cleared = _clear_saturation_pause(ws)
+    assert cleared is True
+    assert not ws.pause_until_path.exists()
+
+
+def test_clear_saturation_pause_skips_circuit_breaker_pause(ws: AppWorkspace) -> None:
+    from chad_captain.cli import _clear_saturation_pause
+    import json as _json
+    ws.pause_until_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.pause_until_path.write_text(
+        _json.dumps({"until": "2099-01-01T00:00:00+00:00",
+                      "reason": "circuit_breaker"})
+    )
+    cleared = _clear_saturation_pause(ws)
+    assert cleared is False
+    # Circuit-breaker pause must remain
+    assert ws.pause_until_path.exists()

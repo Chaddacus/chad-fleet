@@ -220,11 +220,88 @@ def replan(
 
 def replan_if_needed(ws: AppWorkspace, repo_path: str | Path) -> Roadmap | None:
     """Inspect the current roadmap + log and call ``replan`` if a trigger
-    applies. Returns the new Roadmap if it ran, else None."""
+    applies. Returns the new Roadmap if it ran, else None.
+
+    Saturation gate: if the trigger fires AND the feature backlog has zero
+    queued items AND there are no unread admiral notes, pause the app
+    with a ``backlog_saturated`` marker instead of generating filler
+    work. The pause expires in 24h or when fresh backlog items arrive
+    (via ``chad-captain backlog add`` / ``chad-captain ideate`` — both
+    auto-clear saturation pauses).
+    """
     trigger = _detect_trigger(ws)
     if trigger is None:
         return None
+    # Saturation only applies to mid-life apps that have already shipped
+    # features. Initial replans (no roadmap yet) and admiral-driven replans
+    # always proceed regardless of backlog state.
+    if trigger in ("exhausted", "soft_accept_streak") and _is_backlog_saturated(ws):
+        _trigger_saturation_pause(ws)
+        return None
     return replan(ws, repo_path, trigger=trigger)
+
+
+def _is_backlog_saturated(ws: AppWorkspace) -> bool:
+    """True when the captain has nothing left to ship: backlog queued is
+    empty AND no admiral note is steering. Admiral notes always win — if
+    Chad sent guidance, replan the roadmap honoring it instead of pausing.
+    """
+    if list_unread_admiral_notes(ws):
+        return False
+    backlog = read_feature_backlog(ws)
+    return len(backlog.queued()) == 0
+
+
+def _trigger_saturation_pause(ws: AppWorkspace) -> None:
+    """Write a 24h pause file with ``reason='backlog_saturated'`` and emit
+    an escalation log entry the dashboard surfaces as 'needs you'.
+
+    Idempotent — re-running on an already-saturated app extends the pause
+    horizon but doesn't double-log.
+    """
+    from datetime import datetime, timedelta, timezone
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log, read_captain_log,
+    )
+    from chad_captain.validator import _write_pause_until
+    until = datetime.now(timezone.utc) + timedelta(hours=24)
+    _write_pause_until(ws, until.isoformat(), reason="backlog_saturated")
+
+    # Don't double-log: skip if the most recent escalation was already
+    # backlog_saturated within the last 6h (lighter dedup than checking
+    # every entry — saturation is a slow-moving state).
+    recent = read_captain_log(ws, limit=10)
+    for e in recent:
+        if (
+            e.kind == "escalation_raised"
+            and (e.references or {}).get("event") == "backlog_saturated"
+        ):
+            try:
+                ts = datetime.fromisoformat(e.ts)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - ts < timedelta(hours=6):
+                    return
+            except (ValueError, TypeError):
+                continue
+
+    backlog = read_feature_backlog(ws)
+    shipped = len(backlog.shipped())
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id,
+            slice_id=None,
+            kind="escalation_raised",
+            rationale=(
+                f"backlog saturated — {shipped} features shipped, 0 queued. "
+                "Run `chad-captain ideate --app "
+                + f"{ws.app_id} --refresh-research` to refill the backlog, "
+                "or send an admiral note to steer."
+            ),
+            references={"event": "backlog_saturated", "shipped_count": str(shipped)},
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

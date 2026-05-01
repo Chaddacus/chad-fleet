@@ -162,6 +162,7 @@ def create_app() -> FastAPI:
         reg = load_registry()
         entry = reg.by_id(app_id)
         paused_until: str | None = None
+        pause_reason: str | None = None
         if ws.pause_until_path.exists():
             try:
                 import json
@@ -173,6 +174,7 @@ def create_app() -> FastAPI:
                         until_dt = until_dt.replace(tzinfo=timezone.utc)
                     if datetime.now(timezone.utc) < until_dt:
                         paused_until = until_iso
+                        pause_reason = pdata.get("reason") or "circuit_breaker"
             except (ValueError, KeyError, OSError):
                 pass
 
@@ -190,6 +192,7 @@ def create_app() -> FastAPI:
             "progress_tail": progress_tail,
             "unread_admiral_notes": unread,
             "paused_until": paused_until,
+            "pause_reason": pause_reason,
             "feature_backlog": backlog.model_dump(mode="json") if backlog else None,
             "scorecard": None,
         }

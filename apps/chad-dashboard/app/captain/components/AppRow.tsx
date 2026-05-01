@@ -20,6 +20,7 @@ export function AppRow({ app }: { app: AppStateBundle }) {
   const progress = roadmapProgress(app.roadmap?.slices);
   const ac = appActivityClass(app);
   const isPaused = !!(app.paused_until && new Date(app.paused_until).getTime() > Date.now());
+  const isSaturated = isPaused && app.pause_reason === 'backlog_saturated';
   const pauseMinutesLeft = isPaused
     ? Math.max(0, Math.round((new Date(app.paused_until!).getTime() - Date.now()) / 60000))
     : 0;
@@ -49,20 +50,24 @@ export function AppRow({ app }: { app: AppStateBundle }) {
 
       <div className="app-row-activity">
         <div className="activity-status-line">
-          <div className={`activity-pulse${cs ? '' : ' idle'}${isPaused ? ' paused' : ''}`}></div>
-          <span className={`activity-status${cs ? ' live' : ''}${isPaused ? ' paused' : ''}`}>
-            {isPaused ? '⏸ paused' : cs ? 'in flight' : 'idle'}
+          <div className={`activity-pulse${cs ? '' : ' idle'}${isPaused ? (isSaturated ? ' saturated' : ' paused') : ''}`}></div>
+          <span className={`activity-status${cs ? ' live' : ''}${isPaused ? (isSaturated ? ' saturated' : ' paused') : ''}`}>
+            {isSaturated ? '★ awaiting direction' : isPaused ? '⏸ paused' : cs ? 'in flight' : 'idle'}
           </span>
         </div>
         {isPaused ? (
           <>
             <div className="activity-obj">
-              Circuit breaker tripped — resumes in ~{pauseMinutesLeft}m
+              {isSaturated
+                ? 'Backlog saturated — awaiting direction'
+                : `Circuit breaker tripped — resumes in ~${pauseMinutesLeft}m`}
             </div>
             <div className="activity-meta">
-              {app.captain_log_tail[0]
-                ? trunc(app.captain_log_tail[0].rationale, 72)
-                : 'paused by safety guard'}
+              {isSaturated
+                ? 'run `chad-captain ideate --refresh-research` or send admiral note'
+                : (app.captain_log_tail[0]
+                    ? trunc(app.captain_log_tail[0].rationale, 72)
+                    : 'paused by safety guard')}
             </div>
           </>
         ) : cs ? (

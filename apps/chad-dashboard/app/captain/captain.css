@@ -146,6 +146,13 @@
   background: var(--yellow);
   box-shadow: 0 0 8px var(--yellow);
 }
+.app-row.saturated .app-row-accent {
+  background: var(--indigo);
+  box-shadow: 0 0 10px var(--indigo);
+  animation: cap-bar-pulse 1.6s ease-in-out infinite;
+}
+.activity-pulse.saturated { background: var(--indigo); box-shadow: 0 0 6px var(--indigo); }
+.activity-status.saturated { color: var(--indigo); font-weight: 600; }
 .app-row.escalating .app-row-accent {
   background: var(--red);
   box-shadow: 0 0 12px var(--red);

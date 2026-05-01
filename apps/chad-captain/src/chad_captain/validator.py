@@ -757,10 +757,14 @@ def _is_paused(ws: AppWorkspace) -> bool:
     return True
 
 
-def _write_pause_until(ws: AppWorkspace, until_iso: str) -> None:
+def _write_pause_until(
+    ws: AppWorkspace, until_iso: str, *, reason: str = "circuit_breaker",
+) -> None:
     import json as _json
     ws.pause_until_path.parent.mkdir(parents=True, exist_ok=True)
-    ws.pause_until_path.write_text(_json.dumps({"until": until_iso}))
+    ws.pause_until_path.write_text(
+        _json.dumps({"until": until_iso, "reason": reason})
+    )
 
 
 def _maybe_trip_circuit_breaker(ws: AppWorkspace, reg_app) -> None:

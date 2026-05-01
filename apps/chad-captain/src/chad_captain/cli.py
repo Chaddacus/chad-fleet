@@ -337,6 +337,25 @@ def cmd_status(_args: argparse.Namespace) -> None:
     print(json.dumps(status, indent=2))
 
 
+def _clear_saturation_pause(ws) -> bool:
+    """If the app's pause file is a saturation pause, delete it.
+    Returns True iff a saturation pause was cleared.
+    """
+    if not ws.pause_until_path.exists():
+        return False
+    try:
+        data = json.loads(ws.pause_until_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if data.get("reason") != "backlog_saturated":
+        return False
+    try:
+        ws.pause_until_path.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def cmd_backlog(args: argparse.Namespace) -> None:
     """Dispatch `chad-captain backlog {add,list,ship,defer}`."""
     from chad_captain.protocol import (
@@ -365,7 +384,11 @@ def cmd_backlog(args: argparse.Namespace) -> None:
         )
         backlog.items.append(item)
         write_feature_backlog(ws, backlog)
-        print(f"added {item.id}: {item.title} (priority={item.priority})")
+        cleared = _clear_saturation_pause(ws)
+        msg = f"added {item.id}: {item.title} (priority={item.priority})"
+        if cleared:
+            msg += " — saturation pause cleared"
+        print(msg)
         return
 
     if sub == "list":
@@ -472,6 +495,9 @@ def cmd_ideate(args: argparse.Namespace) -> None:
     added, skipped = merge_candidates_into_backlog(ws, candidates)
     print()
     print(f"merged: +{added} new, {skipped} dedup'd against existing")
+    if added > 0:
+        if _clear_saturation_pause(ws):
+            print("saturation pause cleared — captain can resume on next tick")
 
 
 def main(argv: list[str] | None = None) -> None:

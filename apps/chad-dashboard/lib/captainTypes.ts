@@ -122,6 +122,7 @@ export interface AppStateBundle {
   progress_tail: ProgressEvent[];
   unread_admiral_notes: string[];
   paused_until?: string | null;
+  pause_reason?: 'circuit_breaker' | 'backlog_saturated' | string | null;
   feature_backlog?: FeatureBacklog | null;
   scorecard: Scorecard | null;
   error?: string;
