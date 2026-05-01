@@ -414,6 +414,66 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     raise ValueError(f"unknown backlog subcommand: {sub}")
 
 
+def cmd_ideate(args: argparse.Namespace) -> None:
+    """Run feature ideation against an app's research profile."""
+    from chad_captain.protocol import AppWorkspace
+    from chad_captain.research import synthesize_profile, load_profile
+    from chad_captain.research.ideation import (
+        ideate_features, merge_candidates_into_backlog,
+    )
+    from chad_captain.scorecard import score_repo
+    from chad_captain.extras import get_extras
+    from chad_captain.apps_registry import load_registry
+
+    ws = AppWorkspace(args.app)
+    reg = load_registry()
+    entry = reg.by_id(args.app)
+    repo = args.repo or (entry.repo_path if entry else None)
+    if not repo:
+        print(f"no repo path for {args.app} (pass --repo or register the app)",
+              file=sys.stderr)
+        sys.exit(2)
+
+    profile = (
+        synthesize_profile(ws, repo, refresh=True)
+        if args.refresh_research
+        else (load_profile(ws) or synthesize_profile(ws, repo))
+    )
+    sc = score_repo(repo, extras=get_extras(args.app))
+    weak = sorted(sc.dimensions, key=lambda d: d.score)[:5]
+    weak_dims = [f"{d.name} ({d.score:.2f}): {d.rationale}" for d in weak]
+
+    candidates, saturation = ideate_features(
+        ws, profile, scorecard_weak_dims=weak_dims, model=args.model,
+    )
+
+    if not candidates:
+        print("(no candidates)")
+        if saturation:
+            print(f"saturation: {saturation}")
+        return
+
+    print(f"# {len(candidates)} candidate(s)")
+    if saturation:
+        print(f"# saturation_note: {saturation}")
+    for c in candidates:
+        print(f"  {c.title}")
+        print(f"    priority={c.priority:.2f} est={c.estimated_slice_count}")
+        if c.rationale:
+            print(f"    rationale: {c.rationale[:200]}")
+        for ev in c.competitive_evidence[:3]:
+            print(f"    evidence: {ev[:120]}")
+
+    if args.dry_run:
+        print()
+        print("(dry-run) — backlog not modified")
+        return
+
+    added, skipped = merge_candidates_into_backlog(ws, candidates)
+    print()
+    print(f"merged: +{added} new, {skipped} dedup'd against existing")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="chad-captain",
@@ -536,6 +596,21 @@ def main(argv: list[str] | None = None) -> None:
         "--status", default="deferred", choices=("deferred", "obsolete", "queued"),
     )
 
+    ideate_p = sub.add_parser(
+        "ideate",
+        help="Phase B — auto-generate feature backlog candidates from research",
+    )
+    ideate_p.add_argument("--app", required=True, metavar="APP_ID")
+    ideate_p.add_argument("--repo", default=None, metavar="PATH",
+                           help="Repo path; defaults to registry entry. Used to refresh "
+                                "research if needed.")
+    ideate_p.add_argument("--refresh-research", action="store_true",
+                           help="Force a fresh research pass before ideating")
+    ideate_p.add_argument("--dry-run", action="store_true",
+                           help="Print candidates as JSON; don't write to backlog")
+    ideate_p.add_argument("--model", default="opus",
+                           choices=("opus", "haiku", "sonnet"))
+
     research_p = sub.add_parser("research", help="Build or read app research profile")
     research_p.add_argument("--app", required=True, metavar="APP_ID")
     research_p.add_argument("--repo", default=None, metavar="PATH",
@@ -566,6 +641,7 @@ def main(argv: list[str] | None = None) -> None:
         "install-plists": cmd_install_plists,
         "init-workspace": cmd_init_workspace,
         "backlog": cmd_backlog,
+        "ideate": cmd_ideate,
     }
     dispatch[args.command](args)
 
