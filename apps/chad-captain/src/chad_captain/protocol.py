@@ -93,6 +93,13 @@ class AppWorkspace:
         reads at validate to compute the rubric delta."""
         return self.root / "slice_baseline.json"
 
+    @property
+    def branch_baseline_path(self) -> Path:
+        """Pre-branch (PR-wide) scorecard snapshot. Captain writes once at
+        captain-branch creation, reads at roadmap_complete to embed a
+        before/after delta in the PR body. Cleared after PR open."""
+        return self.root / "branch_baseline.json"
+
     def ensure(self) -> None:
         """Create the workspace directory tree if missing."""
         for d in (

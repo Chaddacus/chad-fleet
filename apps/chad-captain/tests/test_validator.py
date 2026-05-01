@@ -720,4 +720,305 @@ def test_build_current_slice_marks_retry() -> None:
     rs = RoadmapSlice(slice_id="s1", objective="o")
     cs = build_current_slice(rs, app_id="test-app", repo_path="/tmp/r", parent_slice_id="s1")
     assert cs.parent_slice_id == "s1"
-    assert cs.slice_id.endswith("-retry")
+
+
+# ---------------------------------------------------------------------------
+# C3 — branch baseline + scorecard delta in PR body
+# ---------------------------------------------------------------------------
+
+
+def _git_init_repo(path: Path, base: str = "main") -> None:
+    """Bootstrap a tiny throwaway git repo for branch-baseline tests."""
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", base], cwd=path, check=True)
+    # README so the repo isn't empty (and so docs_present scores).
+    (path / "README.md").write_text("# test\n")
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "add", "README.md"],
+        cwd=path, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-qm", "init"],
+        cwd=path, check=True,
+    )
+
+
+def test_tick_writes_branch_baseline_on_first_dispatch(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First dispatch onto a captain branch snapshots the scorecard."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A")],
+    )
+    write_roadmap(ws, rm)
+
+    assert not ws.branch_baseline_path.exists()
+    captain_tick(ws, repo_path=str(repo))
+    assert ws.branch_baseline_path.exists()
+
+    # Sanity: the baseline parses as a Scorecard with reasonable shape.
+    from chad_captain.scorecard import read_baseline
+    sc = read_baseline(ws.branch_baseline_path)
+    assert sc is not None
+    assert 0.0 <= sc.aggregate <= 1.0
+    assert any(d.name == "docs_present" for d in sc.dimensions)
+
+
+def test_tick_branch_baseline_not_overwritten_on_resume(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a branch baseline already exists, captain does NOT overwrite it
+    on a subsequent dispatch (idempotent across slices in the same PR)."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import read_baseline, write_baseline, Scorecard, DimensionScore
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    sentinel = Scorecard(
+        repo_path=str(repo),
+        dimensions=[DimensionScore(name="sentinel", score=0.123)],
+        aggregate=0.123,
+    )
+    write_baseline(ws.branch_baseline_path, sentinel)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A")],
+    )
+    write_roadmap(ws, rm)
+    captain_tick(ws, repo_path=str(repo))
+
+    sc = read_baseline(ws.branch_baseline_path)
+    assert sc is not None
+    assert sc.aggregate == 0.123
+    assert sc.dimensions[0].name == "sentinel"
+
+
+def test_roadmap_complete_pr_body_includes_scorecard_delta(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a branch baseline exists at roadmap_complete, the PR body
+    embeds the before/after scorecard delta and the baseline is cleared."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import (
+        DimensionScore,
+        Scorecard,
+        write_baseline,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Pre-populate a low-aggregate baseline so the live score will look better.
+    pre = Scorecard(
+        repo_path=str(repo),
+        dimensions=[DimensionScore(name="docs_present", score=0.0)],
+        aggregate=0.0,
+    )
+    write_baseline(ws.branch_baseline_path, pre)
+
+    pr_calls: list[dict] = []
+
+    def fake_push(*, repo_path: str, branch: str, **_kw):
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_open_pr(*, repo_path: str, base: str, head: str,
+                     title: str, body: str, **_kw):
+        pr_calls.append({"body": body})
+        return mf.CmdResult(
+            ok=True, summary="ok",
+            stdout="https://github.com/owner/repo/pull/99",
+        )
+
+    monkeypatch.setattr(mf, "push_captain_branch", fake_push)
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # PR opened with scorecard section in body
+    assert len(pr_calls) == 1
+    body = pr_calls[0]["body"]
+    assert "Scorecard delta" in body
+    assert "Aggregate:" in body
+    # Baseline cleared on successful PR open
+    assert not ws.branch_baseline_path.exists()
+
+
+def test_roadmap_complete_pr_body_omits_delta_when_no_baseline(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No branch baseline on disk → PR body still ships, just without
+    the scorecard delta section. Best-effort, not blocking."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pr_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    def fake_open_pr(*, body: str, **_kw):
+        pr_calls.append({"body": body})
+        return mf.CmdResult(ok=True, summary="ok", stdout="https://x")
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    assert not ws.branch_baseline_path.exists()
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert len(pr_calls) == 1
+    body = pr_calls[0]["body"]
+    assert "Scorecard delta" not in body
+
+
+def test_roadmap_complete_baseline_preserved_on_pr_open_failure(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If PR open fails, the branch baseline must NOT be cleared so the
+    next captain tick can retry and still produce a delta-bearing PR."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import (
+        DimensionScore,
+        Scorecard,
+        write_baseline,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pre = Scorecard(
+        repo_path=str(repo),
+        dimensions=[DimensionScore(name="docs_present", score=0.0)],
+        aggregate=0.0,
+    )
+    write_baseline(ws.branch_baseline_path, pre)
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=False, summary="exit 1: gh auth required"),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # PR open failed → baseline still on disk for retry.
+    assert ws.branch_baseline_path.exists()

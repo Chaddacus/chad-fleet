@@ -501,6 +501,24 @@ def captain_tick(
                 )
                 return (status + "; " if status else "") + f"branch setup failed: {br.summary}"
 
+            # C3 branch baseline: snapshot the scorecard once per
+            # branch lifetime (created or resumed-with-no-baseline).
+            # Roadmap_complete reads it back to embed before/after
+            # delta in the PR body. Idempotent — never overwrites
+            # an existing baseline. Cleared on PR open.
+            if use_baseline_scorecard and not ws.branch_baseline_path.exists():
+                try:
+                    from chad_captain.extras import get_extras
+                    from chad_captain.scorecard import score_repo, write_baseline
+                    write_baseline(
+                        ws.branch_baseline_path,
+                        score_repo(repo_path, extras=get_extras(ws.app_id)),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "branch baseline write failed for %s: %s", ws.app_id, e,
+                    )
+
         # Detect retry: is this a re-queue of a slice we just rejected?
         log_tail = list(_recent_validate_for(ws, rs.slice_id, limit=5))
         is_retry = any(e.verdict in ("reject_retry", "kill_replan") for e in log_tail)
@@ -618,9 +636,29 @@ def _handle_roadmap_complete(
         )
         return
 
+    # C3: load branch baseline + score current repo so the PR body
+    # embeds an aggregate scorecard delta. Best-effort — failures
+    # mean we ship the PR without the section, not block on it.
+    sc_before: dict | None = None
+    sc_after: dict | None = None
+    try:
+        from chad_captain.extras import get_extras
+        from chad_captain.scorecard import read_baseline, score_repo
+        before = read_baseline(ws.branch_baseline_path)
+        if before is not None:
+            after = score_repo(repo_path, extras=get_extras(ws.app_id))
+            sc_before = before.model_dump()
+            sc_after = after.model_dump()
+    except Exception as e:
+        logger.warning(
+            "branch scorecard delta failed for %s: %s", ws.app_id, e,
+        )
+
     body = format_pr_body(
         app_id=ws.app_id,
         roadmap=roadmap,
+        scorecard_before=sc_before,
+        scorecard_after=sc_after,
         verify_cmd=reg_app.verify_cmd,
     )
     title = format_pr_title(app_id=ws.app_id, roadmap=roadmap)
@@ -631,6 +669,16 @@ def _handle_roadmap_complete(
         title=title,
         body=body,
     )
+    # Clear the branch baseline only on successful PR open so a
+    # crash mid-handler still has the snapshot for the next attempt.
+    if pr_res.ok:
+        try:
+            from chad_captain.scorecard import clear_baseline
+            clear_baseline(ws.branch_baseline_path)
+        except Exception as e:
+            logger.warning(
+                "branch baseline clear failed for %s: %s", ws.app_id, e,
+            )
     append_captain_log(
         ws,
         CaptainLogEntry(
