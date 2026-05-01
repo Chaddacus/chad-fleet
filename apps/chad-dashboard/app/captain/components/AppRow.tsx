@@ -19,6 +19,10 @@ export function AppRow({ app }: { app: AppStateBundle }) {
   const lv = lastValidate(app);
   const progress = roadmapProgress(app.roadmap?.slices);
   const ac = appActivityClass(app);
+  const isPaused = !!(app.paused_until && new Date(app.paused_until).getTime() > Date.now());
+  const pauseMinutesLeft = isPaused
+    ? Math.max(0, Math.round((new Date(app.paused_until!).getTime() - Date.now()) / 60000))
+    : 0;
 
   const scoreVal = app.scorecard?.aggregate;
 
@@ -41,12 +45,23 @@ export function AppRow({ app }: { app: AppStateBundle }) {
 
       <div className="app-row-activity">
         <div className="activity-status-line">
-          <div className={`activity-pulse${cs ? '' : ' idle'}`}></div>
-          <span className={`activity-status${cs ? ' live' : ''}`}>
-            {cs ? 'in flight' : 'idle'}
+          <div className={`activity-pulse${cs ? '' : ' idle'}${isPaused ? ' paused' : ''}`}></div>
+          <span className={`activity-status${cs ? ' live' : ''}${isPaused ? ' paused' : ''}`}>
+            {isPaused ? '⏸ paused' : cs ? 'in flight' : 'idle'}
           </span>
         </div>
-        {cs ? (
+        {isPaused ? (
+          <>
+            <div className="activity-obj">
+              Circuit breaker tripped — resumes in ~{pauseMinutesLeft}m
+            </div>
+            <div className="activity-meta">
+              {app.captain_log_tail[0]
+                ? trunc(app.captain_log_tail[0].rationale, 72)
+                : 'paused by safety guard'}
+            </div>
+          </>
+        ) : cs ? (
           <>
             <div className="activity-obj">{sliceHeadline(cs, 72)}</div>
             <div className="activity-meta">

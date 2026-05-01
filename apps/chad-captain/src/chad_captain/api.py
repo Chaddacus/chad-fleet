@@ -161,6 +161,21 @@ def create_app() -> FastAPI:
                         continue
         reg = load_registry()
         entry = reg.by_id(app_id)
+        paused_until: str | None = None
+        if ws.pause_until_path.exists():
+            try:
+                import json
+                pdata = json.loads(ws.pause_until_path.read_text())
+                until_iso = pdata.get("until")
+                if until_iso:
+                    until_dt = datetime.fromisoformat(until_iso)
+                    if until_dt.tzinfo is None:
+                        until_dt = until_dt.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) < until_dt:
+                        paused_until = until_iso
+            except (ValueError, KeyError, OSError):
+                pass
+
         bundle: dict[str, Any] = {
             "app_id": app_id,
             "name": entry.name if entry else app_id,
@@ -171,6 +186,7 @@ def create_app() -> FastAPI:
             "captain_log_tail": [e.model_dump(mode="json") for e in log],
             "progress_tail": progress_tail,
             "unread_admiral_notes": unread,
+            "paused_until": paused_until,
             "scorecard": None,
         }
         if include_scorecard and entry and entry.repo_path and Path(entry.repo_path).exists():

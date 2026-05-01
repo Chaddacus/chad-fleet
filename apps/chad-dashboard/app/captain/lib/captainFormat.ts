@@ -76,9 +76,10 @@ export function verdictCls(v: CaptainVerdict | null | undefined): string {
   return v ? `vc-${v}` : '';
 }
 
-export function appActivityClass(app: AppStateBundle): 'active' | 'idle' | 'escalating' | 'warn' {
+export function appActivityClass(app: AppStateBundle): 'active' | 'idle' | 'escalating' | 'warn' | 'paused' {
   const lastValidate = app.captain_log_tail.find((e) => e.kind === 'validate');
   if (lastValidate?.verdict === 'escalate') return 'escalating';
+  if (app.paused_until && new Date(app.paused_until).getTime() > Date.now()) return 'paused';
   if (app.current_slice) return 'active';
   if (lastValidate?.verdict === 'reject_retry') return 'warn';
   return 'idle';

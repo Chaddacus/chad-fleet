@@ -121,6 +121,7 @@ export interface AppStateBundle {
   captain_log_tail: CaptainLogEntry[];
   progress_tail: ProgressEvent[];
   unread_admiral_notes: string[];
+  paused_until?: string | null;
   scorecard: Scorecard | null;
   error?: string;
 }

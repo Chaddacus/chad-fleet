@@ -142,11 +142,17 @@
 }
 .app-row.idle .app-row-accent { background: var(--t3); }
 .app-row.warn .app-row-accent { background: var(--yellow); }
+.app-row.paused .app-row-accent {
+  background: var(--yellow);
+  box-shadow: 0 0 8px var(--yellow);
+}
 .app-row.escalating .app-row-accent {
   background: var(--red);
   box-shadow: 0 0 12px var(--red);
   animation: cap-bar-pulse 0.8s ease-in-out infinite;
 }
+.activity-pulse.paused { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: none; }
+.activity-status.paused { color: var(--yellow); font-weight: 600; }
 @keyframes cap-bar-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
 
 .app-row.active::after {
