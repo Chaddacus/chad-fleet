@@ -43,6 +43,7 @@ from chad_captain.protocol import (
     SliceComplete,
     append_captain_log,
     clear_slice_complete,
+    read_current_slice,
     read_roadmap,
     read_slice_complete,
     write_current_slice,
@@ -346,6 +347,13 @@ def captain_tick(
     from chad_captain.apps_registry import load_registry
     reg_app = load_registry().by_id(ws.app_id)
 
+    # C7 — stall watchdog. Before any other work, check if a slice has
+    # been "in flight" (current_slice on disk, no slice_complete) past
+    # its timeout + grace window. If so, synthesize a SliceComplete
+    # with goose_exit_code=-9 so the validate path routes it through
+    # kill_replan. This recovers the loop when goose-runner hangs.
+    _maybe_watchdog_stalled_slice(ws)
+
     # 1. Validate any pending completion.
     completion = read_slice_complete(ws)
     if completion is not None:
@@ -578,6 +586,83 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     entries = read_captain_log(ws, limit=50)
     matches = [e for e in entries if e.kind == "validate" and (e.slice_id == slice_id or (e.slice_id or "").startswith(slice_id))]
     return matches[-limit:]
+
+
+# Grace window past CurrentSlice.timeout_seconds before declaring a stall.
+# goose-runner's own watchdog should kill at timeout_seconds; if it didn't,
+# the runner itself has likely hung (tool-call loop, network deadlock, etc).
+# 5min grace is enough to cover slow shutdowns without blocking the loop.
+_STALL_GRACE_SECONDS = 300
+
+
+def _maybe_watchdog_stalled_slice(ws: AppWorkspace) -> None:
+    """If current_slice has been in flight past timeout + grace, synthesize
+    a SliceComplete(goose_exit_code=-9) so the validator's kill_replan path
+    fires and the slice gets re-queued. Idempotent: if a slice_complete
+    already exists, do nothing (validator handles it normally).
+    """
+    if read_slice_complete(ws) is not None:
+        return  # validator will handle the real completion this tick
+    cs = read_current_slice(ws)
+    if cs is None or not cs.started_at:
+        return  # no in-flight slice (or runner hasn't picked up yet)
+
+    try:
+        started = datetime.fromisoformat(cs.started_at)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+    except ValueError:
+        logger.warning("watchdog: bad started_at %r on %s", cs.started_at, ws.app_id)
+        return
+
+    age_s = (datetime.now(timezone.utc) - started).total_seconds()
+    deadline_s = cs.timeout_seconds + _STALL_GRACE_SECONDS
+    if age_s < deadline_s:
+        return  # still within timeout + grace window
+
+    logger.warning(
+        "stall watchdog: %s slice %s in flight %.0fs (limit %ds); killing.",
+        ws.app_id, cs.slice_id, age_s, deadline_s,
+    )
+
+    from chad_captain.protocol import (
+        clear_current_slice,
+        write_slice_complete,
+    )
+
+    write_slice_complete(
+        ws,
+        SliceComplete(
+            slice_id=cs.slice_id,
+            app_id=ws.app_id,
+            duration_seconds=age_s,
+            goose_exit_code=-9,
+            summary=(
+                f"watchdog: slice in flight {age_s:.0f}s, exceeded "
+                f"timeout {cs.timeout_seconds}s + grace {_STALL_GRACE_SECONDS}s"
+            ),
+            failure_tail="captain stall watchdog killed the slice",
+        ),
+    )
+    clear_current_slice(ws)
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id,
+            slice_id=cs.slice_id,
+            kind="stall_detected",
+            rationale=(
+                f"slice in flight {age_s:.0f}s past limit "
+                f"({cs.timeout_seconds}s + {_STALL_GRACE_SECONDS}s grace); "
+                "synthesized SliceComplete(-9) for kill_replan"
+            ),
+            references={
+                "started_at": cs.started_at,
+                "age_seconds": f"{age_s:.0f}",
+                "limit_seconds": str(deadline_s),
+            },
+        ),
+    )
 
 
 def _maybe_self_merge_pr(

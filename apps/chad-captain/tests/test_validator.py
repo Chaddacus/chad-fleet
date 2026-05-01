@@ -1029,6 +1029,183 @@ def test_roadmap_complete_baseline_preserved_on_pr_open_failure(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# C7 — stall watchdog
+# ---------------------------------------------------------------------------
+
+
+def _write_inflight_slice(
+    ws: AppWorkspace, *, started_at: str, timeout_seconds: int = 1800,
+    slice_id: str = "s1",
+) -> None:
+    from chad_captain.protocol import write_current_slice
+    write_current_slice(
+        ws,
+        CurrentSlice(
+            slice_id=slice_id, app_id="test-app",
+            objective="o", system_prompt="s", user_prompt="u",
+            repo_path="/tmp/r",
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+        ),
+    )
+
+
+def test_watchdog_kills_stalled_slice_past_timeout_plus_grace(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Slice in flight beyond timeout + grace → synthesize SliceComplete(-9)
+    + emit stall_detected + clear current_slice. Validator path then
+    routes through kill_replan on the next phase of the same tick."""
+    from datetime import datetime, timedelta, timezone
+    from chad_captain.protocol import read_slice_complete
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # 30min timeout + 5min grace = 35min limit; fixture sets started 60min ago
+    long_ago = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
+    _write_inflight_slice(ws, started_at=long_ago, timeout_seconds=1800)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    kinds = [e.kind for e in log]
+    # Stall detected + validate=kill_replan both fired in this tick
+    assert "stall_detected" in kinds
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "kill_replan"
+    # slice_complete consumed by validate (cleared at end)
+    assert read_slice_complete(ws) is None
+    # kill_replan re-queued s1; dispatch path then picked it up as a retry
+    cs = read_current_slice(ws)
+    assert cs is not None
+    assert cs.parent_slice_id == "s1"
+    assert cs.slice_id == "s1-retry"
+
+
+def test_watchdog_skips_when_slice_within_window(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Slice in flight under the limit → watchdog no-op, no stall_detected."""
+    from datetime import datetime, timedelta, timezone
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    _write_inflight_slice(ws, started_at=recent, timeout_seconds=1800)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # current_slice still present, no stall logged, no validate (no completion yet)
+    assert ws.current_slice_path.exists()
+    log = read_captain_log(ws)
+    assert "stall_detected" not in [e.kind for e in log]
+
+
+def test_watchdog_skips_when_started_at_unset(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """current_slice on disk but runner hasn't picked up (started_at=None)
+    → no watchdog (it's a goose-runner queue issue, not a stall)."""
+    from chad_captain.protocol import write_current_slice
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_current_slice(
+        ws,
+        CurrentSlice(
+            slice_id="s1", app_id="test-app", objective="o",
+            system_prompt="s", user_prompt="u", repo_path="/tmp/r",
+            started_at=None,  # explicit
+        ),
+    )
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    assert "stall_detected" not in [e.kind for e in log]
+
+
+def test_watchdog_no_op_when_slice_complete_already_present(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """If SliceComplete already exists, watchdog defers to validator —
+    even if started_at looks ancient."""
+    from datetime import datetime, timedelta, timezone
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    long_ago = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+    _write_inflight_slice(ws, started_at=long_ago, timeout_seconds=600)
+
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    # No stall — the real completion was processed
+    assert "stall_detected" not in [e.kind for e in log]
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    # accept (clean exit + files) not kill_replan
+    assert validates[0].verdict == "accept"
+
+
+def test_watchdog_handles_invalid_started_at_gracefully(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Bad timestamp → log warning + no-op, never crash."""
+    from chad_captain.protocol import write_current_slice
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    write_current_slice(
+        ws,
+        CurrentSlice(
+            slice_id="s1", app_id="test-app", objective="o",
+            system_prompt="s", user_prompt="u", repo_path="/tmp/r",
+            started_at="not-a-real-iso-timestamp",
+        ),
+    )
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+
+    # Should not raise
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log = read_captain_log(ws)
+    assert "stall_detected" not in [e.kind for e in log]
+
+
 def test_post_merge_cycle_runs_when_pr_merged(
     ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
