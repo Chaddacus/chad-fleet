@@ -7,6 +7,7 @@ import type {
   CaptainLogEntry,
   ProgressEvent,
   RoadmapSlice,
+  SessionSummary,
 } from '@/lib/captainTypes';
 import { Delta, VChip } from '../components/Chips';
 import {
@@ -164,6 +165,9 @@ export default function L2Client({ initial }: Props) {
             )}
           </div>
           <div className="pane-body">
+            <div className="sec-lbl" style={{ marginTop: 0 }}>Session Summary</div>
+            <SummaryPane appId={app.app_id} />
+            <div className="sec-lbl" style={{ marginTop: '12px' }}>Roadmap</div>
             <RoadmapPane appId={app.app_id} roadmap={rm} />
             <BacklogPane backlog={app.feature_backlog ?? null} />
             <div className="sec-lbl" style={{ marginTop: '8px' }}>Captain Log</div>
@@ -237,6 +241,100 @@ function LogRow({ entry }: { entry: CaptainLogEntry }) {
         <pre className="log-refs">{JSON.stringify(entry.references, null, 2)}</pre>
       )}
     </div>
+  );
+}
+
+function SummaryPane({ appId }: { appId: string }) {
+  const [summary, setSummary] = useState<SessionSummary | null>(null);
+  const [window, setWindow] = useState<'24h' | '7d' | 'all'>('24h');
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const r = await fetch(
+          `/api/captain/apps/${encodeURIComponent(appId)}/summary?since=${window}`,
+          { cache: 'no-store' },
+        );
+        if (!r || !r.ok) return;
+        const d = (await r.json()) as SessionSummary;
+        if (alive) setSummary(d);
+      } catch {
+        if (alive) setSummary(null);
+      }
+    })();
+    return () => { alive = false; };
+  }, [appId, window]);
+
+  if (!summary) {
+    return <div className="log-rat" style={{ color: 'var(--t3)' }}>Loading session summary…</div>;
+  }
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+        {(['24h', '7d', 'all'] as const).map(w => (
+          <button
+            key={w}
+            onClick={() => setWindow(w)}
+            className={`pane-tag ${window === w ? 'active' : ''}`}
+            style={{
+              cursor: 'pointer',
+              opacity: window === w ? 1 : 0.5,
+              border: 'none',
+              background: window === w ? 'var(--surface)' : 'transparent',
+              color: 'var(--t1)',
+              fontSize: 10,
+            }}
+          >
+            {w}
+          </button>
+        ))}
+      </div>
+      <div className="summary-headline">{summary.headline}</div>
+      <div className="summary-narrative">{summary.narrative}</div>
+      {summary.features_shipped.length > 0 && (
+        <details className="summary-details">
+          <summary>{summary.features_shipped.length} feature{summary.features_shipped.length !== 1 ? 's' : ''} shipped</summary>
+          {summary.features_shipped.map(f => (
+            <div key={f.id} className="summary-feature">
+              <span className="bl-id">{f.id}</span>
+              <span className="bl-title">{f.title}</span>
+              {f.pr_url && (
+                <a href={f.pr_url} target="_blank" rel="noreferrer" className="bl-meta">
+                  {f.pr_url.split('/').pop()}
+                </a>
+              )}
+            </div>
+          ))}
+        </details>
+      )}
+      {summary.prs_merged.length > 0 && (
+        <details className="summary-details">
+          <summary>{summary.prs_merged.length} PR{summary.prs_merged.length !== 1 ? 's' : ''} merged</summary>
+          {summary.prs_merged.map(pr => (
+            <div key={pr.pr_url} className="summary-pr">
+              <a href={pr.pr_url} target="_blank" rel="noreferrer">{pr.title}</a>
+              {pr.backlog_item_ids.length > 0 && (
+                <span className="bl-meta"> ({pr.backlog_item_ids.join(', ')})</span>
+              )}
+            </div>
+          ))}
+        </details>
+      )}
+      {summary.slices_total > 0 && (
+        <div className="summary-stats">
+          <span>{summary.slices_accepted}✓</span>
+          <span>{summary.slices_soft_accepted}~</span>
+          <span>{summary.slices_rejected}✗</span>
+          {summary.rubric_delta_pp !== null && Math.abs(summary.rubric_delta_pp) >= 0.5 && (
+            <span style={{ color: summary.rubric_delta_pp > 0 ? 'var(--green)' : 'var(--red)' }}>
+              {summary.rubric_delta_pp > 0 ? '+' : ''}{summary.rubric_delta_pp.toFixed(1)}pp
+            </span>
+          )}
+          {summary.escalations > 0 && <span>⚠{summary.escalations}</span>}
+        </div>
+      )}
+    </>
   );
 }
 

@@ -437,6 +437,59 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     raise ValueError(f"unknown backlog subcommand: {sub}")
 
 
+def cmd_summary(args: argparse.Namespace) -> None:
+    """Print a human-readable session summary for an app."""
+    from chad_captain.protocol import AppWorkspace
+    from chad_captain.summary import build_session_summary
+
+    ws = AppWorkspace(args.app)
+    try:
+        s = build_session_summary(ws, window=args.since)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.json:
+        print(json.dumps(s.model_dump(mode="json"), indent=2))
+        return
+
+    print(f"# {args.app} — {s.window_label}")
+    print()
+    print(s.headline)
+    print()
+    print(s.narrative)
+    if s.features_shipped:
+        print()
+        print("Features shipped:")
+        for f in s.features_shipped:
+            ref = f" → {f.pr_url}" if f.pr_url else ""
+            print(f"  ✓ [{f.id}] {f.title}{ref}")
+    if s.prs_merged:
+        print()
+        print("PRs merged:")
+        for pr in s.prs_merged:
+            tags = (
+                f"  ({', '.join(pr.backlog_item_ids)})"
+                if pr.backlog_item_ids else ""
+            )
+            print(f"  ✓ {pr.title}{tags}  {pr.pr_url}")
+    if s.slices_total:
+        print()
+        print(
+            f"Slice verdicts: {s.slices_accepted} accept · "
+            f"{s.slices_soft_accepted} soft_accept · "
+            f"{s.slices_rejected} reject"
+        )
+    if s.rubric_delta_pp is not None:
+        print(f"Rubric delta: {s.rubric_delta_pp:+.2f}pp")
+    if s.escalations:
+        sat = (
+            f" ({s.saturation_events} saturation, {s.circuit_breaker_trips} circuit-breaker)"
+            if (s.saturation_events or s.circuit_breaker_trips) else ""
+        )
+        print(f"Escalations: {s.escalations}{sat}")
+
+
 def cmd_ideate(args: argparse.Namespace) -> None:
     """Run feature ideation against an app's research profile."""
     from chad_captain.protocol import AppWorkspace
@@ -622,6 +675,18 @@ def main(argv: list[str] | None = None) -> None:
         "--status", default="deferred", choices=("deferred", "obsolete", "queued"),
     )
 
+    summary_p = sub.add_parser(
+        "summary",
+        help="Print a human-readable session summary for an app",
+    )
+    summary_p.add_argument("--app", required=True, metavar="APP_ID")
+    summary_p.add_argument(
+        "--since", default="24h",
+        help="Time window: '24h', '7d', '30m', or 'all' (default 24h)",
+    )
+    summary_p.add_argument("--json", action="store_true",
+                            help="Output the full structured summary as JSON")
+
     ideate_p = sub.add_parser(
         "ideate",
         help="Phase B — auto-generate feature backlog candidates from research",
@@ -668,6 +733,7 @@ def main(argv: list[str] | None = None) -> None:
         "init-workspace": cmd_init_workspace,
         "backlog": cmd_backlog,
         "ideate": cmd_ideate,
+        "summary": cmd_summary,
     }
     dispatch[args.command](args)
 

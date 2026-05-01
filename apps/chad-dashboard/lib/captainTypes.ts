@@ -150,6 +150,40 @@ export interface FeatureBacklog {
   items: FeatureBacklogItem[];
 }
 
+export interface ShippedPR {
+  pr_url: string;
+  title: string;
+  merged_at: string | null;
+  backlog_item_ids: string[];
+}
+
+export interface ShippedFeature {
+  id: string;
+  title: string;
+  pr_url: string | null;
+  shipped_at: string | null;
+}
+
+export interface SessionSummary {
+  app_id: string;
+  window_start: string;
+  window_end: string;
+  window_label: string;
+  prs_merged: ShippedPR[];
+  features_shipped: ShippedFeature[];
+  slices_total: number;
+  slices_accepted: number;
+  slices_soft_accepted: number;
+  slices_rejected: number;
+  escalations: number;
+  saturation_events: number;
+  circuit_breaker_trips: number;
+  admiral_notes_received: number;
+  rubric_delta_pp: number | null;
+  narrative: string;
+  headline: string;
+}
+
 export interface FleetBundle {
   generated_at: string;
   count: number;

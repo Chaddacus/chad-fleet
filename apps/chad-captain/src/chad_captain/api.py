@@ -250,6 +250,20 @@ def create_app() -> FastAPI:
         return {"count": len(entries),
                 "entries": [e.model_dump(mode="json") for e in entries]}
 
+    @app.get("/apps/{app_id}/summary")
+    def app_summary(app_id: str, since: str = "24h") -> dict:
+        """Human-readable session summary: PRs merged, features shipped,
+        slice verdicts, rubric delta, narrative. ``since`` accepts
+        '30m', '24h', '7d', or 'all'.
+        """
+        from chad_captain.summary import build_session_summary
+        ws = _ws_or_404(app_id)
+        try:
+            s = build_session_summary(ws, window=since)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return s.model_dump(mode="json")
+
     @app.get("/apps/{app_id}/scorecard")
     def app_scorecard(app_id: str, repo_path: str) -> dict:
         if not Path(repo_path).exists():
