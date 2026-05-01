@@ -91,6 +91,21 @@ def cmd_actions(args: argparse.Namespace) -> None:
         print(f"   {a.rationale}")
 
 
+def cmd_unpause(args: argparse.Namespace) -> None:
+    """Clear a per-app circuit-breaker pause marker.
+
+    Use after resolving the underlying issue that tripped the breaker
+    (3+ consecutive reject_hard/revert/escalate). Captain resumes
+    autonomous dispatch on the next tick.
+    """
+    from chad_captain.protocol import AppWorkspace
+    from chad_captain.validator import clear_pause
+
+    ws = AppWorkspace(args.app)
+    cleared = clear_pause(ws)
+    print(f"[{args.app}] {'pause cleared' if cleared else 'no pause to clear'}")
+
+
 def cmd_tick_all(_args: argparse.Namespace) -> None:
     """Run one autonomous tick across every mode==autonomous app.
 
@@ -350,6 +365,11 @@ def main(argv: list[str] | None = None) -> None:
              "(same code path the daemon uses on its interval)",
     )
 
+    unpause_p = sub.add_parser(
+        "unpause", help="Clear circuit-breaker pause marker for an app",
+    )
+    unpause_p.add_argument("--app", required=True, metavar="APP_ID")
+
     register_p = sub.add_parser("register", help="Register an app in the captain registry")
     register_p.add_argument("--app", default=None, metavar="APP_ID")
     register_p.add_argument("--repo", default=None, metavar="PATH")
@@ -414,6 +434,7 @@ def main(argv: list[str] | None = None) -> None:
         "replan": cmd_replan,
         "tick": cmd_tick,
         "tick-all": cmd_tick_all,
+        "unpause": cmd_unpause,
         "register": cmd_register,
         "install-plists": cmd_install_plists,
         "init-workspace": cmd_init_workspace,

@@ -100,6 +100,14 @@ class AppWorkspace:
         before/after delta in the PR body. Cleared after PR open."""
         return self.root / "branch_baseline.json"
 
+    @property
+    def pause_until_path(self) -> Path:
+        """Wall-clock pause marker. Written by C8 circuit breaker when
+        consecutive failures exceed the threshold, read by captain_tick
+        to gate dispatch. Plain ISO-8601 string in a tiny JSON file.
+        Operator can `chad-captain unpause --app <id>` to clear early."""
+        return self.root / "pause_until.json"
+
     def ensure(self) -> None:
         """Create the workspace directory tree if missing."""
         for d in (

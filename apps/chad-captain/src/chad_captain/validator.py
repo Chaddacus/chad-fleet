@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from chad_captain.protocol import (
@@ -454,6 +454,17 @@ def captain_tick(
     else:
         status = None
 
+    # C8 — circuit breaker: after writing a validate entry, count consecutive
+    # bad verdicts. If ≥ threshold, write pause_until and skip dispatch this
+    # tick (and subsequent ticks until pause expires).
+    if completion is not None and reg_app is not None:
+        _maybe_trip_circuit_breaker(ws, reg_app)
+
+    # C8 pause gate — applies only to dispatch (not validation, which
+    # we always want to process).
+    if _is_paused(ws):
+        return (status + "; " if status else "") + "paused (circuit breaker)"
+
     # 2. Dispatch next slice if no current_slice in flight.
     if not ws.current_slice_path.exists():
         roadmap = read_roadmap(ws)
@@ -586,6 +597,96 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     entries = read_captain_log(ws, limit=50)
     matches = [e for e in entries if e.kind == "validate" and (e.slice_id == slice_id or (e.slice_id or "").startswith(slice_id))]
     return matches[-limit:]
+
+
+# --- C8 circuit breaker helpers ---
+
+
+_BAD_VERDICTS = {"reject_hard", "revert", "escalate"}
+
+
+def _is_paused(ws: AppWorkspace) -> bool:
+    """True iff pause_until.json exists AND wall-clock now < its timestamp."""
+    p = ws.pause_until_path
+    if not p.exists():
+        return False
+    try:
+        import json as _json
+        data = _json.loads(p.read_text())
+        until = datetime.fromisoformat(data["until"])
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+    except (ValueError, KeyError, OSError):
+        # Malformed pause file — clear it so the loop can resume rather
+        # than wedging forever on bad on-disk state.
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return False
+    if datetime.now(timezone.utc) >= until:
+        try:
+            p.unlink()  # auto-clear expired pause
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _write_pause_until(ws: AppWorkspace, until_iso: str) -> None:
+    import json as _json
+    ws.pause_until_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.pause_until_path.write_text(_json.dumps({"until": until_iso}))
+
+
+def _maybe_trip_circuit_breaker(ws: AppWorkspace, reg_app) -> None:
+    """If the most recent N validate entries (N = threshold) are all bad
+    verdicts, write pause_until and log circuit_breaker_tripped. Idempotent —
+    re-running on an already-paused app is a no-op (pause file just gets
+    rewritten with the new deadline)."""
+    threshold = max(1, int(reg_app.circuit_breaker_threshold))
+    pause_min = max(1, int(reg_app.circuit_breaker_pause_minutes))
+
+    from chad_captain.protocol import read_captain_log
+    log = read_captain_log(ws, limit=threshold * 4)
+    validates = [e for e in log if e.kind == "validate"]
+    recent = validates[-threshold:]
+    if len(recent) < threshold:
+        return
+    if not all(e.verdict in _BAD_VERDICTS for e in recent):
+        return
+
+    until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+    _write_pause_until(ws, until.isoformat())
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None,
+            kind="escalation_raised",
+            rationale=(
+                f"circuit breaker tripped: {threshold} consecutive bad "
+                f"verdicts ({', '.join(e.verdict or '?' for e in recent)}); "
+                f"dispatch paused for {pause_min}m"
+            ),
+            references={
+                "event": "circuit_breaker_tripped",
+                "threshold": str(threshold),
+                "pause_minutes": str(pause_min),
+                "pause_until": until.isoformat(),
+            },
+        ),
+    )
+
+
+def clear_pause(ws: AppWorkspace) -> bool:
+    """Manually clear the pause marker. Returns True iff a pause existed."""
+    if ws.pause_until_path.exists():
+        try:
+            ws.pause_until_path.unlink()
+            return True
+        except OSError:
+            return False
+    return False
 
 
 # Grace window past CurrentSlice.timeout_seconds before declaring a stall.

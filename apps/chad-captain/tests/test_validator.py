@@ -1030,6 +1030,194 @@ def test_roadmap_complete_baseline_preserved_on_pr_open_failure(
 
 
 # ---------------------------------------------------------------------------
+# C8 — circuit breaker
+# ---------------------------------------------------------------------------
+
+
+def _seed_validate_log(
+    ws: AppWorkspace, *, verdicts: list[str], app_id: str = "test-app",
+) -> None:
+    """Append N validate entries with the given verdicts in order."""
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    for i, v in enumerate(verdicts):
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=app_id, slice_id=f"s{i}",
+                kind="validate", verdict=v, rationale=f"seeded {v}",
+            ),
+        )
+
+
+def test_circuit_breaker_trips_after_threshold_consecutive_bads(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three consecutive reject_hard validate entries → pause_until written
+    + circuit_breaker_tripped escalation logged."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        circuit_breaker_threshold=3,
+        circuit_breaker_pause_minutes=30,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Seed 2 bad verdicts, then drive a 3rd via captain_tick
+    _seed_validate_log(ws, verdicts=["reject_hard", "reject_hard"])
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s2", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    # Slice complete with cheats → escalate verdict (also a bad one)
+    write_slice_complete(
+        ws,
+        SliceComplete(
+            slice_id="s2", app_id="test-app", duration_seconds=5,
+            goose_exit_code=0, summary="x", files_changed=["a.py"],
+            cheat_flags=["assert-true-only:tests/x.py"],
+        ),
+    )
+
+    status = captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert ws.pause_until_path.exists()
+    log = read_captain_log(ws)
+    tripped = [
+        e for e in log
+        if (e.references or {}).get("event") == "circuit_breaker_tripped"
+    ]
+    assert len(tripped) == 1
+    assert "consecutive bad verdicts" in tripped[0].rationale
+    # Status reflects the pause
+    assert "paused" in (status or "")
+
+
+def test_circuit_breaker_does_not_trip_on_mixed_verdicts(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One accept among the recent verdicts → not consecutive, no trip."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous", circuit_breaker_threshold=3,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    _seed_validate_log(ws, verdicts=["reject_hard", "accept", "reject_hard"])
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s3", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s3", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=1, summary="bad", files_changed=[]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert not ws.pause_until_path.exists()
+
+
+def test_paused_app_skips_dispatch(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If pause_until is in the future, captain returns 'paused' and does
+    not dispatch — even when the roadmap has queued slices."""
+    from datetime import datetime, timedelta, timezone
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.validator import _write_pause_until
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo), mode="autonomous",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    until = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _write_pause_until(ws, until)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="queued")],
+    )
+    write_roadmap(ws, rm)
+
+    status = captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert "paused" in (status or "")
+    # No dispatch happened
+    assert not ws.current_slice_path.exists()
+
+
+def test_paused_app_auto_clears_when_pause_expires(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired pause file (now > until) is auto-deleted on the next
+    tick and dispatch resumes."""
+    from datetime import datetime, timedelta, timezone
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.validator import _write_pause_until
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo), mode="autonomous",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    expired = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    _write_pause_until(ws, expired)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="queued")],
+    )
+    write_roadmap(ws, rm)
+
+    status = captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert not ws.pause_until_path.exists()  # auto-cleared
+    assert "dispatched" in (status or "")  # dispatch resumed
+
+
+def test_clear_pause_helper_returns_true_only_when_present(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    from chad_captain.validator import _write_pause_until, clear_pause
+    from datetime import datetime, timedelta, timezone
+
+    assert clear_pause(ws) is False
+    _write_pause_until(ws, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    assert clear_pause(ws) is True
+    assert not ws.pause_until_path.exists()
+
+
+# ---------------------------------------------------------------------------
 # C7 — stall watchdog
 # ---------------------------------------------------------------------------
 

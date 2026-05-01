@@ -81,6 +81,14 @@ class RegisteredApp(BaseModel):
     # raw aggregate fraction (not pp) — e.g. 0.0 means after >= before.
     auto_merge_min_delta: float = 0.0
 
+    # --- C8 circuit breaker ---
+    # When N consecutive validate entries are bad verdicts (reject_hard,
+    # revert, or escalate), pause dispatch for circuit_breaker_pause_minutes
+    # so the captain doesn't churn forever on a stuck app. Admiral can
+    # `chad-captain unpause --app <id>` to clear the pause manually.
+    circuit_breaker_threshold: int = 3
+    circuit_breaker_pause_minutes: int = 60
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)
