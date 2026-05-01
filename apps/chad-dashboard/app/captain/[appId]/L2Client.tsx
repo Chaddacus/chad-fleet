@@ -633,7 +633,10 @@ type PrStatusKind =
   | 'pr_open'
   | 'pr_merged'
   | 'post_merge'
-  | 'roadmap_complete';
+  | 'roadmap_complete'
+  | 'circuit_breaker'
+  | 'main_broken'
+  | 'stalled';
 
 interface PrStatus {
   kind: PrStatusKind;
@@ -644,38 +647,59 @@ interface PrStatus {
 
 /**
  * Walk the captain log tail (newest-first) and surface the most recent
- * PR-lifecycle event so the admiral sees "PR ready", "PR merged", or
- * "post-merge cycle running" at the top of the dashboard.
+ * lifecycle event for the admiral. Critical states (main_broken, stalled,
+ * circuit_breaker) take priority over routine PR lifecycle so a broken
+ * main doesn't get hidden by a stale "PR open" header.
  *
- * Hierarchy (most recent wins):
- *   post_merge_cycle > pull_request_merged > pull_request_opened > roadmap_complete
+ * Priority (most recent wins within band, critical bands beat routine):
+ *   CRITICAL: main_broken > circuit_breaker > stalled
+ *   ROUTINE: post_merge > pr_merged > pr_open > roadmap_complete
  */
 function derivePrStatus(log: CaptainLogEntry[]): PrStatus | null {
+  let critical: PrStatus | null = null;
+  let routine: PrStatus | null = null;
+
   for (const e of log) {
-    if (e.kind === 'post_merge_cycle') {
-      return { kind: 'post_merge', ts: e.ts, rationale: e.rationale };
+    const refs = (e.references as Record<string, string> | null) || {};
+
+    // CRITICAL band — first hit wins (newest first)
+    if (!critical) {
+      if (e.kind === 'escalation_raised'
+          && refs.event === 'post_merge_verify_failed') {
+        critical = {
+          kind: 'main_broken', ts: e.ts, rationale: e.rationale,
+          url: refs.pr_url,
+        };
+      } else if (e.kind === 'escalation_raised'
+                 && refs.event === 'circuit_breaker_tripped') {
+        critical = { kind: 'circuit_breaker', ts: e.ts, rationale: e.rationale };
+      } else if (e.kind === 'stall_detected') {
+        critical = { kind: 'stalled', ts: e.ts, rationale: e.rationale };
+      }
     }
-    if (e.kind === 'pull_request_merged') {
-      return {
-        kind: 'pr_merged',
-        ts: e.ts,
-        rationale: e.rationale,
-        url: (e.references as Record<string, string> | null)?.pr_url,
-      };
+
+    // ROUTINE band — first hit wins
+    if (!routine) {
+      if (e.kind === 'post_merge_cycle') {
+        routine = { kind: 'post_merge', ts: e.ts, rationale: e.rationale };
+      } else if (e.kind === 'pull_request_merged') {
+        routine = {
+          kind: 'pr_merged', ts: e.ts, rationale: e.rationale,
+          url: refs.pr_url,
+        };
+      } else if (e.kind === 'pull_request_opened') {
+        routine = {
+          kind: 'pr_open', ts: e.ts, rationale: e.rationale,
+          url: refs.pr_url,
+        };
+      } else if (e.kind === 'roadmap_complete') {
+        routine = { kind: 'roadmap_complete', ts: e.ts, rationale: e.rationale };
+      }
     }
-    if (e.kind === 'pull_request_opened') {
-      return {
-        kind: 'pr_open',
-        ts: e.ts,
-        rationale: e.rationale,
-        url: (e.references as Record<string, string> | null)?.pr_url,
-      };
-    }
-    if (e.kind === 'roadmap_complete') {
-      return { kind: 'roadmap_complete', ts: e.ts, rationale: e.rationale };
-    }
+
+    if (critical && routine) break;  // both bands resolved
   }
-  return null;
+  return critical ?? routine;
 }
 
 function PrStatusBanner({ status }: { status: PrStatus }) {
@@ -684,6 +708,9 @@ function PrStatusBanner({ status }: { status: PrStatus }) {
     pr_open: { label: 'PR open — ready for review', color: 'var(--green)', icon: '↗' },
     pr_merged: { label: 'PR merged — finalizing cycle', color: 'var(--green)', icon: '✓' },
     post_merge: { label: 'Post-merge — replanning', color: 'var(--accent)', icon: '↻' },
+    main_broken: { label: 'CRITICAL — post-merge verify failed (main is broken)', color: 'var(--red)', icon: '⚠' },
+    circuit_breaker: { label: 'Paused — circuit breaker tripped', color: 'var(--red)', icon: '⏸' },
+    stalled: { label: 'Slice stalled — watchdog killed', color: 'var(--yellow)', icon: '⏱' },
   };
   const m = meta[status.kind];
   return (

@@ -599,6 +599,54 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     return matches[-limit:]
 
 
+# --- C9 pending-merge detection ---
+
+
+# Patterns gh emits when CI / required checks haven't completed yet. These
+# are NOT real failures — captain just retries on the next tick. Conservative
+# match (broad lower-case substring) so we err on "treat as pending" rather
+# than spam escalations.
+_PENDING_MERGE_PATTERNS = (
+    "unstable status",
+    "is not in a state to allow merging",
+    "is not in a state to allow checks",
+    "expected — waiting",
+    "required status check",
+    "checks pending",
+    "checks_pending",
+    "status_pending",
+)
+
+
+def _is_pending_merge_failure(summary: str) -> bool:
+    s = (summary or "").lower()
+    return any(p in s for p in _PENDING_MERGE_PATTERNS)
+
+
+def _recent_auto_merge_failure(ws: AppWorkspace, *, minutes: int) -> bool:
+    """True iff the captain log already has an auto_merge_failed escalation
+    within the last ``minutes`` (used to dedup tick-by-tick re-emissions
+    when admiral hasn't resolved the underlying issue yet)."""
+    from chad_captain.protocol import read_captain_log
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    log = read_captain_log(ws, limit=50)
+    for e in reversed(log):
+        if e.kind != "escalation_raised":
+            continue
+        if (e.references or {}).get("event") != "auto_merge_failed":
+            continue
+        try:
+            when = datetime.fromisoformat(e.ts)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if when >= cutoff:
+            return True
+        return False  # older than window — no recent dup
+    return False
+
+
 # --- C8 circuit breaker helpers ---
 
 
@@ -820,6 +868,14 @@ def _maybe_self_merge_pr(
         delete_branch=True,
     )
     if not res.ok:
+        # C9: distinguish CI-pending failures from hard failures.
+        # Pending = silent (next tick retries; pending IS not a failure).
+        # Hard = escalate, but dedup within 30min so we don't spam the log
+        # every 5min as the captain re-enters _handle_roadmap_complete.
+        if _is_pending_merge_failure(res.summary):
+            return
+        if _recent_auto_merge_failure(ws, minutes=30):
+            return  # already escalated within window
         append_captain_log(
             ws,
             CaptainLogEntry(
@@ -972,7 +1028,73 @@ def _maybe_handle_pr_merge(
             references={"event": "post_merge_cycle"},
         ),
     )
+
+    # C10 — post-merge verify gate. After captain self-merges and refreshes
+    # main, run reg_app.verify_cmd against the freshly-merged main. If it
+    # fails (with flake retries), the merge broke main → log critical
+    # escalation + trip circuit breaker so captain stops dispatching new
+    # work until admiral fixes main.
+    _post_merge_verify(ws, repo_path, reg_app, pending_pr_url, merge_commit)
     return True
+
+
+def _post_merge_verify(
+    ws: AppWorkspace,
+    repo_path: str,
+    reg_app,  # RegisteredApp
+    pr_url: str,
+    merge_commit: dict,
+) -> None:
+    """Run verify_cmd against fresh main; if it fails after flake retries,
+    mark main as broken and trip the circuit breaker.
+
+    Why no auto-revert in v1: reverting requires either pushing directly
+    to main (destructive) or opening a revert PR (non-trivial). The high-
+    severity escalation + circuit-breaker pause stops captain from making
+    things worse. Auto-revert is a v2 enhancement.
+    """
+    if not reg_app.verify_cmd:
+        return
+
+    last_summary = ""
+    for attempt in range(1, 4):  # 3 attempts to absorb flakes
+        passed, summary = run_verify_gate(
+            repo_path=repo_path,
+            verify_cmd=reg_app.verify_cmd,
+            timeout_seconds=reg_app.verify_timeout_seconds,
+        )
+        if passed:
+            return  # main is healthy
+        last_summary = summary
+        logger.warning(
+            "post-merge verify attempt %d/3 failed for %s: %s",
+            attempt, ws.app_id, summary,
+        )
+
+    # All 3 attempts failed — main is broken.
+    until = datetime.now(timezone.utc) + timedelta(
+        minutes=reg_app.circuit_breaker_pause_minutes,
+    )
+    _write_pause_until(ws, until.isoformat())
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+            rationale=(
+                f"POST-MERGE VERIFY FAILED — main is broken. verify_cmd "
+                f"failed 3 attempts: {last_summary}; dispatch paused for "
+                f"{reg_app.circuit_breaker_pause_minutes}m"
+            ),
+            references={
+                "event": "post_merge_verify_failed",
+                "pr_url": pr_url,
+                "merge_sha": (merge_commit or {}).get("oid", ""),
+                "verify_cmd": reg_app.verify_cmd,
+                "pause_until": until.isoformat(),
+                "severity": "critical",
+            },
+        ),
+    )
 
 
 def _handle_roadmap_complete(

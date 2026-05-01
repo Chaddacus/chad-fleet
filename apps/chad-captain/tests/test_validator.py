@@ -1218,6 +1218,282 @@ def test_clear_pause_helper_returns_true_only_when_present(
 
 
 # ---------------------------------------------------------------------------
+# C10 — post-merge verify gate
+# ---------------------------------------------------------------------------
+
+
+def _post_merge_setup(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    *, verify_cmd: str | None,
+):
+    """Wire a roadmap-complete + already-opened-PR + MERGED state so
+    captain_tick will run _maybe_handle_pr_merge → _post_merge_verify."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    if not repo.exists():
+        _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+        verify_cmd=verify_cmd,
+        verify_timeout_seconds=10,
+        circuit_breaker_pause_minutes=45,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id="test-app", kind="pull_request_opened",
+            references={
+                "pr_url": "https://x", "branch": "codex/captain-test-app",
+            },
+        ),
+    )
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc"}, "mergedAt": "now"}),
+    )
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "delete_local_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    return repo
+
+
+def test_post_merge_verify_passes_silently_on_clean_main(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify_cmd='true' → passes first try → no escalation, no pause."""
+    repo = _post_merge_setup(ws, tmp_path, monkeypatch, verify_cmd="true")
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    failed = [
+        e for e in log
+        if (e.references or {}).get("event") == "post_merge_verify_failed"
+    ]
+    assert failed == []
+    assert not ws.pause_until_path.exists()
+
+
+def test_post_merge_verify_failure_pauses_dispatch(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify_cmd='false' → fails 3 attempts → critical escalation + pause."""
+    repo = _post_merge_setup(ws, tmp_path, monkeypatch, verify_cmd="false")
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    failed = [
+        e for e in log
+        if (e.references or {}).get("event") == "post_merge_verify_failed"
+    ]
+    assert len(failed) == 1
+    assert "main is broken" in failed[0].rationale.lower() \
+        or "main is broken" in failed[0].rationale
+    assert (failed[0].references or {}).get("severity") == "critical"
+    assert ws.pause_until_path.exists()
+
+
+def test_post_merge_verify_skipped_without_verify_cmd(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No verify_cmd → no verify run, no pause."""
+    repo = _post_merge_setup(ws, tmp_path, monkeypatch, verify_cmd=None)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert not ws.pause_until_path.exists()
+    log = read_captain_log(ws)
+    failed = [
+        e for e in log
+        if (e.references or {}).get("event") == "post_merge_verify_failed"
+    ]
+    assert failed == []
+
+
+def test_post_merge_verify_recovers_from_flake(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First two attempts fail, third passes → no escalation (flake absorbed)."""
+    import chad_captain.validator as vm
+
+    repo = _post_merge_setup(ws, tmp_path, monkeypatch, verify_cmd="true")
+
+    attempts = [0]
+
+    def flaky_gate(*, repo_path: str, verify_cmd: str | None, timeout_seconds: int):
+        attempts[0] += 1
+        if attempts[0] < 3:
+            return False, f"flake on attempt {attempts[0]}"
+        return True, "ok on third try"
+
+    monkeypatch.setattr(vm, "run_verify_gate", flaky_gate)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert attempts[0] == 3
+    assert not ws.pause_until_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# C9 — pending vs hard merge failure
+# ---------------------------------------------------------------------------
+
+
+def _common_auto_merge_setup(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    *, merge_summary: str, merge_ok: bool = False,
+):
+    """Helper that wires a roadmap_complete tick with a controllable
+    auto_merge_pr response."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    if not repo.exists():
+        _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True, auto_open_pr=True, auto_merge=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    monkeypatch.setattr(
+        mf, "auto_merge_pr",
+        lambda **_kw: mf.CmdResult(ok=merge_ok, summary=merge_summary),
+    )
+    return repo
+
+
+def test_auto_merge_pending_failure_is_silent(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gh 'unstable status' = CI still running. Captain MUST NOT log an
+    escalation — it just retries next tick."""
+    repo = _common_auto_merge_setup(
+        ws, tmp_path, monkeypatch,
+        merge_summary="exit 1: GraphQL: Pull request is in unstable status",
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    failed = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "auto_merge_failed"
+    ]
+    assert failed == []  # pending → silent
+
+
+def test_auto_merge_hard_failure_dedupes_within_window(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hard auto_merge failures dedup within 30min. Two ticks → one escalation."""
+    repo = _common_auto_merge_setup(
+        ws, tmp_path, monkeypatch,
+        merge_summary="exit 1: branch protection requires 1 review",
+    )
+
+    def write_and_tick():
+        rm = Roadmap(
+            app_id="test-app",
+            slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+        )
+        write_roadmap(ws, rm)
+        write_slice_complete(
+            ws,
+            SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                          goose_exit_code=0, summary="done", files_changed=["a.py"]),
+        )
+        captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    write_and_tick()
+    # Mark slice done again so roadmap_complete fires twice
+    write_and_tick()
+
+    log = read_captain_log(ws)
+    failed = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "auto_merge_failed"
+    ]
+    assert len(failed) == 1  # second tick was deduped
+
+
+def test_is_pending_merge_failure_patterns() -> None:
+    from chad_captain.validator import _is_pending_merge_failure
+    assert _is_pending_merge_failure("Pull request is in unstable status")
+    assert _is_pending_merge_failure(
+        "GraphQL: PR is not in a state to allow checks (mergePullRequest)"
+    )
+    assert _is_pending_merge_failure("Required status check 'tests' is pending")
+    assert not _is_pending_merge_failure("branch protection requires 1 review")
+    assert not _is_pending_merge_failure("merge conflict in path/to/file.py")
+    assert not _is_pending_merge_failure("")
+
+
+# ---------------------------------------------------------------------------
 # C7 — stall watchdog
 # ---------------------------------------------------------------------------
 

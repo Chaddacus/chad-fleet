@@ -259,4 +259,52 @@ describe('CaptainL2 PR status banner', () => {
     const { container } = render(React.createElement(L2Client, { initial: app }));
     expect(container.querySelector('.pr-status-banner')).toBeNull();
   });
+
+  it('shows CRITICAL main_broken banner when post_merge_verify_failed exists', async () => {
+    // Critical state should win over routine state
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [
+        logEntry({
+          kind: 'escalation_raised',
+          rationale: 'POST-MERGE VERIFY FAILED — main is broken',
+          references: { event: 'post_merge_verify_failed', pr_url: 'https://x' },
+        }),
+        logEntry({ kind: 'pull_request_merged', references: { pr_url: 'https://x' } }),
+      ],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    const banner = container.querySelector('.pr-status-banner');
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('main is broken');
+  });
+
+  it('shows circuit_breaker banner when tripped', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [
+        logEntry({
+          kind: 'escalation_raised',
+          rationale: '3 consecutive bad verdicts',
+          references: { event: 'circuit_breaker_tripped', threshold: '3' },
+        }),
+      ],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    expect(container.querySelector('.pr-status-banner')!.textContent)
+      .toContain('circuit breaker tripped');
+  });
+
+  it('shows stalled banner when stall_detected logged', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [logEntry({ kind: 'stall_detected', rationale: 'killed' })],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    expect(container.querySelector('.pr-status-banner')!.textContent)
+      .toContain('stalled');
+  });
 });
