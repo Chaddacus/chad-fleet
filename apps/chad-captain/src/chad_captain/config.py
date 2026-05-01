@@ -44,6 +44,13 @@ class CaptainConfig(BaseModel):
     state_dir: Path = _DEFAULT_STATE_DIR
     enabled: bool = True
 
+    # Autonomous tick scheduler (C6). The daemon ticks every registered
+    # mode=="autonomous" app at this interval, driving the slice → PR →
+    # merge cycle without operator intervention. Set tick_interval=0 to
+    # disable (useful for tests or one-shot CLI runs).
+    autonomous_tick_interval_seconds: int = 300  # 5 minutes
+    autonomous_tick_enabled: bool = True
+
     @field_validator("schedule_tz")
     @classmethod
     def validate_tz(cls, v: str) -> str:
@@ -84,4 +91,10 @@ def load_config() -> CaptainConfig:
         ),
         state_dir=state_dir,
         enabled=_env_bool("CAPTAIN_ENABLED", True),
+        autonomous_tick_interval_seconds=_env_int(
+            "CHAD_CAPTAIN_TICK_INTERVAL_SECONDS", 300,
+        ),
+        autonomous_tick_enabled=_env_bool(
+            "CHAD_CAPTAIN_AUTONOMOUS_TICK_ENABLED", True,
+        ),
     )

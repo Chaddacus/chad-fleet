@@ -91,6 +91,23 @@ def cmd_actions(args: argparse.Namespace) -> None:
         print(f"   {a.rationale}")
 
 
+def cmd_tick_all(_args: argparse.Namespace) -> None:
+    """Run one autonomous tick across every mode==autonomous app.
+
+    Same code path the daemon's autonomous-tick loop calls every interval.
+    Useful for kicking the loop manually (post-deploy, post-config-change)
+    or for one-shot diagnostics outside the daemon.
+    """
+    from chad_captain.daemon import tick_autonomous_apps
+
+    results = tick_autonomous_apps()
+    if not results:
+        print("No autonomous apps registered.")
+        return
+    for app_id, status in results.items():
+        print(f"[{app_id}] {status}")
+
+
 def cmd_tick(args: argparse.Namespace) -> None:
     """Run one captain_tick for an app — what launchd invokes daily.
 
@@ -327,6 +344,12 @@ def main(argv: list[str] | None = None) -> None:
     tick_p.add_argument("--no-replan", action="store_true",
                          help="Disable auto-replan when roadmap is exhausted")
 
+    sub.add_parser(
+        "tick-all",
+        help="Run one autonomous tick for every mode==autonomous app "
+             "(same code path the daemon uses on its interval)",
+    )
+
     register_p = sub.add_parser("register", help="Register an app in the captain registry")
     register_p.add_argument("--app", default=None, metavar="APP_ID")
     register_p.add_argument("--repo", default=None, metavar="PATH")
@@ -390,6 +413,7 @@ def main(argv: list[str] | None = None) -> None:
         "research": cmd_research,
         "replan": cmd_replan,
         "tick": cmd_tick,
+        "tick-all": cmd_tick_all,
         "register": cmd_register,
         "install-plists": cmd_install_plists,
         "init-workspace": cmd_init_workspace,
