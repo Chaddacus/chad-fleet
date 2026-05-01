@@ -72,6 +72,7 @@ export default function L2Client({ initial }: Props) {
 
   const cs = app.current_slice;
   const rm = app.roadmap;
+  const prStatus = derivePrStatus(app.captain_log_tail);
 
   return (
     <div className="l2">
@@ -86,6 +87,8 @@ export default function L2Client({ initial }: Props) {
         </span>
         <span className="cap-tick-stamp">{stamp}</span>
       </div>
+
+      {prStatus && <PrStatusBanner status={prStatus} />}
 
       <div className="l2-panes">
         {/* Pane A — current slice + progress */}
@@ -620,6 +623,98 @@ function ScRow({ d }: { d: { name: string; score: number; rationale: string } })
         ></div>
       </div>
       {exp && <div className="sc-rat">{d.rationale}</div>}
+    </div>
+  );
+}
+
+/* ─── PR status banner ────────────────────────────────────────────── */
+
+type PrStatusKind =
+  | 'pr_open'
+  | 'pr_merged'
+  | 'post_merge'
+  | 'roadmap_complete';
+
+interface PrStatus {
+  kind: PrStatusKind;
+  url?: string;
+  ts: string;
+  rationale: string;
+}
+
+/**
+ * Walk the captain log tail (newest-first) and surface the most recent
+ * PR-lifecycle event so the admiral sees "PR ready", "PR merged", or
+ * "post-merge cycle running" at the top of the dashboard.
+ *
+ * Hierarchy (most recent wins):
+ *   post_merge_cycle > pull_request_merged > pull_request_opened > roadmap_complete
+ */
+function derivePrStatus(log: CaptainLogEntry[]): PrStatus | null {
+  for (const e of log) {
+    if (e.kind === 'post_merge_cycle') {
+      return { kind: 'post_merge', ts: e.ts, rationale: e.rationale };
+    }
+    if (e.kind === 'pull_request_merged') {
+      return {
+        kind: 'pr_merged',
+        ts: e.ts,
+        rationale: e.rationale,
+        url: (e.references as Record<string, string> | null)?.pr_url,
+      };
+    }
+    if (e.kind === 'pull_request_opened') {
+      return {
+        kind: 'pr_open',
+        ts: e.ts,
+        rationale: e.rationale,
+        url: (e.references as Record<string, string> | null)?.pr_url,
+      };
+    }
+    if (e.kind === 'roadmap_complete') {
+      return { kind: 'roadmap_complete', ts: e.ts, rationale: e.rationale };
+    }
+  }
+  return null;
+}
+
+function PrStatusBanner({ status }: { status: PrStatus }) {
+  const meta: Record<PrStatusKind, { label: string; color: string; icon: string }> = {
+    roadmap_complete: { label: 'Roadmap complete — awaiting PR', color: 'var(--yellow)', icon: '◌' },
+    pr_open: { label: 'PR open — ready for review', color: 'var(--green)', icon: '↗' },
+    pr_merged: { label: 'PR merged — finalizing cycle', color: 'var(--green)', icon: '✓' },
+    post_merge: { label: 'Post-merge — replanning', color: 'var(--accent)', icon: '↻' },
+  };
+  const m = meta[status.kind];
+  return (
+    <div
+      className="pr-status-banner"
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '8px 12px',
+        margin: '6px 0',
+        border: `1px solid ${m.color}`,
+        borderRadius: 4,
+        fontSize: 12,
+        background: 'var(--bg-elev)',
+      }}
+    >
+      <span style={{ color: m.color, fontWeight: 600 }}>{m.icon} {m.label}</span>
+      {status.url && (
+        <a
+          href={status.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: 'var(--accent)', textDecoration: 'underline' }}
+        >
+          open PR ↗
+        </a>
+      )}
+      <span style={{ color: 'var(--t3)', marginLeft: 'auto' }}>
+        {fmtAgo(status.ts)}
+      </span>
     </div>
   );
 }

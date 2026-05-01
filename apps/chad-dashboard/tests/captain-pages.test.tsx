@@ -162,3 +162,101 @@ describe('CaptainL2 (app detail shell)', () => {
     ).rejects.toThrow('NEXT_NOT_FOUND');
   });
 });
+
+// ---------------------------------------------------------------------------
+// L2 PR status banner — derived from captain_log_tail
+// ---------------------------------------------------------------------------
+
+function logEntry(overrides: {
+  kind: AppStateBundle['captain_log_tail'][number]['kind'];
+  rationale?: string;
+  references?: Record<string, string>;
+  ts?: string;
+}): AppStateBundle['captain_log_tail'][number] {
+  return {
+    ts: overrides.ts ?? new Date().toISOString(),
+    app_id: 'sample-app',
+    slice_id: null,
+    kind: overrides.kind,
+    verdict: null,
+    rubric_delta_pp: null,
+    rationale: overrides.rationale ?? '',
+    references: overrides.references ?? {},
+  };
+}
+
+describe('CaptainL2 PR status banner', () => {
+  it('shows pr_open banner with link when pull_request_opened is most recent', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [
+        logEntry({
+          kind: 'pull_request_opened',
+          rationale: 'PR opened: https://github.com/owner/repo/pull/42',
+          references: { pr_url: 'https://github.com/owner/repo/pull/42' },
+        }),
+      ],
+    });
+
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    const banner = container.querySelector('.pr-status-banner');
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('PR open');
+    expect(banner!.textContent).toContain('ready for review');
+    const link = banner!.querySelector('a');
+    expect(link?.getAttribute('href')).toContain('pull/42');
+  });
+
+  it('shows pr_merged banner when most recent event is pull_request_merged', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [
+        logEntry({ kind: 'pull_request_merged', references: { pr_url: 'https://x' } }),
+        logEntry({ kind: 'pull_request_opened', references: { pr_url: 'https://x' } }),
+      ],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    const banner = container.querySelector('.pr-status-banner');
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('PR merged');
+  });
+
+  it('shows post_merge banner when post_merge_cycle is most recent', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [
+        logEntry({ kind: 'post_merge_cycle' }),
+        logEntry({ kind: 'pull_request_merged' }),
+      ],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    const banner = container.querySelector('.pr-status-banner');
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('Post-merge');
+  });
+
+  it('shows roadmap_complete banner when only roadmap_complete logged', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [logEntry({ kind: 'roadmap_complete' })],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    const banner = container.querySelector('.pr-status-banner');
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('Roadmap complete');
+  });
+
+  it('renders no banner when no PR-lifecycle events present', async () => {
+    const app = bundle({
+      app_id: 'sample-app',
+      captain_log_tail: [logEntry({ kind: 'validate' })],
+    });
+    const { default: L2Client } = await import('../app/captain/[appId]/L2Client');
+    const { container } = render(React.createElement(L2Client, { initial: app }));
+    expect(container.querySelector('.pr-status-banner')).toBeNull();
+  });
+});
