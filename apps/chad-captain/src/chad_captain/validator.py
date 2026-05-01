@@ -832,8 +832,27 @@ def _maybe_trip_low_yield_streak(ws: AppWorkspace, reg_app) -> None:
     pause_min = max(1, int(getattr(reg_app, "low_yield_pause_minutes", 30)))
 
     from chad_captain.protocol import read_captain_log
-    log = read_captain_log(ws, limit=threshold * 4)
-    validates = [e for e in log if e.kind == "validate"]
+    # Pull a generous window so we can find the most recent escalation
+    # AND threshold validates after it.
+    log = read_captain_log(ws, limit=threshold * 8)
+
+    # Reset window: only consider validates AFTER the most recent
+    # low_yield_streak escalation. Without this reset, every time the
+    # pause expires the trailing N validates still includes the
+    # already-counted ones → guard re-trips on the same streak forever.
+    # Live failure: author-toolkit tripped 4 times in a row at 30min
+    # intervals (03:54, 04:22, 04:54, 05:00) — pause expires, one
+    # validate fires, immediately re-trips, captain stuck.
+    last_escalation_idx = -1
+    for i in range(len(log) - 1, -1, -1):
+        e = log[i]
+        if (e.kind == "escalation_raised"
+                and (e.references or {}).get("event") == "low_yield_streak"):
+            last_escalation_idx = i
+            break
+    fresh_log = log[last_escalation_idx + 1 :] if last_escalation_idx >= 0 else log
+
+    validates = [e for e in fresh_log if e.kind == "validate"]
     recent = validates[-threshold:]
     if len(recent) < threshold:
         return
@@ -844,13 +863,6 @@ def _maybe_trip_low_yield_streak(ws: AppWorkspace, reg_app) -> None:
         for e in recent
     ):
         return
-    # Idempotency: bail out if we already tripped within this same streak
-    # (most recent log entry is the escalation we'd write).
-    if log:
-        last = log[-1]
-        if (last.kind == "escalation_raised"
-                and (last.references or {}).get("event") == "low_yield_streak"):
-            return
 
     until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
     _write_pause_until(ws, until.isoformat())

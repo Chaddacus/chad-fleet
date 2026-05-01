@@ -1321,6 +1321,88 @@ def test_low_yield_streak_does_not_retrip_within_same_streak(
     assert len(tripped) == 1
 
 
+def test_low_yield_streak_does_not_retrip_after_pause_resume(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Live failure: pause expires → 1 new validate fires → guard
+    re-trips on same trailing window because old (already-counted)
+    validates are still in the look-back. Captain stuck in 30min
+    pause-resume-pause cycles forever.
+
+    Fix: window resets after each low_yield_streak escalation.
+    Only validates AFTER the escalation count toward the next
+    threshold."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.validator import _maybe_trip_low_yield_streak
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    reg = RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous", low_yield_streak_threshold=3,
+    )
+
+    # Streak fires
+    _seed_validate_log(
+        ws, verdicts=["soft_accept"] * 3, deltas=[0.0, 0.0, 0.0],
+    )
+    _maybe_trip_low_yield_streak(ws, reg)
+
+    # Pause expires, ONE new validate fires (still soft_accept 0pp).
+    # Without the window reset, the trailing 3 includes the ORIGINAL
+    # 2 + this new 1 → guard would re-trip. With the reset, only
+    # the new 1 counts → below threshold → no re-trip.
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id="s4", kind="validate",
+        verdict="soft_accept", rationale="seeded", rubric_delta_pp=0.0,
+    ))
+    _maybe_trip_low_yield_streak(ws, reg)
+
+    log = read_captain_log(ws)
+    tripped = [
+        e for e in log
+        if (e.references or {}).get("event") == "low_yield_streak"
+    ]
+    assert len(tripped) == 1, f"expected 1 trip, got {len(tripped)}"
+
+
+def test_low_yield_streak_retrips_after_fresh_threshold_post_escalation(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """If, AFTER an escalation, N more zero-delta soft_accepts happen,
+    THEN the streak should re-trip — that's a genuinely new failure."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.validator import _maybe_trip_low_yield_streak
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    reg = RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous", low_yield_streak_threshold=3,
+    )
+
+    _seed_validate_log(
+        ws, verdicts=["soft_accept"] * 3, deltas=[0.0, 0.0, 0.0],
+    )
+    _maybe_trip_low_yield_streak(ws, reg)
+    # 3 fresh post-escalation zero-delta validates
+    for i in range(3):
+        append_captain_log(ws, CaptainLogEntry(
+            app_id="test-app", slice_id=f"sn{i}", kind="validate",
+            verdict="soft_accept", rationale="seeded", rubric_delta_pp=0.0,
+        ))
+    _maybe_trip_low_yield_streak(ws, reg)
+
+    log = read_captain_log(ws)
+    tripped = [
+        e for e in log
+        if (e.references or {}).get("event") == "low_yield_streak"
+    ]
+    assert len(tripped) == 2
+
+
 def test_low_yield_streak_ignores_real_deltas(
     ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
