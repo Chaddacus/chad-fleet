@@ -40,6 +40,10 @@ export function AppRow({ app }: { app: AppStateBundle }) {
           {app.unread_admiral_notes.length > 0 && (
             <span className="unread-pip">{app.unread_admiral_notes.length}</span>
           )}
+          {(() => {
+            const queued = (app.feature_backlog?.items ?? []).filter(i => i.status === 'queued').length;
+            return queued > 0 ? <span className="badge b-backlog">{queued} feat</span> : null;
+          })()}
         </div>
       </div>
 

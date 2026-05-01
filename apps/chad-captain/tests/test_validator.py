@@ -2623,3 +2623,111 @@ def test_post_merge_cycle_ignores_already_handled_merge(
     captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
     # Already-handled — don't poll
     assert polled == []
+
+
+# ---------------------------------------------------------------------------
+# Phase A: feature backlog ship-mark on roadmap merge
+# ---------------------------------------------------------------------------
+
+
+def test_backlog_explicit_tag_marks_shipped(tmp_path: Path) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        read_feature_backlog, write_feature_backlog,
+    )
+    from chad_captain.validator import _mark_backlog_items_shipped
+    ws = AppWorkspace("bl-test", base=tmp_path)
+    ws.ensure()
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="bl-test",
+        items=[
+            FeatureBacklogItem(id="fb-001", title="Cover A/B testing dashboard", priority=0.9),
+            FeatureBacklogItem(id="fb-002", title="Email automation flow", priority=0.7),
+        ],
+    ))
+    rm = Roadmap(app_id="bl-test", slices=[
+        RoadmapSlice(slice_id="S1", objective="x",
+                     title="Add A/B test endpoint [fb-001]", status="done"),
+        RoadmapSlice(slice_id="S2", objective="y",
+                     title="Bump linter version", status="done"),
+    ])
+    shipped = _mark_backlog_items_shipped(ws, rm, pr_url="https://github.com/x/y/pull/99")
+    assert shipped == ["fb-001"]
+    bl2 = read_feature_backlog(ws)
+    assert bl2.by_id("fb-001").status == "shipped"
+    assert bl2.by_id("fb-001").shipped_in == "https://github.com/x/y/pull/99"
+    assert bl2.by_id("fb-002").status == "queued"
+
+
+def test_backlog_token_overlap_marks_shipped(tmp_path: Path) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        read_feature_backlog, write_feature_backlog,
+    )
+    from chad_captain.validator import _mark_backlog_items_shipped
+    ws = AppWorkspace("bl-test", base=tmp_path)
+    ws.ensure()
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="bl-test",
+        items=[
+            FeatureBacklogItem(id="fb-001", title="Cover image variation testing", priority=0.9),
+        ],
+    ))
+    rm = Roadmap(app_id="bl-test", slices=[
+        RoadmapSlice(slice_id="S1", objective="x",
+                     title="Cover image variation upload UI", status="done"),
+    ])
+    shipped = _mark_backlog_items_shipped(ws, rm, pr_url="PR#42")
+    assert shipped == ["fb-001"]
+    bl2 = read_feature_backlog(ws)
+    assert bl2.by_id("fb-001").status == "shipped"
+
+
+def test_backlog_no_overlap_leaves_queued(tmp_path: Path) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        read_feature_backlog, write_feature_backlog,
+    )
+    from chad_captain.validator import _mark_backlog_items_shipped
+    ws = AppWorkspace("bl-test", base=tmp_path)
+    ws.ensure()
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="bl-test",
+        items=[
+            FeatureBacklogItem(id="fb-001", title="Cover A/B testing dashboard", priority=0.9),
+        ],
+    ))
+    rm = Roadmap(app_id="bl-test", slices=[
+        RoadmapSlice(slice_id="S1", objective="x",
+                     title="Update database migration script", status="done"),
+    ])
+    shipped = _mark_backlog_items_shipped(ws, rm, pr_url="PR#1")
+    assert shipped == []
+    bl2 = read_feature_backlog(ws)
+    assert bl2.by_id("fb-001").status == "queued"
+
+
+def test_backlog_skips_already_shipped(tmp_path: Path) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem,
+        read_feature_backlog, write_feature_backlog,
+    )
+    from chad_captain.validator import _mark_backlog_items_shipped
+    ws = AppWorkspace("bl-test", base=tmp_path)
+    ws.ensure()
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="bl-test",
+        items=[
+            FeatureBacklogItem(id="fb-001", title="Cover A/B testing", status="shipped",
+                               shipped_in="PR#1", priority=0.9),
+        ],
+    ))
+    rm = Roadmap(app_id="bl-test", slices=[
+        RoadmapSlice(slice_id="S1", objective="x",
+                     title="Cover A/B testing followup [fb-001]", status="done"),
+    ])
+    shipped = _mark_backlog_items_shipped(ws, rm, pr_url="PR#2")
+    # Already shipped items aren't re-shipped.
+    assert shipped == []
+    bl2 = read_feature_backlog(ws)
+    assert bl2.by_id("fb-001").shipped_in == "PR#1"  # not overwritten

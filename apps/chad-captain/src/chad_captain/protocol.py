@@ -84,6 +84,15 @@ class AppWorkspace:
         return self.root / "research" / "app-profile.json"
 
     @property
+    def feature_backlog_path(self) -> Path:
+        """Persistent product backlog. Captain reads at replan to anchor
+        feature slices on a known roadmap of work; writes at merge to mark
+        items shipped. Phase A is human-seeded via `chad-captain backlog add`;
+        Phase B will auto-populate via deep research.
+        """
+        return self.root / "research" / "feature_backlog.json"
+
+    @property
     def scorecard_history_path(self) -> Path:
         return self.root / "scorecard-history.jsonl"
 
@@ -254,6 +263,65 @@ class Roadmap(BaseModel):
     slices: list[RoadmapSlice] = Field(default_factory=list)
 
 
+FeatureStatus = Literal["queued", "shipped", "deferred", "obsolete"]
+
+
+class FeatureBacklogItem(BaseModel):
+    """One product-level feature on the captain's backlog.
+
+    Bigger than a slice — usually decomposes into 2-4 slices. Anchors the
+    replanner so it isn't re-inventing features each cycle. Status flips
+    to 'shipped' when the captain merges a roadmap whose slice titles
+    overlap this item's title (fuzzy match).
+    """
+
+    id: str  # short stable id, e.g. "fb-001"
+    title: str
+    rationale: str = ""  # why this feature matters; surfaces in replan prompt
+    priority: float = Field(default=0.5, ge=0.0, le=1.0)
+    estimated_slice_count: int = 2
+    status: FeatureStatus = "queued"
+    source: str = ""  # "admiral", "research", "manual", "auto-ideation"
+    competitive_evidence: list[str] = Field(default_factory=list)
+    shipped_in: str | None = None  # e.g. "PR#147"
+    shipped_at: str | None = None
+    created_at: str = Field(default_factory=_now_iso)
+
+
+class FeatureBacklog(BaseModel):
+    """Persistent product backlog for one app."""
+
+    app_id: str
+    generated_at: str = Field(default_factory=_now_iso)
+    items: list[FeatureBacklogItem] = Field(default_factory=list)
+
+    def queued(self, *, top: int | None = None) -> list[FeatureBacklogItem]:
+        ranked = sorted(
+            (i for i in self.items if i.status == "queued"),
+            key=lambda i: i.priority,
+            reverse=True,
+        )
+        return ranked[:top] if top else ranked
+
+    def shipped(self, *, last: int | None = None) -> list[FeatureBacklogItem]:
+        items = [i for i in self.items if i.status == "shipped"]
+        items.sort(key=lambda i: i.shipped_at or i.created_at, reverse=True)
+        return items[:last] if last else items
+
+    def by_id(self, item_id: str) -> FeatureBacklogItem | None:
+        return next((i for i in self.items if i.id == item_id), None)
+
+    def next_id(self) -> str:
+        max_n = 0
+        for it in self.items:
+            if it.id.startswith("fb-"):
+                try:
+                    max_n = max(max_n, int(it.id.split("-", 1)[1]))
+                except ValueError:
+                    continue
+        return f"fb-{max_n + 1:03d}"
+
+
 class AdmiralNote(BaseModel):
     """One note from the admiral (Chad) targeted at one app's captain context."""
 
@@ -341,6 +409,26 @@ def read_roadmap(ws: AppWorkspace) -> Roadmap | None:
     return Roadmap.model_validate_json(ws.roadmap_path.read_text())
 
 
+def read_feature_backlog(ws: AppWorkspace) -> FeatureBacklog:
+    """Return the persisted backlog, or an empty one if none exists yet."""
+    if not ws.feature_backlog_path.exists():
+        return FeatureBacklog(app_id=ws.app_id)
+    try:
+        return FeatureBacklog.model_validate_json(
+            ws.feature_backlog_path.read_text()
+        )
+    except (ValueError, OSError):
+        # Corrupt file — return empty rather than crashing the daemon.
+        return FeatureBacklog(app_id=ws.app_id)
+
+
+def write_feature_backlog(ws: AppWorkspace, backlog: FeatureBacklog) -> None:
+    ws.ensure()
+    ws.feature_backlog_path.parent.mkdir(parents=True, exist_ok=True)
+    backlog.generated_at = _now_iso()
+    atomic_write(ws.feature_backlog_path, backlog.model_dump_json(indent=2))
+
+
 def write_admiral_note(ws: AppWorkspace, note: AdmiralNote) -> Path:
     ws.ensure()
     path = ws.admiral_notes_dir / f"{note.note_id}.json"
@@ -375,6 +463,9 @@ __all__ = [
     "CaptainVerdict",
     "RoadmapSlice",
     "Roadmap",
+    "FeatureBacklogItem",
+    "FeatureBacklog",
+    "FeatureStatus",
     "AdmiralNote",
     "write_current_slice",
     "read_current_slice",
@@ -387,6 +478,8 @@ __all__ = [
     "read_captain_log",
     "write_roadmap",
     "read_roadmap",
+    "read_feature_backlog",
+    "write_feature_backlog",
     "write_admiral_note",
     "list_unread_admiral_notes",
     "consume_admiral_note",

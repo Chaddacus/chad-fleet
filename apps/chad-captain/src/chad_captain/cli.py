@@ -337,6 +337,83 @@ def cmd_status(_args: argparse.Namespace) -> None:
     print(json.dumps(status, indent=2))
 
 
+def cmd_backlog(args: argparse.Namespace) -> None:
+    """Dispatch `chad-captain backlog {add,list,ship,defer}`."""
+    from chad_captain.protocol import (
+        AppWorkspace,
+        FeatureBacklogItem,
+        read_feature_backlog,
+        write_feature_backlog,
+    )
+
+    sub = args.backlog_cmd
+    ws = AppWorkspace(args.app)
+    backlog = read_feature_backlog(ws)
+
+    if sub == "add":
+        if not 0.0 <= args.priority <= 1.0:
+            print(f"--priority must be in [0.0, 1.0]; got {args.priority}", file=sys.stderr)
+            sys.exit(2)
+        item = FeatureBacklogItem(
+            id=backlog.next_id(),
+            title=args.title,
+            rationale=args.rationale,
+            priority=args.priority,
+            estimated_slice_count=args.slices,
+            source=args.source,
+            competitive_evidence=list(args.evidence or []),
+        )
+        backlog.items.append(item)
+        write_feature_backlog(ws, backlog)
+        print(f"added {item.id}: {item.title} (priority={item.priority})")
+        return
+
+    if sub == "list":
+        items = backlog.items if args.all else backlog.queued()
+        if args.json:
+            print(json.dumps([i.model_dump(mode="json") for i in items], indent=2))
+            return
+        if not items:
+            print(f"(no {'' if args.all else 'queued '}items in {args.app} backlog)")
+            return
+        for it in items:
+            tag = it.status if args.all else "queued"
+            print(
+                f"  [{it.id}] {tag:>9s} priority={it.priority:.2f} "
+                f"~{it.estimated_slice_count}sl src={it.source:>10s}  {it.title}"
+            )
+            if it.rationale:
+                print(f"             {it.rationale[:140]}")
+            if it.shipped_in:
+                print(f"             shipped in {it.shipped_in} at {it.shipped_at}")
+        return
+
+    if sub == "ship":
+        item = backlog.by_id(args.item_id)
+        if item is None:
+            print(f"no backlog item {args.item_id} in {args.app}", file=sys.stderr)
+            sys.exit(1)
+        from datetime import datetime, timezone
+        item.status = "shipped"
+        item.shipped_in = args.pr
+        item.shipped_at = datetime.now(timezone.utc).isoformat()
+        write_feature_backlog(ws, backlog)
+        print(f"shipped {item.id}: {item.title}")
+        return
+
+    if sub == "defer":
+        item = backlog.by_id(args.item_id)
+        if item is None:
+            print(f"no backlog item {args.item_id} in {args.app}", file=sys.stderr)
+            sys.exit(1)
+        item.status = args.status
+        write_feature_backlog(ws, backlog)
+        print(f"{args.status}: {item.id} {item.title}")
+        return
+
+    raise ValueError(f"unknown backlog subcommand: {sub}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="chad-captain",
@@ -414,6 +491,51 @@ def main(argv: list[str] | None = None) -> None:
     replan_p.add_argument("--no-llm", action="store_true",
                           help="Skip the LLM call; use the deterministic fallback")
 
+    backlog_p = sub.add_parser(
+        "backlog",
+        help="Manage the per-app feature backlog (Phase A — manual seeding)",
+    )
+    backlog_sub = backlog_p.add_subparsers(dest="backlog_cmd", required=True)
+
+    bl_add = backlog_sub.add_parser("add", help="Add a feature to the backlog")
+    bl_add.add_argument("--app", required=True, metavar="APP_ID")
+    bl_add.add_argument("--title", required=True)
+    bl_add.add_argument("--rationale", default="")
+    bl_add.add_argument("--priority", type=float, default=0.5)
+    bl_add.add_argument("--slices", type=int, default=2,
+                         help="Estimated slice count to ship this feature")
+    bl_add.add_argument("--source", default="manual",
+                         choices=("admiral", "research", "manual", "auto-ideation"))
+    bl_add.add_argument(
+        "--evidence", action="append", default=[],
+        help="Competitive-evidence URL/excerpt; repeat for multiple",
+    )
+
+    bl_list = backlog_sub.add_parser(
+        "list", help="List the app's backlog (queued by default)",
+    )
+    bl_list.add_argument("--app", required=True, metavar="APP_ID")
+    bl_list.add_argument("--all", action="store_true",
+                          help="Include shipped/deferred/obsolete items")
+    bl_list.add_argument("--json", action="store_true")
+
+    bl_ship = backlog_sub.add_parser(
+        "ship", help="Manually mark a backlog item shipped (for backfill)",
+    )
+    bl_ship.add_argument("--app", required=True, metavar="APP_ID")
+    bl_ship.add_argument("item_id")
+    bl_ship.add_argument("--pr", default="manual",
+                          help="PR url/ref recorded as shipped_in")
+
+    bl_defer = backlog_sub.add_parser(
+        "defer", help="Defer or obsolete a backlog item",
+    )
+    bl_defer.add_argument("--app", required=True, metavar="APP_ID")
+    bl_defer.add_argument("item_id")
+    bl_defer.add_argument(
+        "--status", default="deferred", choices=("deferred", "obsolete", "queued"),
+    )
+
     research_p = sub.add_parser("research", help="Build or read app research profile")
     research_p.add_argument("--app", required=True, metavar="APP_ID")
     research_p.add_argument("--repo", default=None, metavar="PATH",
@@ -443,6 +565,7 @@ def main(argv: list[str] | None = None) -> None:
         "register": cmd_register,
         "install-plists": cmd_install_plists,
         "init-workspace": cmd_init_workspace,
+        "backlog": cmd_backlog,
     }
     dispatch[args.command](args)
 

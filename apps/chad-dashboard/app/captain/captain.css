@@ -244,7 +244,26 @@
 .b-obs  { color: var(--t3);     background: var(--surface);  border-color: var(--border); }
 .b-esc  { color: var(--red);    background: var(--red-d);    border-color: var(--red-bd);
           animation: cap-esc-flash 0.9s infinite; }
+.b-backlog { color: var(--green); background: var(--surface); border-color: var(--border2); }
 @keyframes cap-esc-flash { 0%, 100% { opacity: 1 } 50% { opacity: 0.6 } }
+
+.backlog-row {
+  display: grid;
+  grid-template-columns: 56px 36px 1fr auto;
+  gap: 8px;
+  padding: 4px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+  align-items: center;
+}
+.backlog-row.queued { color: var(--t1); }
+.backlog-row.shipped { color: var(--t3); }
+.backlog-row .bl-id { font-family: monospace; color: var(--t3); }
+.backlog-row .bl-prio { color: var(--green); letter-spacing: -2px; font-size: 9px; }
+.backlog-row .bl-status { color: var(--green); font-size: 10px; }
+.backlog-row .bl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backlog-row .bl-meta { color: var(--t3); font-size: 10px; font-family: monospace; }
+.backlog-row.shipped .bl-title { text-decoration: line-through; }
 
 .verdict-chip {
   display: inline-flex; align-items: center;

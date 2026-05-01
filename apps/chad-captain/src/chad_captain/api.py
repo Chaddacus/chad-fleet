@@ -176,6 +176,9 @@ def create_app() -> FastAPI:
             except (ValueError, KeyError, OSError):
                 pass
 
+        from chad_captain.protocol import read_feature_backlog
+        backlog = read_feature_backlog(ws) if ws.root.exists() else None
+
         bundle: dict[str, Any] = {
             "app_id": app_id,
             "name": entry.name if entry else app_id,
@@ -187,6 +190,7 @@ def create_app() -> FastAPI:
             "progress_tail": progress_tail,
             "unread_admiral_notes": unread,
             "paused_until": paused_until,
+            "feature_backlog": backlog.model_dump(mode="json") if backlog else None,
             "scorecard": None,
         }
         if include_scorecard and entry and entry.repo_path and Path(entry.repo_path).exists():

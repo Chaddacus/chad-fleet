@@ -165,6 +165,7 @@ export default function L2Client({ initial }: Props) {
           </div>
           <div className="pane-body">
             <RoadmapPane appId={app.app_id} roadmap={rm} />
+            <BacklogPane backlog={app.feature_backlog ?? null} />
             <div className="sec-lbl" style={{ marginTop: '8px' }}>Captain Log</div>
             {app.captain_log_tail.length === 0 && (
               <div style={{ fontSize: '11px', color: 'var(--t3)' }}>No log entries.</div>
@@ -236,6 +237,37 @@ function LogRow({ entry }: { entry: CaptainLogEntry }) {
         <pre className="log-refs">{JSON.stringify(entry.references, null, 2)}</pre>
       )}
     </div>
+  );
+}
+
+function BacklogPane({ backlog }: { backlog: import('@/lib/captainTypes').FeatureBacklog | null }) {
+  if (!backlog || backlog.items.length === 0) return null;
+  const queued = backlog.items.filter(i => i.status === 'queued').sort((a, b) => b.priority - a.priority);
+  const shipped = backlog.items.filter(i => i.status === 'shipped').slice(0, 5);
+  if (queued.length === 0 && shipped.length === 0) return null;
+  return (
+    <>
+      <div className="sec-lbl" style={{ marginTop: '12px' }}>
+        Feature Backlog ({queued.length} queued{shipped.length ? `, ${shipped.length} recently shipped` : ''})
+      </div>
+      {queued.map(it => (
+        <div key={it.id} className="backlog-row queued">
+          <span className="bl-id">{it.id}</span>
+          <span className="bl-prio" title={`priority ${it.priority.toFixed(2)}`}>
+            {'█'.repeat(Math.max(1, Math.round(it.priority * 5)))}
+          </span>
+          <span className="bl-title">{it.title}</span>
+          <span className="bl-meta">~{it.estimated_slice_count}sl · {it.source}</span>
+        </div>
+      ))}
+      {shipped.map(it => (
+        <div key={it.id} className="backlog-row shipped" title={it.shipped_in || ''}>
+          <span className="bl-id">{it.id}</span>
+          <span className="bl-status">✓ shipped</span>
+          <span className="bl-title">{it.title}</span>
+        </div>
+      ))}
+    </>
   );
 }
 

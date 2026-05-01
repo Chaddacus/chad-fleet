@@ -39,6 +39,7 @@ from chad_captain.protocol import (
     consume_admiral_note,
     list_unread_admiral_notes,
     read_captain_log,
+    read_feature_backlog,
     read_roadmap,
     write_roadmap,
 )
@@ -71,6 +72,8 @@ class ReplanContext(BaseModel):
     recent_decisions: list[dict] = Field(default_factory=list)
     admiral_notes: list[str] = Field(default_factory=list)
     code_inventory: dict = Field(default_factory=dict)
+    backlog_queued: list[dict] = Field(default_factory=list)  # top N queued features
+    backlog_shipped: list[str] = Field(default_factory=list)  # recent shipped titles
 
 
 REPLAN_SCHEMA = {
@@ -170,6 +173,19 @@ def replan(
     notes_with_paths = _collect_admiral_notes(ws)
     notes = [body for body, _ in notes_with_paths]
     inventory = _build_code_inventory(repo_path)
+    backlog = read_feature_backlog(ws)
+    backlog_queued = [
+        {
+            "id": i.id,
+            "title": i.title,
+            "rationale": i.rationale,
+            "priority": i.priority,
+            "estimated_slice_count": i.estimated_slice_count,
+            "source": i.source,
+        }
+        for i in backlog.queued(top=8)
+    ]
+    backlog_shipped = [i.title for i in backlog.shipped(last=20)]
 
     ctx = ReplanContext(
         trigger=trigger,
@@ -178,6 +194,8 @@ def replan(
         recent_decisions=recent_decisions,
         admiral_notes=notes,
         code_inventory=inventory,
+        backlog_queued=backlog_queued,
+        backlog_shipped=backlog_shipped,
     )
 
     roadmap = (
@@ -484,6 +502,34 @@ def _build_prompt(ctx: ReplanContext) -> str:
         lines.append("## Admiral notes (treat as direct steering input)")
         for note in ctx.admiral_notes:
             lines.append(f"- {note}")
+        lines.append("")
+    if ctx.backlog_queued:
+        lines.append("## Feature backlog — queued items (highest priority first)")
+        lines.append(
+            "These are the curated next features for this app. PREFER picking "
+            "FEATURE slices from this list over inventing new ones. The id, "
+            "title, and rationale are stable; cite the id in slice titles "
+            "(e.g. 'Cover A/B testing — POST endpoint [fb-001]') so the "
+            "captain can mark items shipped after merge."
+        )
+        for item in ctx.backlog_queued:
+            est = item.get("estimated_slice_count") or 2
+            src = item.get("source") or "manual"
+            rat = item.get("rationale") or ""
+            lines.append(
+                f"- [{item['id']}] (priority {item['priority']:.2f}, ~{est} slices, "
+                f"source={src}) {item['title']}"
+                + (f" — {rat[:200]}" if rat else "")
+            )
+        lines.append("")
+    if ctx.backlog_shipped:
+        lines.append("## Already-shipped features — DO NOT propose duplicates")
+        for title in ctx.backlog_shipped:
+            lines.append(f"- {title}")
+        lines.append(
+            "If your candidate FEATURE slice substantially overlaps any of "
+            "the above, drop it and pick a different backlog item."
+        )
         lines.append("")
     if p.web.status == "ok" and p.web.landscape_md:
         lines.append("## Competitive landscape (excerpt)")

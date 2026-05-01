@@ -1445,6 +1445,13 @@ def _handle_roadmap_complete(
             _maybe_self_merge_pr(
                 ws, repo_path, reg_app, sc_before, sc_after, pr_res.stdout.strip(),
             )
+
+        # Mark backlog items shipped when their titles overlap with the
+        # roadmap's slice titles. Phase A — fuzzy match on tokens.
+        try:
+            _mark_backlog_items_shipped(ws, roadmap, pr_url=pr_res.stdout.strip())
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("backlog ship-mark failed for %s: %s", ws.app_id, e)
     append_captain_log(
         ws,
         CaptainLogEntry(
@@ -1463,6 +1470,76 @@ def _handle_roadmap_complete(
             },
         ),
     )
+
+
+_BACKLOG_STOPWORDS = frozenset({
+    "a", "an", "and", "the", "to", "of", "for", "in", "on", "at", "by",
+    "with", "as", "is", "are", "be", "or", "feature", "add", "build",
+    "ship", "implement", "create", "make", "new", "update", "support",
+    "feat", "remediation", "fix", "test", "tests", "module", "page",
+    "view", "endpoint", "api", "service", "handler", "wire", "use",
+    "use", "this", "that", "from", "into", "via",
+})
+
+
+def _normalize_backlog_title(s: str) -> set[str]:
+    """Return the set of significant lowercase tokens in `s` for matching."""
+    import re as _re
+    cleaned = _re.sub(r"[^a-z0-9 ]", " ", s.lower())
+    tokens = {t for t in cleaned.split() if len(t) >= 3 and t not in _BACKLOG_STOPWORDS}
+    return tokens
+
+
+def _backlog_match_score(slice_title: str, item_title: str) -> float:
+    """Token-overlap score in [0, 1]. Symmetric Jaccard."""
+    a = _normalize_backlog_title(slice_title)
+    b = _normalize_backlog_title(item_title)
+    if not a or not b:
+        return 0.0
+    inter = a & b
+    union = a | b
+    return len(inter) / len(union)
+
+
+def _mark_backlog_items_shipped(
+    ws: AppWorkspace, roadmap: Roadmap, *, pr_url: str
+) -> list[str]:
+    """For each queued backlog item, if any slice in `roadmap` matches it
+    (token-overlap or explicit ``[fb-NNN]`` tag), flip status to shipped.
+
+    Returns the list of shipped item ids (mostly for tests/logging).
+    """
+    from chad_captain.protocol import read_feature_backlog, write_feature_backlog
+    backlog = read_feature_backlog(ws)
+    queued = backlog.queued()
+    if not queued:
+        return []
+
+    slice_titles = [s.title or s.objective for s in roadmap.slices if s.status == "done"]
+    slice_blob = " | ".join(slice_titles).lower()
+    shipped_ids: list[str] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for item in queued:
+        # Explicit tag wins: any slice title that contains [fb-NNN]
+        if f"[{item.id.lower()}]" in slice_blob:
+            item.status = "shipped"
+            item.shipped_in = pr_url
+            item.shipped_at = now
+            shipped_ids.append(item.id)
+            continue
+        # Token-overlap fallback: ≥0.5 Jaccard against ANY slice title
+        for st in slice_titles:
+            if _backlog_match_score(st, item.title) >= 0.5:
+                item.status = "shipped"
+                item.shipped_in = pr_url
+                item.shipped_at = now
+                shipped_ids.append(item.id)
+                break
+
+    if shipped_ids:
+        write_feature_backlog(ws, backlog)
+    return shipped_ids
 
 
 __all__ = [

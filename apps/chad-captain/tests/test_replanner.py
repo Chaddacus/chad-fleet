@@ -488,3 +488,53 @@ def test_clean_title_falls_back_to_first_sentence_of_objective() -> None:
 def test_clean_title_falls_back_when_blank_string() -> None:
     out = _clean_title("   ", objective_fallback="Persist agent decision log via Django model")
     assert out.startswith("Persist agent decision log")
+
+
+# ---------------------------------------------------------------------------
+# Phase A: backlog feeds the replan prompt
+# ---------------------------------------------------------------------------
+
+
+def test_replan_prompt_includes_queued_backlog_items() -> None:
+    from chad_captain.protocol import FeatureBacklog, FeatureBacklogItem
+    from chad_captain.replanner import _build_prompt
+    sc = _scorecard()
+    ctx = ReplanContext(
+        trigger="manual", profile=_profile(), scorecard=sc,
+        backlog_queued=[
+            {"id": "fb-001", "title": "Cover A/B testing dashboard",
+             "rationale": "10/10 indie author tools have it",
+             "priority": 0.9, "estimated_slice_count": 3, "source": "research"},
+            {"id": "fb-002", "title": "Email automation flow",
+             "rationale": "", "priority": 0.7,
+             "estimated_slice_count": 2, "source": "admiral"},
+        ],
+        backlog_shipped=["CSV export endpoint"],
+    )
+    prompt = _build_prompt(ctx)
+    assert "fb-001" in prompt
+    assert "Cover A/B testing dashboard" in prompt
+    assert "fb-002" in prompt
+    assert "PREFER picking" in prompt
+    assert "CSV export endpoint" in prompt
+    assert "DO NOT propose duplicates" in prompt
+
+
+def test_replan_picks_up_seeded_backlog(ws: AppWorkspace, repo: Path) -> None:
+    """End-to-end: write_feature_backlog → replan(use_llm=False) reads it."""
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem, write_feature_backlog,
+    )
+    write_feature_backlog(ws, FeatureBacklog(
+        app_id="test-app",
+        items=[
+            FeatureBacklogItem(id="fb-001", title="Demo backlog feature", priority=0.8),
+        ],
+    ))
+    # Use fallback path (no LLM) so we exercise the read path even when LLM
+    # is stubbed to fail; backlog still loads into context successfully.
+    rm = replan(ws, repo, trigger="initial", use_llm=False)
+    # Fallback path doesn't consume backlog, but the replan must not crash
+    # when a backlog file exists.
+    assert rm is not None
+    assert len(rm.slices) >= 1

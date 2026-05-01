@@ -122,8 +122,31 @@ export interface AppStateBundle {
   progress_tail: ProgressEvent[];
   unread_admiral_notes: string[];
   paused_until?: string | null;
+  feature_backlog?: FeatureBacklog | null;
   scorecard: Scorecard | null;
   error?: string;
+}
+
+export type FeatureStatus = 'queued' | 'shipped' | 'deferred' | 'obsolete';
+
+export interface FeatureBacklogItem {
+  id: string;
+  title: string;
+  rationale: string;
+  priority: number;
+  estimated_slice_count: number;
+  status: FeatureStatus;
+  source: string;
+  competitive_evidence: string[];
+  shipped_in: string | null;
+  shipped_at: string | null;
+  created_at: string;
+}
+
+export interface FeatureBacklog {
+  app_id: string;
+  generated_at: string;
+  items: FeatureBacklogItem[];
 }
 
 export interface FleetBundle {
