@@ -209,11 +209,35 @@ def replan(
 
     # Mark admiral notes as consumed only after roadmap write succeeds.
     # If we crash mid-replan, the notes are still in queue for the next attempt.
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log,
+    )
     for _body, path in notes_with_paths:
+        note_id = path.stem  # e.g. "note-20260501T142914960453"
         try:
             consume_admiral_note(ws, path)
         except OSError as e:
             logger.warning("could not consume admiral note %s: %s", path, e)
+            continue
+        # Log the note→replan link so the dashboard can show "your note
+        # produced this roadmap" without parsing JSONL by hand.
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id,
+                slice_id=None,
+                kind="note_response",
+                rationale=(
+                    f"note {note_id} consumed by replan trigger={trigger}; "
+                    f"new roadmap has {len(roadmap.slices)} slices"
+                ),
+                references={
+                    "note_id": note_id,
+                    "trigger": trigger,
+                    "roadmap_generated_at": roadmap.generated_at,
+                },
+            ),
+        )
 
     return roadmap
 
@@ -324,14 +348,12 @@ def _detect_trigger(ws: AppWorkspace) -> str | None:
     ):
         return "soft_accept_streak"
 
-    notes = list_unread_admiral_notes(ws)
-    for n in notes:
-        try:
-            data = json.loads(n.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if "replan" in (data.get("body") or "").lower():
-            return "admiral_note"
+    # Any unread admiral note triggers a replan — Chad sent direction,
+    # captain acts on it. Previously we required the literal word "replan"
+    # in the body, which silently dropped natural-language notes like
+    # "look at test density and file size health".
+    if list_unread_admiral_notes(ws):
+        return "admiral_note"
     return None
 
 

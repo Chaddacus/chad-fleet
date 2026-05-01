@@ -187,6 +187,7 @@ export default function L2Client({ initial }: Props) {
           </div>
           <div className="pane-body">
             <AdmiralConsole app={app} onAfter={refetch} />
+            <NotesPane app={app} />
           </div>
         </div>
       </div>
@@ -241,6 +242,67 @@ function LogRow({ entry }: { entry: CaptainLogEntry }) {
         <pre className="log-refs">{JSON.stringify(entry.references, null, 2)}</pre>
       )}
     </div>
+  );
+}
+
+function NotesPane({ app }: { app: AppStateBundle }) {
+  const queued = app.admiral_notes_queued ?? [];
+  const consumed = app.admiral_notes_consumed ?? [];
+  const log = app.captain_log_tail ?? [];
+
+  // Build a map: note_id → {kind, ts, rationale} from log entries
+  const noteEvents = new Map<string, { kind: string; ts: string; rationale: string }[]>();
+  for (const e of log) {
+    const id = (e.references as Record<string, string> | undefined)?.note_id;
+    if (!id) continue;
+    if (!noteEvents.has(id)) noteEvents.set(id, []);
+    noteEvents.get(id)!.push({ kind: e.kind, ts: e.ts, rationale: e.rationale });
+  }
+
+  if (queued.length === 0 && consumed.length === 0) {
+    return null;
+  }
+  return (
+    <>
+      <div className="sec-lbl" style={{ marginTop: '12px' }}>
+        Admiral Notes ({queued.length} queued{consumed.length ? `, ${consumed.length} processed` : ''})
+      </div>
+      {queued.map(n => {
+        const events = noteEvents.get(n.note_id) ?? [];
+        return (
+          <div key={n.note_id} className="note-row queued">
+            <div className="note-row-hd">
+              <span className="note-status">⏳ queued</span>
+              <span className="note-ts">{fmtAgo(n.received_at)}</span>
+            </div>
+            <div className="note-body">{n.body}</div>
+            {events.length > 0 && (
+              <div className="note-events">
+                {events.map((e, i) => (
+                  <span key={i} className="note-event">{e.kind}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+      {consumed.map(n => {
+        const events = noteEvents.get(n.note_id) ?? [];
+        const responseEvent = events.find(e => e.kind === 'note_response');
+        return (
+          <div key={n.note_id} className="note-row consumed">
+            <div className="note-row-hd">
+              <span className="note-status">✓ processed</span>
+              <span className="note-ts">{fmtAgo(n.consumed_at)}</span>
+            </div>
+            <div className="note-body">{n.body}</div>
+            {responseEvent && (
+              <div className="note-response">{responseEvent.rationale}</div>
+            )}
+          </div>
+        );
+      })}
+    </>
   );
 }
 

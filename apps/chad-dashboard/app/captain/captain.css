@@ -317,6 +317,51 @@
   font-family: monospace;
 }
 
+.note-row {
+  border-left: 2px solid var(--border);
+  padding: 4px 8px;
+  margin: 4px 0;
+  font-size: 11px;
+}
+.note-row.queued { border-left-color: var(--yellow); }
+.note-row.consumed { border-left-color: var(--green); opacity: 0.85; }
+.note-row-hd {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+.note-status { font-weight: 600; color: var(--t1); }
+.note-row.queued .note-status { color: var(--yellow); }
+.note-row.consumed .note-status { color: var(--green); }
+.note-ts { color: var(--t3); font-size: 10px; }
+.note-body {
+  color: var(--t1);
+  line-height: 1.4;
+  margin: 2px 0;
+  white-space: pre-wrap;
+}
+.note-response {
+  font-size: 10px;
+  color: var(--t3);
+  font-style: italic;
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px dashed var(--border);
+}
+.note-events {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+.note-event {
+  font-size: 9px;
+  color: var(--indigo);
+  background: var(--surface);
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-family: monospace;
+}
+
 .verdict-chip {
   display: inline-flex; align-items: center;
   font-size: 10px; font-weight: 700; letter-spacing: 0.06em;

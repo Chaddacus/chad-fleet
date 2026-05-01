@@ -121,6 +121,8 @@ export interface AppStateBundle {
   captain_log_tail: CaptainLogEntry[];
   progress_tail: ProgressEvent[];
   unread_admiral_notes: string[];
+  admiral_notes_queued?: AdmiralNote[];
+  admiral_notes_consumed?: AdmiralNoteConsumed[];
   paused_until?: string | null;
   pause_reason?: 'circuit_breaker' | 'backlog_saturated' | string | null;
   feature_backlog?: FeatureBacklog | null;
@@ -148,6 +150,20 @@ export interface FeatureBacklog {
   app_id: string;
   generated_at: string;
   items: FeatureBacklogItem[];
+}
+
+export interface AdmiralNote {
+  note_id: string;
+  app_id: string;
+  received_at: string;
+  body: string;
+  expects_response: boolean;
+  captain_response: string | null;
+  responded_at: string | null;
+}
+
+export interface AdmiralNoteConsumed extends AdmiralNote {
+  consumed_at: string;
 }
 
 export interface ShippedPR {

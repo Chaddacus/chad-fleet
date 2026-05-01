@@ -661,3 +661,43 @@ def test_clear_saturation_pause_skips_circuit_breaker_pause(ws: AppWorkspace) ->
     assert cleared is False
     # Circuit-breaker pause must remain
     assert ws.pause_until_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Admiral note lifecycle visibility
+# ---------------------------------------------------------------------------
+
+
+def test_any_unread_admiral_note_triggers_replan(ws: AppWorkspace) -> None:
+    """Natural-language notes (no 'replan' keyword) must still trigger
+    admiral_note replan. Previously we silently dropped them."""
+    write_roadmap(ws, Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="a", status="queued")],
+    ))
+    write_admiral_note(ws, AdmiralNote(
+        note_id="n1", app_id="test-app",
+        body="look at test density and file size health",
+    ))
+    assert _detect_trigger(ws) == "admiral_note"
+
+
+def test_replan_emits_note_response_log_per_consumed_note(
+    ws: AppWorkspace, repo: Path
+) -> None:
+    """Each consumed note should write a note_response log entry linking
+    note_id to the new roadmap. That's the visibility surface."""
+    from chad_captain.protocol import read_captain_log
+    write_admiral_note(ws, AdmiralNote(
+        note_id="note-test-link", app_id="test-app",
+        body="please ship feature X",
+    ))
+    replan(ws, repo, trigger="admiral_note", use_llm=False)
+    log = read_captain_log(ws, limit=20)
+    note_responses = [
+        e for e in log
+        if e.kind == "note_response"
+        and (e.references or {}).get("note_id") == "note-test-link"
+    ]
+    assert len(note_responses) == 1
+    assert "consumed by replan" in note_responses[0].rationale

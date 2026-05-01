@@ -178,8 +178,43 @@ def create_app() -> FastAPI:
             except (ValueError, KeyError, OSError):
                 pass
 
-        from chad_captain.protocol import read_feature_backlog
+        from chad_captain.protocol import (
+            AdmiralNote, read_feature_backlog,
+        )
         backlog = read_feature_backlog(ws) if ws.root.exists() else None
+
+        # Admiral note lifecycle: queued + most-recent consumed (≤ 10).
+        # Chad needs to see what he sent, what's processed, and what
+        # still hasn't been picked up.
+        admiral_queued: list[dict] = []
+        admiral_consumed: list[dict] = []
+        if ws.root.exists():
+            try:
+                for p in sorted(ws.admiral_notes_dir.glob("*.json")):
+                    if not p.is_file():
+                        continue
+                    try:
+                        n = AdmiralNote.model_validate_json(p.read_text())
+                        admiral_queued.append(n.model_dump(mode="json"))
+                    except Exception:
+                        continue
+                if ws.admiral_notes_consumed_dir.exists():
+                    cons = sorted(
+                        ws.admiral_notes_consumed_dir.glob("*.json"),
+                        key=lambda p: p.stat().st_mtime, reverse=True,
+                    )[:10]
+                    for p in cons:
+                        try:
+                            n = AdmiralNote.model_validate_json(p.read_text())
+                            d = n.model_dump(mode="json")
+                            d["consumed_at"] = datetime.fromtimestamp(
+                                p.stat().st_mtime, tz=timezone.utc,
+                            ).isoformat()
+                            admiral_consumed.append(d)
+                        except Exception:
+                            continue
+            except OSError:
+                pass
 
         bundle: dict[str, Any] = {
             "app_id": app_id,
@@ -191,6 +226,8 @@ def create_app() -> FastAPI:
             "captain_log_tail": [e.model_dump(mode="json") for e in log],
             "progress_tail": progress_tail,
             "unread_admiral_notes": unread,
+            "admiral_notes_queued": admiral_queued,
+            "admiral_notes_consumed": admiral_consumed,
             "paused_until": paused_until,
             "pause_reason": pause_reason,
             "feature_backlog": backlog.model_dump(mode="json") if backlog else None,
@@ -292,6 +329,28 @@ def create_app() -> FastAPI:
             expects_response=payload.expects_response,
         )
         path = write_admiral_note(ws, note)
+
+        # Log the receipt so it's visible in the captain log + summary.
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=app_id,
+                slice_id=None,
+                kind="note_received",
+                rationale=f"admiral note received: {(note.body or '')[:140]}",
+                references={"note_id": note.note_id},
+            ),
+        )
+
+        # Admiral notes outrank circuit-breaker pauses — Chad sent direction,
+        # captain should act on it. Clear any saturation OR circuit_breaker
+        # pause so the next tick processes the note rather than ignoring it.
+        if ws.pause_until_path.exists():
+            try:
+                ws.pause_until_path.unlink()
+            except OSError:
+                pass
+
         return {"note_id": note.note_id, "path": str(path)}
 
     @app.post("/apps/{app_id}/replan")
