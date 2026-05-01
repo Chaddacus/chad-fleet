@@ -199,6 +199,23 @@ def test_replan_rejects_unknown_trigger(ws: AppWorkspace, repo: Path) -> None:
         replan(ws, repo, trigger="bogus", use_llm=False)
 
 
+def test_replan_consumes_admiral_notes_on_success(ws: AppWorkspace, repo: Path) -> None:
+    write_admiral_note(ws, AdmiralNote(
+        note_id="note-test-consume", app_id="test-app",
+        received_at="2026-05-01T00:00:00Z",
+        body="please replan: consolidate billing modules",
+    ))
+    note_path = ws.admiral_notes_dir / "note-test-consume.json"
+    consumed_path = ws.admiral_notes_consumed_dir / "note-test-consume.json"
+    assert note_path.exists()
+    assert not consumed_path.exists()
+
+    replan(ws, repo, trigger="admiral_note", use_llm=False)
+
+    assert not note_path.exists(), "note should be moved out of queue after replan"
+    assert consumed_path.exists(), "note should land in admiral_notes/consumed/"
+
+
 def test_replan_uses_llm_when_available(ws: AppWorkspace, repo: Path, monkeypatch) -> None:
     """When the LLM call succeeds, the replanner should consume its slices."""
     fake_payload = {

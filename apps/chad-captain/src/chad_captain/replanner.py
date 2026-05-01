@@ -36,6 +36,7 @@ from chad_captain.protocol import (
     AppWorkspace,
     Roadmap,
     RoadmapSlice,
+    consume_admiral_note,
     list_unread_admiral_notes,
     read_captain_log,
     read_roadmap,
@@ -150,7 +151,8 @@ def replan(
         for e in captain_log
     ]
 
-    notes = _collect_admiral_notes(ws)
+    notes_with_paths = _collect_admiral_notes(ws)
+    notes = [body for body, _ in notes_with_paths]
     inventory = _build_code_inventory(repo_path)
 
     ctx = ReplanContext(
@@ -170,6 +172,15 @@ def replan(
     roadmap.generated_by = "replanner"
     roadmap.generated_at = datetime.now(timezone.utc).isoformat()
     write_roadmap(ws, roadmap)
+
+    # Mark admiral notes as consumed only after roadmap write succeeds.
+    # If we crash mid-replan, the notes are still in queue for the next attempt.
+    for _body, path in notes_with_paths:
+        try:
+            consume_admiral_note(ws, path)
+        except OSError as e:
+            logger.warning("could not consume admiral note %s: %s", path, e)
+
     return roadmap
 
 
@@ -213,16 +224,23 @@ def _detect_trigger(ws: AppWorkspace) -> str | None:
     return None
 
 
-def _collect_admiral_notes(ws: AppWorkspace, *, limit: int = 5) -> list[str]:
+def _collect_admiral_notes(
+    ws: AppWorkspace, *, limit: int = 5
+) -> list[tuple[str, Path]]:
+    """Return up to ``limit`` unread admiral notes as ``(body, path)`` tuples.
+
+    Path is preserved so the caller can move successfully-consumed notes to
+    ``admiral_notes/consumed/`` after the roadmap write succeeds.
+    """
     notes_paths = list_unread_admiral_notes(ws)[-limit:]
-    out: list[str] = []
+    out: list[tuple[str, Path]] = []
     for p in notes_paths:
         try:
             note = AdmiralNote.model_validate_json(p.read_text())
         except (OSError, ValidationError) as e:
             logger.warning("could not parse admiral note %s: %s", p, e)
             continue
-        out.append(note.body)
+        out.append((note.body, p))
     return out
 
 
