@@ -133,7 +133,15 @@ def validate_slice(
             rationale="clean exit, files modified, no rubric delta available",
         )
 
-    if delta < 0:
+    # Noise floor for the continuous rubric — anything in
+    # [-NOISE_FLOOR, +ACCEPT] is soft_accept. Without this, the new
+    # continuous file_size_health/test_density dims produce tiny
+    # floating-point negative deltas (-0.0001pp from same-LOC files) that
+    # fired reject_retry → revert and threw out legit slices.
+    NOISE_FLOOR_PP = 0.5
+    ACCEPT_THRESHOLD_PP = 0.5
+
+    if delta <= -NOISE_FLOOR_PP:
         if is_retry:
             return ValidationResult(
                 verdict="revert",
@@ -146,7 +154,7 @@ def validate_slice(
             rubric_delta_pp=delta,
         )
 
-    if delta >= 0.5:
+    if delta >= ACCEPT_THRESHOLD_PP:
         return ValidationResult(
             verdict="accept",
             rationale=f"rubric delta {delta:+.2f}pp",
