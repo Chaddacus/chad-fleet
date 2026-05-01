@@ -10,6 +10,7 @@ import {
   lastValidate,
   roadmapProgress,
   scoreColor,
+  sliceHeadline,
   trunc,
 } from '../lib/captainFormat';
 
@@ -47,7 +48,7 @@ export function AppRow({ app }: { app: AppStateBundle }) {
         </div>
         {cs ? (
           <>
-            <div className="activity-obj">{trunc(cs.objective, 72)}</div>
+            <div className="activity-obj">{sliceHeadline(cs, 72)}</div>
             <div className="activity-meta">
               {cs.slice_id} · <span>{elapsed(cs.started_at)}</span> elapsed
             </div>

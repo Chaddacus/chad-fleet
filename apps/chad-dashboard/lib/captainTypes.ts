@@ -47,6 +47,7 @@ export interface CurrentSlice {
   slice_id: string;
   app_id: string;
   objective: string;
+  title?: string;
   system_prompt: string;
   user_prompt: string;
   repo_path: string;
@@ -63,6 +64,7 @@ export interface CurrentSlice {
 export interface RoadmapSlice {
   slice_id: string;
   objective: string;
+  title?: string;
   phase: string;
   estimated_minutes: number;
   blocked_by: string[];

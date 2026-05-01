@@ -135,6 +135,7 @@ class CurrentSlice(BaseModel):
     slice_id: str
     app_id: str
     objective: str = Field(..., description="One-line goal for this slice (used in logs)")
+    title: str = Field(default="", description="≤80-char human-readable headline for dashboard display; falls back to objective")
     system_prompt: str = Field(..., description="Full system prompt passed to goose --system")
     user_prompt: str = Field(..., description="Full user prompt passed to goose --text")
     repo_path: str = Field(..., description="Working directory for goose run")
@@ -235,6 +236,7 @@ class RoadmapSlice(BaseModel):
 
     slice_id: str
     objective: str
+    title: str = ""  # ≤80-char human-readable headline; falls back to objective
     phase: str = ""  # e.g. "T-32", "fundations", "compliance"
     estimated_minutes: int = 30
     blocked_by: list[str] = Field(default_factory=list)

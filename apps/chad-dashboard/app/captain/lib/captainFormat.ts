@@ -32,6 +32,25 @@ export function trunc(s: string | undefined | null, n: number): string {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+/**
+ * Human-readable slice headline. Prefers the LLM-supplied `title` (already
+ * sanitized server-side: ≤80 chars, no file paths, no FEATURE: prefix). Falls
+ * back to the first sentence of the verbose objective, truncated to `max`.
+ */
+export function sliceHeadline(
+  s: { title?: string | null; objective?: string | null } | null | undefined,
+  max = 80,
+): string {
+  if (!s) return '';
+  const title = (s.title ?? '').trim();
+  if (title) return trunc(title, max);
+  const obj = (s.objective ?? '').trim();
+  if (!obj) return '';
+  // First sentence wins; otherwise just truncate.
+  const firstSentence = obj.split(/(?<=\.)\s+/)[0] ?? obj;
+  return trunc(firstSentence.replace(/^\s*(FEATURE|REMEDIATION|HOUSEKEEPING|FIX|TEST|REFACTOR|CHORE|DOCS)\s*:\s*/i, ''), max);
+}
+
 export function fmtDetail(d: Record<string, unknown> | undefined | null): string {
   if (!d) return '';
   const entries = Object.entries(d);

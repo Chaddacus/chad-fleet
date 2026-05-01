@@ -15,6 +15,7 @@ import {
   fmtDetail,
   fmtTime,
   scoreColor,
+  sliceHeadline,
   trunc,
 } from '../lib/captainFormat';
 import { BASELINE_DIMENSIONS } from '@/lib/captainTypes';
@@ -112,7 +113,13 @@ export default function L2Client({ initial }: Props) {
                   <span style={{ color: 'var(--t3)' }}>·</span>
                   <span style={{ color: 'var(--green)' }}>● in flight</span>
                 </div>
-                <div className="slice-obj">{cs.objective}</div>
+                <div className="slice-obj">{sliceHeadline(cs, 200)}</div>
+                {cs.title && cs.title !== cs.objective && (
+                  <details className="slice-obj-full">
+                    <summary>full objective</summary>
+                    <div className="slice-obj-detail">{cs.objective}</div>
+                  </details>
+                )}
                 <div className="slice-kv">
                   <KV k="started" v={fmtTime(cs.started_at)} />
                   <KV k="elapsed" v={elapsed(cs.started_at)} live />
@@ -292,7 +299,7 @@ function RoadmapSliceRow({ appId, sl }: { appId: string; sl: RoadmapSlice }) {
       </div>
       <div className="rm-body">
         <div className="rm-id">{sl.slice_id}</div>
-        <div className={`rm-obj ${sl.status}`}>{sl.objective}</div>
+        <div className={`rm-obj ${sl.status}`} title={sl.objective}>{sliceHeadline(sl, 110)}</div>
         {sl.phase && (
           <div className="rm-phase">
             {sl.phase} · ~{sl.estimated_minutes}min

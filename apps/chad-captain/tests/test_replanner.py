@@ -19,6 +19,7 @@ from chad_captain.protocol import (
 )
 from chad_captain.replanner import (
     REPLAN_TRIGGERS,
+    _clean_title,
     _detect_trigger,
     _fallback_roadmap,
     replan,
@@ -447,3 +448,43 @@ def test_build_prompt_adds_stall_warning_when_deltas_tiny() -> None:
     assert "FEATURE work" in prompt
     # Always-on feature-mix instruction
     assert "FEATURE slices" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _clean_title — dashboard-friendly headlines
+# ---------------------------------------------------------------------------
+
+
+def test_clean_title_uses_explicit_title_when_present() -> None:
+    out = _clean_title("Add billing entitlements API endpoint", objective_fallback="ignore me")
+    assert out == "Add billing entitlements API endpoint"
+
+
+def test_clean_title_strips_phase_prefix() -> None:
+    out = _clean_title("FEATURE: surface AgentDecision history", objective_fallback="x")
+    assert out == "surface AgentDecision history"
+    out2 = _clean_title("REMEDIATION: Shrink launch ops file", objective_fallback="x")
+    assert out2 == "Shrink launch ops file"
+
+
+def test_clean_title_truncates_overlong() -> None:
+    raw = "A" * 200
+    out = _clean_title(raw, objective_fallback="x")
+    assert len(out) <= 80
+    assert out.endswith("…")
+
+
+def test_clean_title_falls_back_to_first_sentence_of_objective() -> None:
+    objective = (
+        "Add GET /api/billing/entitlements/ endpoint in apps/billing/api/views.py. "
+        "Wire URL. Add tests."
+    )
+    out = _clean_title(None, objective_fallback=objective)
+    # First sentence wins, no module paths fed through
+    assert out.startswith("Add GET /api/billing/entitlements/ endpoint")
+    assert "Wire URL" not in out
+
+
+def test_clean_title_falls_back_when_blank_string() -> None:
+    out = _clean_title("   ", objective_fallback="Persist agent decision log via Django model")
+    assert out.startswith("Persist agent decision log")

@@ -84,10 +84,19 @@ REPLAN_SCHEMA = {
             "maxItems": 8,
             "items": {
                 "type": "object",
-                "required": ["slice_id", "objective"],
+                "required": ["slice_id", "objective", "title"],
                 "properties": {
                     "slice_id": {"type": "string"},
                     "objective": {"type": "string"},
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Human-readable headline ≤80 chars, no file paths "
+                            "or code identifiers. Plain English describing what "
+                            "this slice does (e.g. 'Add billing entitlements "
+                            "API endpoint' or 'Shrink launch ops service file')."
+                        ),
+                    },
                     "phase": {"type": "string"},
                     "estimated_minutes": {"type": "integer"},
                     "blocked_by": {"type": "array", "items": {"type": "string"}},
@@ -111,7 +120,14 @@ REPLAN_SYSTEM = (
     "4. Sequenced via blocked_by — earlier slices unblock later ones; do NOT "
     "create a single mega-slice.\n"
     "Reject vague objectives like 'improve X' or 'refactor Y' — every slice "
-    "names the file(s), function(s), or behavior to change."
+    "names the file(s), function(s), or behavior to change.\n"
+    "Each slice MUST also include a `title` — a ≤80-char plain-English "
+    "headline for dashboard display. The title is what a human glances at "
+    "to know what's happening. NO file paths, NO code identifiers, NO "
+    "module names. Examples: 'Add billing entitlements API endpoint', "
+    "'Shrink launch ops service file', 'Wire tier-gated permission check'. "
+    "The verbose `objective` is for the coding agent; the `title` is for "
+    "the human watching the dashboard."
 )
 
 
@@ -269,6 +285,7 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
             slices.append(RoadmapSlice(
                 slice_id=str(raw["slice_id"]),
                 objective=str(raw["objective"]),
+                title=_clean_title(raw.get("title"), str(raw["objective"])),
                 phase=str(raw.get("phase") or ""),
                 estimated_minutes=int(raw.get("estimated_minutes") or 30),
                 blocked_by=list(raw.get("blocked_by") or []),
@@ -284,6 +301,40 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
         slices=slices,
         objective_summary=str(data.get("objective_summary") or ""),
     )
+
+
+_TITLE_MAX_CHARS = 80
+_PHASE_PREFIX_RE = re.compile(
+    r"^(FEATURE|REMEDIATION|HOUSEKEEPING|FIX|TEST|REFACTOR|CHORE|DOCS)\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_title(raw: object, objective_fallback: str) -> str:
+    """Return a sanitized headline for dashboard display.
+
+    Falls back to the first sentence of the objective (truncated) when the
+    LLM omits or fumbles the title field.
+    """
+    candidate = str(raw or "").strip()
+    if not candidate:
+        candidate = _derive_title_from_objective(objective_fallback)
+    candidate = _PHASE_PREFIX_RE.sub("", candidate).strip()
+    if len(candidate) > _TITLE_MAX_CHARS:
+        candidate = candidate[: _TITLE_MAX_CHARS - 1].rstrip() + "…"
+    return candidate
+
+
+def _derive_title_from_objective(objective: str) -> str:
+    """Pull a one-line headline out of the verbose slice objective."""
+    text = objective.strip()
+    # First sentence (split on period+space, ignoring code paths).
+    for sep in (". ", ".\n", "\n"):
+        idx = text.find(sep)
+        if 0 < idx <= 120:
+            text = text[:idx]
+            break
+    return text.strip()
 
 
 def _build_code_inventory(repo_path: str | Path) -> dict:
@@ -522,8 +573,8 @@ def _fallback_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
             app_id=app_id,
             objective_summary="Healthy scorecard; smoke tests + dependency refresh",
             slices=[
-                RoadmapSlice(slice_id="S1", objective="Run full test suite and ensure 100% pass; fix any newly failing tests in place"),
-                RoadmapSlice(slice_id="S2", objective="Audit and bump one outdated direct dependency to its latest minor version", blocked_by=["S1"]),
+                RoadmapSlice(slice_id="S1", title="Run full test suite", objective="Run full test suite and ensure 100% pass; fix any newly failing tests in place"),
+                RoadmapSlice(slice_id="S2", title="Bump one outdated dependency", objective="Audit and bump one outdated direct dependency to its latest minor version", blocked_by=["S1"]),
             ],
         )
     slices: list[RoadmapSlice] = []
@@ -532,6 +583,7 @@ def _fallback_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
         slices.append(RoadmapSlice(
             slice_id=f"S{i}",
             objective=objective,
+            title=_clean_title(None, objective),
             phase="compliance",
             estimated_minutes=45,
             blocked_by=[f"S{i-1}"] if i > 1 else [],
