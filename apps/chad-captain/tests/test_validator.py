@@ -1403,6 +1403,111 @@ def test_low_yield_streak_retrips_after_fresh_threshold_post_escalation(
     assert len(tripped) == 2
 
 
+def test_reuse_regression_blocks_new_parallel_package(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live failure: PR #145 shipped a 2nd parallel `entitlements.py`
+    module without rejection. The C14 gate now turns reuse_consistency
+    drops into reject_retry verdicts."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import write_baseline, score_repo
+    from chad_captain.protocol import write_roadmap
+    from chad_captain.validator import captain_tick
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Set up a clean baseline (no parallel packages).
+    (repo / "apps" / "billing").mkdir(parents=True)
+    (repo / "apps" / "billing" / "models.py").write_text("class Plan: pass\n")
+    write_baseline(ws.slice_baseline_path, score_repo(repo))
+
+    # Now the slice "lands" by creating a top-level billing/ directory →
+    # introduces the parallel-package smell.
+    (repo / "billing").mkdir()
+    (repo / "billing" / "models.py").write_text("class Plan2: pass\n")
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="add billing", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(
+            slice_id="s1", app_id="test-app", duration_seconds=5,
+            goose_exit_code=0, summary="ok",
+            files_changed=["billing/models.py"],
+        ),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=True)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert validates, "expected a validate entry"
+    last = validates[-1]
+    assert last.verdict == "reject_retry"
+    assert "parallel package" in last.rationale or "reuse_consistency" in last.rationale
+    assert "billing" in last.rationale  # name of the new dup is surfaced
+
+
+def test_reuse_regression_does_not_fire_on_clean_slice(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No regression in reuse_consistency → no override. Slice ships."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import write_baseline, score_repo
+    from chad_captain.protocol import write_roadmap
+    from chad_captain.validator import captain_tick
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "apps" / "billing").mkdir(parents=True)
+    (repo / "apps" / "billing" / "models.py").write_text("class Plan: pass\n")
+    write_baseline(ws.slice_baseline_path, score_repo(repo))
+
+    # Clean slice — adds a test file inside the existing package.
+    (repo / "apps" / "billing" / "tests").mkdir()
+    (repo / "apps" / "billing" / "tests" / "test_x.py").write_text("def test(): pass\n")
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="add tests", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(
+            slice_id="s1", app_id="test-app", duration_seconds=5,
+            goose_exit_code=0, summary="ok",
+            files_changed=["apps/billing/tests/test_x.py"],
+        ),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=True)
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert validates, "expected a validate entry"
+    # Should NOT be reject_retry — accept or soft_accept depending on delta.
+    assert validates[-1].verdict in ("accept", "soft_accept")
+
+
 def test_low_yield_streak_ignores_real_deltas(
     ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

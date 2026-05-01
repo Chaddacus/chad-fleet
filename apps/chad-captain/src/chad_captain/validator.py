@@ -426,6 +426,37 @@ def captain_tick(
         )
         result = validate_slice(complete=completion, slice_=proxy_slice, score_delta=score_delta)
 
+        # C14 — reuse-regression guard. If the slice introduced a NEW
+        # parallel package (reuse_consistency dropped from before to
+        # after), override the verdict / rationale with a specific
+        # parallel-package message. Live failure: PR #145 shipped two
+        # parallel `entitlements.py` modules — one in top-level
+        # `billing/` with TIER_RANK and one in `apps/billing/services/`
+        # with TIER_FEATURE_MATRIX. reuse_consistency dropped, but the
+        # generic "rubric regression" message gave the captain no
+        # actionable signal. The override turns it into an explicit
+        # "EXTEND existing package instead" instruction.
+        if use_baseline_scorecard:
+            reuse_drop = _detect_reuse_regression(ws, repo_path)
+            if reuse_drop is not None:
+                was_retry = completion.slice_id.endswith("-retry")
+                # Always reject when a parallel package is introduced.
+                # On retry, reject_hard so we don't loop on the same
+                # mistake. First time, reject_retry with explicit
+                # guidance.
+                verdict = "reject_hard" if was_retry else "reject_retry"
+                suffix = "after retry; reject hard" if was_retry else (
+                    "retry — EXTEND existing package instead of parallel"
+                )
+                result = ValidationResult(
+                    verdict=verdict,
+                    rationale=(
+                        f"reuse_consistency regressed {reuse_drop} — "
+                        f"slice introduced parallel package; {suffix}"
+                    ),
+                    rubric_delta_pp=result.rubric_delta_pp,
+                )
+
         # C1 verify gate: if the registered app has a verify_cmd, run it
         # against the repo. Goose's exit-code is local to the slice; the
         # verify gate is global ("does the project still build/test?").
@@ -788,6 +819,40 @@ _MODULE_LEVEL_STATE_RE = re.compile(
     r"^\+(_[A-Z][A-Z0-9_]*)\s*(?::\s*[^=]+)?\s*=\s*(\[\s*\]|\{\s*\}|set\(\s*\))\s*$",
     re.MULTILINE,
 )
+
+
+def _detect_reuse_regression(ws: AppWorkspace, repo_path: str) -> str | None:
+    """Compare the cached slice baseline scorecard's reuse_consistency
+    score to the live repo's. If live is materially lower (≥0.05 drop,
+    one new duplicate package), return a short string describing it.
+
+    Returns None if no baseline is available, scorecard has no
+    reuse_consistency dim, or no regression."""
+    try:
+        from chad_captain.scorecard import (
+            read_baseline, score_repo,
+        )
+        from chad_captain.extras import get_extras
+    except ImportError:
+        return None
+    before = read_baseline(ws.slice_baseline_path)
+    if before is None:
+        return None
+    after = score_repo(repo_path, extras=get_extras(ws.app_id))
+    before_dim = before.by_name("reuse_consistency")
+    after_dim = after.by_name("reuse_consistency")
+    if before_dim is None or after_dim is None:
+        return None
+    drop = before_dim.score - after_dim.score
+    if drop < 0.05:
+        return None
+    # Identify which name is new (in after but not before).
+    before_names = {d["name"] for d in (before_dim.detail or {}).get("duplicates", [])}
+    after_names = {d["name"] for d in (after_dim.detail or {}).get("duplicates", [])}
+    new_dups = sorted(after_names - before_names)
+    if new_dups:
+        return f"-{drop:.2f} (new parallel package: {', '.join(new_dups)})"
+    return f"-{drop:.2f}"
 
 
 def _detect_persistence_violation(
