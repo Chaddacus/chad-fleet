@@ -144,6 +144,53 @@ class GooseRunner:
             ),
         )
 
+        # CRASH-RESILIENCE: from this point onward, ALWAYS write a SliceComplete
+        # before returning (success OR exception). Without this, an unhandled
+        # exception during goose run / git inspection / summary extraction
+        # leaves current_slice with started_at set + no slice_complete on disk;
+        # tick() then skips the slice forever via the "started_at is not None"
+        # guard, requiring captain's stall watchdog to recover (~35min wait).
+        try:
+            self._execute_slice_inner(slice_, slice_log, wall_start)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "[%s] _execute_slice crashed for %s — emitting synthetic "
+                "SliceComplete(-9) so captain can recover",
+                self.app_id, slice_.slice_id,
+            )
+            try:
+                duration = time.time() - wall_start
+                tail = f"goose-runner crashed: {type(exc).__name__}: {exc}"[-2048:]
+                write_slice_complete(
+                    self.ws,
+                    SliceComplete(
+                        slice_id=slice_.slice_id,
+                        app_id=self.app_id,
+                        duration_seconds=duration,
+                        goose_exit_code=-9,
+                        summary=f"runner crash: {type(exc).__name__}",
+                        files_changed=[],
+                        diff_path=None,
+                        log_path=str(slice_log) if slice_log.exists() else None,
+                        failure_tail=tail,
+                        cheat_flags=[],
+                    ),
+                )
+                clear_current_slice(self.ws)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[%s] failed to write recovery SliceComplete; captain "
+                    "stall watchdog will recover instead", self.app_id,
+                )
+
+    def _execute_slice_inner(
+        self,
+        slice_: CurrentSlice,
+        slice_log: Path,
+        wall_start: float,
+    ) -> None:
+        """The actual slice-execution body. Wrapped by _execute_slice's
+        try/except so any failure path still emits a SliceComplete."""
         # Snapshot pre-state for diff/files-changed detection.
         pre_commit = _git_head(self.repo_path)
         pre_dirty = _git_dirty_files(self.repo_path)

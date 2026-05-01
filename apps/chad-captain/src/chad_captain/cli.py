@@ -34,11 +34,16 @@ def cmd_run(_args: argparse.Namespace) -> None:
 
 
 def cmd_daemon(_args: argparse.Namespace) -> None:
+    import logging as _logging
     from chad_captain.config import load_config
     from chad_captain.daemon import run_forever
 
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     cfg = load_config()
-    print("Starting chad-captain daemon...")
+    print("Starting chad-captain daemon...", flush=True)
     run_forever(cfg)
 
 
