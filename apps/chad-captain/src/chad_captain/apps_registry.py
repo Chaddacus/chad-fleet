@@ -62,8 +62,24 @@ class RegisteredApp(BaseModel):
     # On accept verdict, push the captain branch to origin. Cheap idempotent op.
     auto_push: bool = False
     # On roadmap_complete (all slices done/skipped), push + open a draft PR
-    # via `gh pr create`. Admiral merges; captain never auto-merges.
+    # via `gh pr create`.
     auto_open_pr: bool = False
+    # Captain self-merges the PR after open when safety gates pass:
+    #   - verify_cmd already passed for every accepted slice (transitively)
+    #   - aggregate scorecard delta from branch baseline is ≥ 0 (no regression)
+    #   - gh pr merge succeeds (branch protection / conflicts / required checks)
+    # On any gate failure, the captain logs an escalation and leaves the PR
+    # open for admiral. Default False for back-compat; flip on for true
+    # autonomy. Requires auto_open_pr=True (no PR → nothing to merge).
+    auto_merge: bool = False
+    # Merge strategy passed to `gh pr merge`. Squash keeps main history
+    # one-commit-per-PR (recommended for captain branches that contain
+    # one captain-runner commit per slice).
+    auto_merge_method: Literal["squash", "merge", "rebase"] = "squash"
+    # Minimum scorecard aggregate delta (post - pre) required to auto-merge.
+    # 0.0 = no regression allowed; negative values relax it. Express as
+    # raw aggregate fraction (not pp) — e.g. 0.0 means after >= before.
+    auto_merge_min_delta: float = 0.0
 
 
 class AppsRegistry(BaseModel):

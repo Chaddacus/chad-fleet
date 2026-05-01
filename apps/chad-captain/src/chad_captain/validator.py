@@ -580,6 +580,96 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     return matches[-limit:]
 
 
+def _maybe_self_merge_pr(
+    ws: AppWorkspace,
+    repo_path: str,
+    reg_app,  # RegisteredApp
+    sc_before: dict | None,
+    sc_after: dict | None,
+    pr_url: str,
+) -> None:
+    """Captain self-merge guard. Called after a successful auto-PR open.
+
+    Safety gates (any failure → log escalation, leave PR open):
+      1. Aggregate scorecard delta from branch baseline must clear
+         ``reg_app.auto_merge_min_delta`` (default 0.0 — no regression).
+      2. ``gh pr merge`` must succeed (handles branch protection,
+         conflicts, required CI). Non-zero exit → admiral resolves.
+
+    On success: do NOT log pull_request_merged here — the next captain
+    tick's _maybe_handle_pr_merge will detect the MERGED state via
+    ``gh pr view`` and run the post-merge cycle (refresh main, drop
+    local branch, clear roadmap). One canonical detection path.
+    """
+    # Gate 1: scorecard delta non-regression.
+    if sc_before and sc_after:
+        delta = float(sc_after.get("aggregate", 0.0)) - float(sc_before.get("aggregate", 0.0))
+        if delta < reg_app.auto_merge_min_delta:
+            append_captain_log(
+                ws,
+                CaptainLogEntry(
+                    app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                    rationale=(
+                        f"auto_merge blocked: scorecard delta {delta:+.4f} below "
+                        f"min_delta {reg_app.auto_merge_min_delta:+.4f}; "
+                        "admiral review required"
+                    ),
+                    references={
+                        "event": "auto_merge_blocked",
+                        "pr_url": pr_url,
+                        "branch": reg_app.captain_branch or "",
+                        "delta": f"{delta:+.4f}",
+                    },
+                ),
+            )
+            return
+
+    # Gate 2: actually merge. gh enforces branch protection / required
+    # checks / conflicts — non-zero exit means admiral handles it.
+    from chad_captain.merge_facilitator import auto_merge_pr
+    res = auto_merge_pr(
+        repo_path=repo_path,
+        head=reg_app.captain_branch or "",
+        method=reg_app.auto_merge_method,
+        delete_branch=True,
+    )
+    if not res.ok:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=f"auto_merge failed: {res.summary}",
+                references={
+                    "event": "auto_merge_failed",
+                    "pr_url": pr_url,
+                    "branch": reg_app.captain_branch or "",
+                },
+            ),
+        )
+        return
+    # Success — log a hint event so the dashboard knows captain initiated
+    # the merge (vs admiral). Final pull_request_merged + post_merge_cycle
+    # come from _maybe_handle_pr_merge on the next tick (single source of
+    # truth for "the PR is now merged on origin").
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None, kind="pull_request_opened",
+            rationale=(
+                f"captain self-merged PR ({reg_app.auto_merge_method}); "
+                "post-merge cycle on next tick"
+            ),
+            references={
+                "event": "auto_merge_initiated",
+                "pr_url": pr_url,
+                "branch": reg_app.captain_branch or "",
+                "merged_by": "captain",
+                "method": reg_app.auto_merge_method,
+            },
+        ),
+    )
+
+
 def _maybe_handle_pr_merge(
     ws: AppWorkspace,
     repo_path: str,
@@ -805,6 +895,14 @@ def _handle_roadmap_complete(
         except Exception as e:
             logger.warning(
                 "branch baseline clear failed for %s: %s", ws.app_id, e,
+            )
+
+        # C5: captain self-merge gate. Autonomous fleet → captain merges
+        # its own PRs as long as safety gates hold. Gate fails → leave PR
+        # open and escalate; admiral resolves manually.
+        if reg_app.auto_merge:
+            _maybe_self_merge_pr(
+                ws, repo_path, reg_app, sc_before, sc_after, pr_res.stdout.strip(),
             )
     append_captain_log(
         ws,

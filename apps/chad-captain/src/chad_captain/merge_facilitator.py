@@ -7,11 +7,18 @@ admiral review":
     1. is_roadmap_complete()  — all slices done/skipped, none in flight
     2. push_captain_branch()  — git push -u origin <branch>
     3. format_pr_body()       — markdown with scorecard delta + slice manifest
-    4. open_pull_request()    — gh pr create --draft (admiral merges, not captain)
+    4. open_pull_request()    — gh pr create --draft
+    5. auto_merge_pr()        — gh pr merge --squash --delete-branch (C5,
+                                 gated by scorecard delta + branch protection)
+    6. get_pr_state()         — poll for MERGED on subsequent ticks
+    7. refresh_base_branch() / delete_local_branch() — post-merge cleanup
 
-We deliberately do NOT auto-merge. Admiral retains the merge gate. The captain
-goes only as far as "here's a reviewable PR with evidence" — same model a senior
-engineer would follow handing work to a tech lead.
+The captain self-merges when reg_app.auto_merge is set AND the aggregate
+scorecard delta clears reg_app.auto_merge_min_delta (default 0.0). gh
+itself enforces branch protection / required reviewers / required CI —
+on any failure the captain logs an escalation and leaves the PR open
+for admiral. This is the autonomous-fleet model: safeties are automated
+gates, not a required human-in-the-loop checkpoint.
 
 External tools required: `git` (always present) and `gh` (GitHub CLI, must be
 authenticated). Both are subprocess-only — no library deps. Failures are
@@ -204,6 +211,33 @@ def get_pr_state(
     if not isinstance(state, str):
         return None, data
     return state.upper(), data
+
+
+def auto_merge_pr(
+    *,
+    repo_path: str,
+    head: str,
+    method: str = "squash",
+    delete_branch: bool = True,
+    timeout: int = 120,
+) -> CmdResult:
+    """Squash-merge a PR via ``gh pr merge``. Captain-side autonomy gate.
+
+    Failure modes that must NOT crash the loop:
+      - branch protection requires reviewers → exit 1, stderr explains
+      - merge conflicts → exit 1
+      - required CI checks pending → exit 1
+      - gh auth / network down → FileNotFoundError or exit != 0
+    Caller (validator) treats any non-ok result as escalation_raised and
+    leaves the PR open for admiral review. Idempotent — gh detects
+    already-merged PRs and exits non-zero with a recoverable message.
+    """
+    if method not in ("squash", "merge", "rebase"):
+        return CmdResult(ok=False, summary=f"invalid merge method: {method}")
+    cmd = ["gh", "pr", "merge", head, f"--{method}"]
+    if delete_branch:
+        cmd.append("--delete-branch")
+    return _run(cmd, cwd=repo_path, timeout=timeout)
 
 
 def delete_local_branch(

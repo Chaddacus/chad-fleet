@@ -10,6 +10,7 @@ import pytest
 
 from chad_captain.merge_facilitator import (
     CmdResult,
+    auto_merge_pr,
     branch_exists_local,
     current_branch,
     delete_local_branch,
@@ -454,6 +455,68 @@ def test_delete_local_branch_refuses_when_on_branch(tmp_path: Path) -> None:
     assert "refusing" in res.summary
     # Branch still there
     assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is True
+
+
+def test_auto_merge_pr_default_squash_with_delete(tmp_path: Path) -> None:
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        res = auto_merge_pr(repo_path=str(tmp_path), head="codex/captain-x")
+        assert res.ok is True
+        cmd = mock_run.call_args.args[0]
+        assert cmd[:3] == ["gh", "pr", "merge"]
+        assert "codex/captain-x" in cmd
+        assert "--squash" in cmd
+        assert "--delete-branch" in cmd
+
+
+def test_auto_merge_pr_supports_merge_method(tmp_path: Path) -> None:
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        auto_merge_pr(
+            repo_path=str(tmp_path), head="codex/x", method="merge",
+        )
+        cmd = mock_run.call_args.args[0]
+        assert "--merge" in cmd
+        assert "--squash" not in cmd
+
+
+def test_auto_merge_pr_can_skip_delete_branch(tmp_path: Path) -> None:
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        auto_merge_pr(
+            repo_path=str(tmp_path), head="codex/x", delete_branch=False,
+        )
+        cmd = mock_run.call_args.args[0]
+        assert "--delete-branch" not in cmd
+
+
+def test_auto_merge_pr_rejects_invalid_method(tmp_path: Path) -> None:
+    res = auto_merge_pr(
+        repo_path=str(tmp_path), head="codex/x", method="frobnicate",
+    )
+    assert res.ok is False
+    assert "invalid merge method" in res.summary
+
+
+def test_auto_merge_pr_surfaces_branch_protection_failure(tmp_path: Path) -> None:
+    """gh exits non-zero when branch protection requires reviewers; we
+    surface that as ok=False with a tail of stderr so the captain log
+    captures the reason."""
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="GraphQL: Pull request is in unstable status (mergePullRequest)\n",
+        )
+        res = auto_merge_pr(repo_path=str(tmp_path), head="codex/x")
+        assert res.ok is False
+        assert "exit 1" in res.summary
+        assert "unstable" in res.summary
 
 
 def test_delete_local_branch_idempotent_when_missing(tmp_path: Path) -> None:

@@ -1242,6 +1242,289 @@ def test_post_merge_cycle_skipped_when_no_pending_pr(
     assert polled == []
 
 
+def test_auto_merge_invokes_gh_pr_merge_when_enabled(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """auto_merge=True + non-regressing scorecard → captain calls
+    gh pr merge after opening the PR. No need for admiral."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import (
+        DimensionScore,
+        Scorecard,
+        write_baseline,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+        auto_merge=True,
+        auto_merge_method="squash",
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pre = Scorecard(
+        repo_path=str(repo),
+        dimensions=[DimensionScore(name="docs_present", score=0.0)],
+        aggregate=0.0,
+    )
+    write_baseline(ws.branch_baseline_path, pre)
+
+    merge_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(
+            ok=True, summary="ok", stdout="https://github.com/o/r/pull/1",
+        ),
+    )
+
+    def fake_merge(*, repo_path: str, head: str, method: str = "squash", **_kw):
+        merge_calls.append({"head": head, "method": method})
+        return mf.CmdResult(ok=True, summary="ok")
+    monkeypatch.setattr(mf, "auto_merge_pr", fake_merge)
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert len(merge_calls) == 1
+    assert merge_calls[0]["head"] == "codex/captain-test-app"
+    assert merge_calls[0]["method"] == "squash"
+
+    # An auto_merge_initiated reference should land in the log.
+    log = read_captain_log(ws)
+    initiated = [
+        e for e in log
+        if (e.references or {}).get("event") == "auto_merge_initiated"
+    ]
+    assert len(initiated) == 1
+    assert initiated[0].references.get("merged_by") == "captain"
+
+
+def test_auto_merge_skipped_when_flag_disabled(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default auto_merge=False → captain opens PR, never calls gh pr merge."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+        auto_merge=False,  # explicit
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    merge_calls = []
+    monkeypatch.setattr(
+        mf, "auto_merge_pr",
+        lambda **kw: merge_calls.append(kw) or mf.CmdResult(ok=True, summary="ok"),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    assert merge_calls == []
+
+
+def test_auto_merge_blocked_when_scorecard_regression(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aggregate scorecard delta < min_delta → captain logs escalation
+    instead of merging. PR stays open for admiral."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.scorecard import (
+        DimensionScore,
+        Scorecard,
+        write_baseline,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+        auto_merge=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Baseline aggregate higher than what live repo will score → forced
+    # negative delta (live repo is brand-new with only README + git → low score).
+    pre = Scorecard(
+        repo_path=str(repo),
+        dimensions=[DimensionScore(name="docs_present", score=1.0)],
+        aggregate=1.0,
+    )
+    write_baseline(ws.branch_baseline_path, pre)
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    merge_calls = []
+    monkeypatch.setattr(
+        mf, "auto_merge_pr",
+        lambda **kw: merge_calls.append(kw) or mf.CmdResult(ok=True, summary="ok"),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # Did NOT merge
+    assert merge_calls == []
+    # DID escalate
+    log = read_captain_log(ws)
+    escalations = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "auto_merge_blocked"
+    ]
+    assert len(escalations) == 1
+    assert "below min_delta" in escalations[0].rationale
+
+
+def test_auto_merge_failure_escalates_and_leaves_pr_open(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gh pr merge fails (e.g. branch protection) → log escalation,
+    leave PR open. _maybe_handle_pr_merge will not see MERGED state
+    and admiral can resolve."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_push=True,
+        auto_open_pr=True,
+        auto_merge=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    monkeypatch.setattr(
+        mf, "auto_merge_pr",
+        lambda **_kw: mf.CmdResult(
+            ok=False, summary="exit 1: branch protection requires 1 review",
+        ),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="in_flight")],
+    )
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    escalations = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "auto_merge_failed"
+    ]
+    assert len(escalations) == 1
+    assert "branch protection" in escalations[0].rationale
+
+
 def test_post_merge_cycle_ignores_already_handled_merge(
     ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
