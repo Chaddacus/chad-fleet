@@ -1193,6 +1193,11 @@ def _handle_roadmap_complete(
         head=reg_app.captain_branch,
         title=title,
         body=body,
+        # Auto-merge requires a non-draft PR (`gh pr merge` fails on drafts
+        # with "Pull Request is still a draft"). Open ready-for-review when
+        # the registry has auto_merge=True so the immediate self-merge
+        # attempt is actually mergeable.
+        draft=not reg_app.auto_merge,
     )
     # Clear the branch baseline only on successful PR open so a
     # crash mid-handler still has the snapshot for the next attempt.
