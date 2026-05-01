@@ -210,6 +210,11 @@ class CaptainLogEntry(BaseModel):
         # reach terminal state and when the captain auto-opens a PR.
         "roadmap_complete",
         "pull_request_opened",
+        # Captain → main integration (C4): emitted when a captain-opened PR
+        # is detected as merged on origin and when the captain refreshes
+        # local main + clears roadmap to begin a new cycle.
+        "pull_request_merged",
+        "post_merge_cycle",
     ]
     verdict: CaptainVerdict | None = None
     rubric_delta_pp: float | None = None

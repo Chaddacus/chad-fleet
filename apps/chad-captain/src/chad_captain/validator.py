@@ -462,6 +462,14 @@ def captain_tick(
             # admiral merges first, then NEXT tick replans against new main.
             from chad_captain.merge_facilitator import is_roadmap_complete
             if is_roadmap_complete(roadmap):
+                # C4: if a captain-opened PR is already merged on origin,
+                # run the post-merge cycle (refresh main, drop stale branch,
+                # clear roadmap so next tick replans). This precedes the
+                # roadmap_complete handler so we don't try to re-open a PR
+                # for a branch we're about to delete.
+                merged = _maybe_handle_pr_merge(ws, repo_path, reg_app)
+                if merged:
+                    return (status + "; " if status else "") + "post_merge_cycle"
                 _handle_roadmap_complete(ws, repo_path, roadmap, reg_app)
                 if reg_app is not None and reg_app.auto_open_pr:
                     return (status + "; " if status else "") + "roadmap_complete (PR opened)"
@@ -570,6 +578,125 @@ def _recent_validate_for(ws: AppWorkspace, slice_id: str, limit: int = 5):
     entries = read_captain_log(ws, limit=50)
     matches = [e for e in entries if e.kind == "validate" and (e.slice_id == slice_id or (e.slice_id or "").startswith(slice_id))]
     return matches[-limit:]
+
+
+def _maybe_handle_pr_merge(
+    ws: AppWorkspace,
+    repo_path: str,
+    reg_app,  # RegisteredApp | None
+) -> bool:
+    """If the captain has a pull_request_opened event since its last
+    pull_request_merged event, poll the PR's state. On MERGED:
+      - emit pull_request_merged log
+      - refresh local base branch (fetch + checkout + ff-pull)
+      - delete the stale captain branch (it's now in main)
+      - clear current_slice / slice_complete / roadmap so the next tick
+        replans against the freshly-merged main
+      - emit post_merge_cycle log
+
+    Returns True iff the post-merge cycle ran. False = nothing to do
+    (no PR, PR not merged, gh lookup failed). All errors tolerated.
+    """
+    if reg_app is None or not reg_app.captain_branch:
+        return False
+
+    # Find the most recent pull_request_opened with no later merged event.
+    from chad_captain.protocol import read_captain_log
+    log = read_captain_log(ws, limit=200)
+    pending_pr_url: str | None = None
+    for entry in reversed(log):
+        if entry.kind == "pull_request_merged":
+            break  # we already handled the latest PR
+        if entry.kind == "pull_request_opened":
+            pending_pr_url = (entry.references or {}).get("pr_url") or None
+            break
+    if not pending_pr_url:
+        return False
+
+    from chad_captain.merge_facilitator import (
+        delete_local_branch,
+        get_pr_state,
+        refresh_base_branch,
+    )
+
+    state, raw = get_pr_state(
+        repo_path=repo_path, head=reg_app.captain_branch,
+    )
+    if state != "MERGED":
+        return False
+
+    merge_commit = (raw or {}).get("mergeCommit") or {}
+    merged_at = (raw or {}).get("mergedAt") or ""
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None,
+            kind="pull_request_merged",
+            rationale=f"PR merged at {merged_at or 'unknown'}",
+            references={
+                "pr_url": pending_pr_url,
+                "branch": reg_app.captain_branch,
+                "merge_sha": (merge_commit or {}).get("oid", ""),
+            },
+        ),
+    )
+
+    # Refresh main, then drop the stale captain branch. Both are
+    # best-effort — failures escalate but don't block the next tick.
+    rb = refresh_base_branch(
+        repo_path=repo_path, base_branch=reg_app.pr_base_branch,
+    )
+    if not rb.ok:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=f"post-merge base refresh failed: {rb.summary}",
+                references={"event": "post_merge_refresh_failed"},
+            ),
+        )
+    else:
+        # We're now on base; safe to delete the stale captain branch.
+        db = delete_local_branch(
+            repo_path=repo_path, branch=reg_app.captain_branch,
+        )
+        if not db.ok:
+            append_captain_log(
+                ws,
+                CaptainLogEntry(
+                    app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                    rationale=f"local branch delete failed: {db.summary}",
+                    references={
+                        "event": "post_merge_branch_delete_failed",
+                        "branch": reg_app.captain_branch,
+                    },
+                ),
+            )
+
+    # Clear roadmap + slice state so next tick starts a fresh cycle.
+    # Branch baseline already cleared on PR open; clear again defensively.
+    try:
+        if ws.roadmap_path.exists():
+            ws.roadmap_path.unlink()
+        if ws.current_slice_path.exists():
+            ws.current_slice_path.unlink()
+        if ws.slice_complete_path.exists():
+            ws.slice_complete_path.unlink()
+        if ws.branch_baseline_path.exists():
+            ws.branch_baseline_path.unlink()
+    except OSError as e:
+        logger.warning("post_merge state clear failed for %s: %s", ws.app_id, e)
+
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None,
+            kind="post_merge_cycle",
+            rationale="local main refreshed, captain branch cleaned, roadmap cleared",
+            references={"event": "post_merge_cycle"},
+        ),
+    )
+    return True
 
 
 def _handle_roadmap_complete(

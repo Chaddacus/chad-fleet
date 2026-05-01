@@ -177,6 +177,94 @@ def push_captain_branch(
     )
 
 
+def get_pr_state(
+    *,
+    repo_path: str,
+    head: str,
+    timeout: int = 30,
+) -> tuple[str | None, dict]:
+    """Look up the PR state for ``head`` via ``gh pr view``.
+
+    Returns ``(state, raw)`` where ``state`` is one of ``"OPEN"``, ``"MERGED"``,
+    ``"CLOSED"`` or None on lookup failure (no PR, gh down, network error).
+    Caller treats None as "unknown — try again next tick."
+    """
+    res = _run(
+        ["gh", "pr", "view", head, "--json",
+         "state,number,url,mergeCommit,isDraft,mergedAt"],
+        cwd=repo_path, timeout=timeout,
+    )
+    if not res.ok:
+        return None, {}
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None, {}
+    state = data.get("state")
+    if not isinstance(state, str):
+        return None, data
+    return state.upper(), data
+
+
+def delete_local_branch(
+    *,
+    repo_path: str,
+    branch: str,
+    timeout: int = 10,
+) -> CmdResult:
+    """Force-delete a local branch. Used after a captain PR merges to drop
+    the stale local copy so the next cycle starts from new main.
+
+    Refuses if we're currently on ``branch`` (caller must checkout base first).
+    Returns ok=True if branch already gone (already cleaned up = success).
+    """
+    cur = current_branch(repo_path=repo_path, timeout=timeout)
+    if cur == branch:
+        return CmdResult(
+            ok=False,
+            summary=f"refusing to delete branch we're on ({branch})",
+        )
+    if not branch_exists_local(repo_path=repo_path, branch=branch, timeout=timeout):
+        return CmdResult(ok=True, summary=f"already deleted ({branch})")
+    return _run(
+        ["git", "branch", "-D", branch],
+        cwd=repo_path, timeout=timeout,
+    )
+
+
+def refresh_base_branch(
+    *,
+    repo_path: str,
+    base_branch: str = "main",
+    remote: str = "origin",
+    timeout: int = 60,
+) -> CmdResult:
+    """Fetch + checkout + fast-forward the base branch.
+
+    Idempotent. Used after a captain PR merges so the next cycle starts
+    from the freshly-merged main. We deliberately do NOT delete the
+    captain branch — admiral may still want it for diff archaeology.
+    """
+    fetch = _run(
+        ["git", "fetch", remote, base_branch],
+        cwd=repo_path, timeout=timeout,
+    )
+    if not fetch.ok:
+        return fetch
+    co = _run(["git", "checkout", base_branch], cwd=repo_path, timeout=timeout)
+    if not co.ok:
+        return co
+    pull = _run(
+        ["git", "pull", "--ff-only", remote, base_branch],
+        cwd=repo_path, timeout=timeout,
+    )
+    if not pull.ok:
+        return pull
+    return CmdResult(
+        ok=True, summary=f"refreshed {base_branch} from {remote}/{base_branch}",
+    )
+
+
 def open_pull_request(
     *,
     repo_path: str,

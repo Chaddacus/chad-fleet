@@ -1022,3 +1022,286 @@ def test_roadmap_complete_baseline_preserved_on_pr_open_failure(
 
     # PR open failed → baseline still on disk for retry.
     assert ws.branch_baseline_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# C4 — merge detection + post-merge cycle
+# ---------------------------------------------------------------------------
+
+
+def test_post_merge_cycle_runs_when_pr_merged(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Captain has an open PR, all slices done. Next tick polls gh, sees
+    MERGED, refreshes main, deletes branch, clears roadmap, emits events."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Pre-load history so _maybe_handle_pr_merge sees a pull_request_opened.
+    pr_url = "https://github.com/owner/repo/pull/42"
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id="test-app", slice_id=None, kind="pull_request_opened",
+            rationale="PR opened",
+            references={"pr_url": pr_url, "branch": "codex/captain-test-app"},
+        ),
+    )
+
+    # Roadmap: all slices terminal (one done) → roadmap_complete is True.
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    refresh_calls: list[dict] = []
+    delete_calls: list[dict] = []
+    push_calls: list[dict] = []
+    open_pr_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc"}, "mergedAt": "now"}),
+    )
+
+    def fake_refresh(*, repo_path: str, base_branch: str = "main", **_kw):
+        refresh_calls.append({"base": base_branch})
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_delete(*, repo_path: str, branch: str, **_kw):
+        delete_calls.append({"branch": branch})
+        return mf.CmdResult(ok=True, summary="deleted")
+
+    def fake_push(*, repo_path: str, branch: str, **_kw):
+        push_calls.append({"branch": branch})
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_open_pr(**kw):
+        open_pr_calls.append(kw)
+        return mf.CmdResult(ok=True, summary="ok", stdout="https://x")
+
+    monkeypatch.setattr(mf, "refresh_base_branch", fake_refresh)
+    monkeypatch.setattr(mf, "delete_local_branch", fake_delete)
+    monkeypatch.setattr(mf, "push_captain_branch", fake_push)
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    status = captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert "post_merge_cycle" in (status or "")
+    # post-merge log events landed
+    log = read_captain_log(ws)
+    kinds = [e.kind for e in log]
+    assert "pull_request_merged" in kinds
+    assert "post_merge_cycle" in kinds
+    # Refresh + delete were attempted once each
+    assert len(refresh_calls) == 1 and refresh_calls[0]["base"] == "main"
+    assert len(delete_calls) == 1 and delete_calls[0]["branch"] == "codex/captain-test-app"
+    # No new PR was opened on this tick — we're cleaning up the merged one
+    assert len(open_pr_calls) == 0
+    # Roadmap got cleared so the next tick replans
+    assert not ws.roadmap_path.exists()
+
+
+def test_post_merge_cycle_skipped_when_pr_still_open(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR state OPEN → no merge cycle, no state mutation, captain holds."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id="test-app", slice_id=None, kind="pull_request_opened",
+            rationale="PR opened",
+            references={"pr_url": "https://x", "branch": "codex/captain-test-app"},
+        ),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    monkeypatch.setattr(mf, "get_pr_state", lambda **_kw: ("OPEN", {}))
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+    refreshed = []
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **kw: refreshed.append(kw) or mf.CmdResult(ok=True, summary="ok"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    kinds = [e.kind for e in log]
+    assert "pull_request_merged" not in kinds
+    assert "post_merge_cycle" not in kinds
+    assert refreshed == []
+    # Roadmap state preserved (PR not merged yet → captain holds)
+    assert ws.roadmap_path.exists()
+
+
+def test_post_merge_cycle_skipped_when_no_pending_pr(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pull_request_opened in log → don't poll gh at all."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=False,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    polled = []
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **kw: polled.append(kw) or (None, {}),
+    )
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # No PR opened ever → nothing to poll
+    assert polled == []
+
+
+def test_post_merge_cycle_ignores_already_handled_merge(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If pull_request_merged is already in the log AFTER the latest
+    pull_request_opened, the cycle has already run — don't re-trigger."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app",
+        name="Test",
+        repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    append_captain_log(
+        ws,
+        CaptainLogEntry(app_id="test-app", kind="pull_request_opened",
+                        references={"pr_url": "https://x", "branch": "codex/captain-test-app"}),
+    )
+    append_captain_log(
+        ws,
+        CaptainLogEntry(app_id="test-app", kind="pull_request_merged",
+                        references={"pr_url": "https://x"}),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    polled = []
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **kw: polled.append(kw) or ("MERGED", {}),
+    )
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok", stdout="https://x"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    # Already-handled — don't poll
+    assert polled == []

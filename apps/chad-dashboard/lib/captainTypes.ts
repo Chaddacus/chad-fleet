@@ -28,7 +28,9 @@ export type CaptainLogKind =
   | 'escalation_raised'
   | 'escalation_resolved'
   | 'roadmap_complete'
-  | 'pull_request_opened';
+  | 'pull_request_opened'
+  | 'pull_request_merged'
+  | 'post_merge_cycle';
 
 export type ProgressKind =
   | 'slice_started'

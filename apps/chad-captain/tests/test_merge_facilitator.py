@@ -12,12 +12,15 @@ from chad_captain.merge_facilitator import (
     CmdResult,
     branch_exists_local,
     current_branch,
+    delete_local_branch,
     ensure_captain_branch,
     format_pr_body,
     format_pr_title,
+    get_pr_state,
     is_roadmap_complete,
     open_pull_request,
     push_captain_branch,
+    refresh_base_branch,
 )
 from chad_captain.protocol import Roadmap, RoadmapSlice
 
@@ -347,6 +350,117 @@ def test_pr_title_under_70_chars() -> None:
     title = format_pr_title(app_id=rm.app_id, roadmap=rm)
     assert len(title) <= 70
     assert "captain" in title.lower()
+
+
+# ---------------------------------------------------------------------------
+# get_pr_state / refresh_base_branch / delete_local_branch — C4 helpers
+# ---------------------------------------------------------------------------
+
+
+def test_get_pr_state_returns_merged_on_merged_pr(tmp_path: Path) -> None:
+    payload = (
+        '{"state":"MERGED","number":42,'
+        '"url":"https://github.com/owner/repo/pull/42",'
+        '"mergeCommit":{"oid":"abc123"},"isDraft":false,'
+        '"mergedAt":"2026-04-30T01:00:00Z"}'
+    )
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=payload, stderr="",
+        )
+        state, raw = get_pr_state(repo_path=str(tmp_path), head="codex/x")
+        assert state == "MERGED"
+        assert raw["mergeCommit"]["oid"] == "abc123"
+
+
+def test_get_pr_state_returns_open_on_open_pr(tmp_path: Path) -> None:
+    payload = '{"state":"OPEN","number":1,"url":"https://x"}'
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=payload, stderr="",
+        )
+        state, _raw = get_pr_state(repo_path=str(tmp_path), head="codex/x")
+        assert state == "OPEN"
+
+
+def test_get_pr_state_returns_none_when_gh_fails(tmp_path: Path) -> None:
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="not found\n",
+        )
+        state, raw = get_pr_state(repo_path=str(tmp_path), head="codex/x")
+        assert state is None
+        assert raw == {}
+
+
+def test_get_pr_state_returns_none_on_bad_json(tmp_path: Path) -> None:
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="not json", stderr="",
+        )
+        state, _raw = get_pr_state(repo_path=str(tmp_path), head="codex/x")
+        assert state is None
+
+
+def test_refresh_base_branch_runs_fetch_checkout_pull(tmp_path: Path) -> None:
+    fetch = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    co = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    pull = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("chad_captain.merge_facilitator.subprocess.run",
+               side_effect=[fetch, co, pull]) as mock_run:
+        res = refresh_base_branch(repo_path=str(tmp_path), base_branch="main")
+        assert res.ok is True
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert commands[0][:2] == ["git", "fetch"]
+        assert commands[1][:2] == ["git", "checkout"]
+        assert commands[2][:3] == ["git", "pull", "--ff-only"]
+
+
+def test_refresh_base_branch_short_circuits_on_fetch_failure(tmp_path: Path) -> None:
+    fetch = subprocess.CompletedProcess(
+        args=[], returncode=128, stdout="", stderr="auth failed\n",
+    )
+    with patch("chad_captain.merge_facilitator.subprocess.run",
+               side_effect=[fetch]) as mock_run:
+        res = refresh_base_branch(repo_path=str(tmp_path))
+        assert res.ok is False
+        # Did not progress past fetch
+        assert mock_run.call_count == 1
+
+
+def test_delete_local_branch_real_repo(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    # Create + leave the captain branch
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "codex/captain-x"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is True
+
+    res = delete_local_branch(repo_path=str(repo), branch="codex/captain-x")
+    assert res.ok is True
+    assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is False
+
+
+def test_delete_local_branch_refuses_when_on_branch(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "codex/captain-x"],
+        cwd=repo, check=True,
+    )
+    res = delete_local_branch(repo_path=str(repo), branch="codex/captain-x")
+    assert res.ok is False
+    assert "refusing" in res.summary
+    # Branch still there
+    assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is True
+
+
+def test_delete_local_branch_idempotent_when_missing(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    res = delete_local_branch(repo_path=str(repo), branch="codex/never-existed")
+    assert res.ok is True
+    assert "already deleted" in res.summary
 
 
 def test_pr_title_includes_slice_count() -> None:
