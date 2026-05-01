@@ -188,6 +188,52 @@ def test_file_size_health_drops_for_giant_file(tmp_path: Path) -> None:
     assert sc.by_name("file_size_health").score < 1.0
 
 
+def test_file_size_health_continuous_decay(tmp_path: Path) -> None:
+    """Each split should move the score by an observable amount so the
+    captain loop credits incremental progress. Previously the dim used a
+    10-giant denominator so any repo ≥10 giants stayed at 0.00."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    # 4 giant files
+    for i in range(4):
+        (repo / f"big{i}.py").write_text("\n" * 1500)
+    sc = score_repo(repo)
+    # 1 - 4/20 = 0.80
+    assert sc.by_name("file_size_health").score == pytest.approx(0.80, abs=0.01)
+
+
+def test_file_size_health_does_not_bottom_out_for_realistic_codebase(
+    tmp_path: Path,
+) -> None:
+    """A real codebase with 15 giants used to score 0.0 — no incremental
+    credit possible. New formula gives 0.25 with room to climb per split."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for i in range(15):
+        (repo / f"big{i}.py").write_text("\n" * 1500)
+    sc = score_repo(repo)
+    score = sc.by_name("file_size_health").score
+    assert score > 0.0, f"expected room to grow, got {score}"
+    assert score == pytest.approx(0.25, abs=0.01)
+
+
+def test_file_size_health_split_moves_score(tmp_path: Path) -> None:
+    """Going from 4 giants to 3 should produce an observable delta — the
+    captain rubric needs >=0.5pp to issue accept (vs soft_accept)."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    for i in range(4):
+        (repo / f"big{i}.py").write_text("\n" * 1500)
+    before = score_repo(repo).by_name("file_size_health").score
+
+    # Simulate splitting one giant into a small file
+    (repo / "big0.py").write_text("\n" * 100)
+    after = score_repo(repo).by_name("file_size_health").score
+
+    delta_pp = (after - before) * 100  # convert to pp
+    assert delta_pp >= 0.5, f"expected >=0.5pp from one split, got {delta_pp}"
+
+
 def test_docs_present_zero_no_readme(tmp_path: Path) -> None:
     repo = tmp_path / "r"
     repo.mkdir()

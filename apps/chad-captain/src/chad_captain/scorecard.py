@@ -279,7 +279,12 @@ def _dim_file_size_health(files: list[Path]) -> DimensionScore:
     if not giants:
         return DimensionScore(name="file_size_health", score=1.0,
                               rationale=f"no files exceed {GIANT_FILE_LINES} lines")
-    score = max(0.0, 1.0 - len(giants) / 10.0)
+    # Continuous decay with a 20-giant denominator: each split moves the score
+    # by ~5pp (5% per giant resolved). Was 10-giant denominator → bottomed out
+    # at 0 for any repo with ≥10 giants, which made the captain loop unable
+    # to credit incremental file-split work (S1 dogfood on author-toolkit:
+    # extracted 38 lines from a 3368-line file, dim stayed 0.00, soft_accept).
+    score = max(0.0, 1.0 - len(giants) / 20.0)
     return DimensionScore(
         name="file_size_health", score=score,
         rationale=f"{len(giants)} file(s) over {GIANT_FILE_LINES} lines",

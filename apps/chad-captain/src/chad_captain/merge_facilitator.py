@@ -92,6 +92,75 @@ def _run(
     )
 
 
+def current_branch(*, repo_path: str, timeout: int = 5) -> str | None:
+    """Return the currently checked-out branch in repo_path, or None if
+    detached HEAD or git fails."""
+    res = _run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo_path, timeout=timeout,
+    )
+    if not res.ok:
+        return None
+    name = res.stdout.strip()
+    return None if name == "HEAD" else name
+
+
+def branch_exists_local(*, repo_path: str, branch: str, timeout: int = 5) -> bool:
+    """Cheap check: does this branch exist locally?"""
+    res = _run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_path, timeout=timeout,
+    )
+    return res.ok
+
+
+def ensure_captain_branch(
+    *,
+    repo_path: str,
+    branch: str,
+    base_branch: str = "main",
+    timeout: int = 30,
+) -> CmdResult:
+    """Make sure ``branch`` is checked out in ``repo_path``.
+
+    Idempotent rules:
+      1. If we're already on ``branch`` → ok, no-op.
+      2. If ``branch`` exists locally → checkout ``branch``.
+      3. Otherwise → checkout ``base_branch`` first (so the new branch starts
+         from a clean main snapshot), then create ``branch`` from there.
+
+    Failures (dirty worktree blocking checkout, missing base_branch, etc.) are
+    captured into CmdResult.summary, never raised. Caller decides whether to
+    log + skip dispatch or escalate.
+    """
+    cur = current_branch(repo_path=repo_path, timeout=timeout)
+    if cur == branch:
+        return CmdResult(ok=True, summary=f"already on {branch}")
+
+    if branch_exists_local(repo_path=repo_path, branch=branch, timeout=timeout):
+        res = _run(["git", "checkout", branch], cwd=repo_path, timeout=timeout)
+        if res.ok:
+            return CmdResult(ok=True, summary=f"checked out existing {branch}")
+        return res
+
+    # Need to create the branch. Make sure base_branch is checked out first
+    # so the new branch starts from the right ancestor.
+    if cur != base_branch:
+        co = _run(["git", "checkout", base_branch], cwd=repo_path, timeout=timeout)
+        if not co.ok:
+            return CmdResult(
+                ok=False,
+                summary=f"could not checkout base {base_branch}: {co.summary}",
+            )
+    create = _run(
+        ["git", "checkout", "-b", branch],
+        cwd=repo_path, timeout=timeout,
+    )
+    if create.ok:
+        return CmdResult(ok=True, summary=f"created {branch} from {base_branch}")
+    return create
+
+
 def push_captain_branch(
     *,
     repo_path: str,

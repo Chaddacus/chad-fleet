@@ -88,6 +88,20 @@ def validate_slice(
     is_retry = slice_.parent_slice_id is not None
 
     if complete.goose_exit_code != 0:
+        # Edge case from S3 dogfood: goose's own commit attempt was blocked by
+        # sandbox/permissions but its file edits were already on the working
+        # tree, and the captain runner's _git_autocommit step staged + committed
+        # them. So exit!=0 with files_changed populated means "the work landed
+        # despite goose's own exit." Treat as soft_accept (low confidence)
+        # rather than reject_retry (which would redo or break finished work).
+        if complete.files_changed:
+            return ValidationResult(
+                verdict="soft_accept",
+                rationale=(
+                    f"goose exit {complete.goose_exit_code} but {len(complete.files_changed)} "
+                    f"file(s) committed by captain-runner — work landed, low-confidence accept"
+                ),
+            )
         if is_retry:
             return ValidationResult(
                 verdict="reject_hard",
@@ -458,6 +472,34 @@ def captain_tick(
                 rs = next_queued_slice(roadmap)
             if rs is None:
                 return (status + "; " if status else "") + "roadmap exhausted (replan needed)"
+
+        # C2 branch auto-create: before dispatching, ensure the captain
+        # branch is checked out. Skipped when no captain_branch configured
+        # (back-compat: dispatch on whatever branch admiral set up).
+        if reg_app is not None and reg_app.captain_branch:
+            from chad_captain.merge_facilitator import ensure_captain_branch
+            br = ensure_captain_branch(
+                repo_path=repo_path,
+                branch=reg_app.captain_branch,
+                base_branch=reg_app.pr_base_branch,
+            )
+            if not br.ok:
+                # Don't dispatch onto the wrong branch — log + return without
+                # writing current_slice. Admiral can fix the worktree and tick again.
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id, slice_id=rs.slice_id,
+                        kind="escalation_raised",
+                        rationale=f"branch setup failed: {br.summary}",
+                        references={
+                            "event": "branch_setup_failed",
+                            "branch": reg_app.captain_branch,
+                            "base": reg_app.pr_base_branch,
+                        },
+                    ),
+                )
+                return (status + "; " if status else "") + f"branch setup failed: {br.summary}"
 
         # Detect retry: is this a re-queue of a slice we just rejected?
         log_tail = list(_recent_validate_for(ws, rs.slice_id, limit=5))

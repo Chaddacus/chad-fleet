@@ -80,14 +80,40 @@ def test_timeout_kill_replan() -> None:
     assert r.verdict == "kill_replan"
 
 
-def test_nonzero_exit_first_attempt_retries() -> None:
-    r = validate_slice(complete=_complete(exit_code=7), slice_=_slice())
+def test_nonzero_exit_no_files_first_attempt_retries() -> None:
+    """No work landed AND non-zero exit → retry once."""
+    r = validate_slice(complete=_complete(exit_code=7, files=[]), slice_=_slice())
     assert r.verdict == "reject_retry"
 
 
-def test_nonzero_exit_after_retry_hard_rejects() -> None:
-    r = validate_slice(complete=_complete(exit_code=7), slice_=_slice(parent="s1"))
+def test_nonzero_exit_no_files_after_retry_hard_rejects() -> None:
+    """Retry already happened and still no work → hard reject."""
+    r = validate_slice(complete=_complete(exit_code=7, files=[]),
+                       slice_=_slice(parent="s1"))
     assert r.verdict == "reject_hard"
+
+
+def test_nonzero_exit_with_files_soft_accepts() -> None:
+    """Regression from S3 dogfood: goose's own commit was blocked by sandbox
+    (exit≠0) but the captain-runner _git_autocommit step landed the file edits.
+    Reject_retry would redo or break already-good work — soft_accept instead."""
+    r = validate_slice(
+        complete=_complete(exit_code=1, files=["scripts/x.py", "tests/test_x.py"]),
+        slice_=_slice(),
+    )
+    assert r.verdict == "soft_accept"
+    assert "2 file" in r.rationale
+    assert "exit 1" in r.rationale
+
+
+def test_nonzero_exit_with_files_soft_accepts_even_on_retry() -> None:
+    """Same logic on retry — work landed, take it. Don't escalate to
+    reject_hard just because exit was nonzero."""
+    r = validate_slice(
+        complete=_complete(exit_code=1, files=["a.py"]),
+        slice_=_slice(parent="s1"),
+    )
+    assert r.verdict == "soft_accept"
 
 
 def test_no_files_changed_first_attempt_retries() -> None:

@@ -10,6 +10,9 @@ import pytest
 
 from chad_captain.merge_facilitator import (
     CmdResult,
+    branch_exists_local,
+    current_branch,
+    ensure_captain_branch,
     format_pr_body,
     format_pr_title,
     is_roadmap_complete,
@@ -171,6 +174,90 @@ def test_open_pr_supports_non_draft(tmp_path: Path) -> None:
         )
         cmd = mock_run.call_args.args[0]
         assert "--draft" not in cmd
+
+
+# ---------------------------------------------------------------------------
+# ensure_captain_branch — branch auto-create with real git
+# ---------------------------------------------------------------------------
+
+
+def _init_repo(tmp_path: Path, base: str = "main") -> Path:
+    """Bootstrap a tiny throwaway git repo on the given branch."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", base], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "--allow-empty", "-qm", "init"],
+        cwd=repo, check=True,
+    )
+    return repo
+
+
+def test_current_branch_returns_initial_branch(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    assert current_branch(repo_path=str(repo)) == "main"
+
+
+def test_branch_exists_local_true_for_existing(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    assert branch_exists_local(repo_path=str(repo), branch="main") is True
+
+
+def test_branch_exists_local_false_for_missing(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path)
+    assert branch_exists_local(repo_path=str(repo), branch="codex/x") is False
+
+
+def test_ensure_captain_branch_already_on_target_is_noop(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="codex/captain-x")
+    res = ensure_captain_branch(
+        repo_path=str(repo), branch="codex/captain-x", base_branch="main",
+    )
+    assert res.ok
+    assert "already on" in res.summary
+    assert current_branch(repo_path=str(repo)) == "codex/captain-x"
+
+
+def test_ensure_captain_branch_checks_out_existing_branch(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    # Pre-create the captain branch
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "codex/captain-x"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    assert current_branch(repo_path=str(repo)) == "main"
+
+    res = ensure_captain_branch(
+        repo_path=str(repo), branch="codex/captain-x", base_branch="main",
+    )
+    assert res.ok
+    assert "checked out" in res.summary
+    assert current_branch(repo_path=str(repo)) == "codex/captain-x"
+
+
+def test_ensure_captain_branch_creates_from_base(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is False
+
+    res = ensure_captain_branch(
+        repo_path=str(repo), branch="codex/captain-x", base_branch="main",
+    )
+    assert res.ok
+    assert "created" in res.summary
+    assert current_branch(repo_path=str(repo)) == "codex/captain-x"
+    # And it actually exists now
+    assert branch_exists_local(repo_path=str(repo), branch="codex/captain-x") is True
+
+
+def test_ensure_captain_branch_fails_when_base_missing(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, base="main")
+    res = ensure_captain_branch(
+        repo_path=str(repo), branch="codex/x", base_branch="nonexistent",
+    )
+    assert res.ok is False
+    assert "could not checkout base" in res.summary
 
 
 # ---------------------------------------------------------------------------
