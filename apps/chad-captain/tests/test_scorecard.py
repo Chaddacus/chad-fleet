@@ -34,6 +34,7 @@ def test_score_repo_returns_seven_dimensions(tmp_path: Path) -> None:
         "file_size_health",
         "docs_present",
         "test_density",
+        "migrations_consistent",
     ]
     assert 0.0 <= sc.aggregate <= 1.0
 
@@ -300,6 +301,120 @@ def test_test_density_handles_no_source(tmp_path: Path) -> None:
     sc = score_repo(repo)
     # No source files at all — dim degrades to 1.0 rather than crashing.
     assert sc.by_name("test_density").score == 1.0
+
+
+def test_migrations_consistent_no_django_app_scores_1(tmp_path: Path) -> None:
+    """Non-Django repo: dim is a no-op."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "main.py").write_text("x = 1\n")
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == 1.0
+
+
+def test_migrations_consistent_app_with_migrations_scores_1(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    repo.mkdir()
+    app = repo / "apps" / "billing"
+    app.mkdir(parents=True)
+    (app / "models.py").write_text("from django.db import models\n\nclass Plan(models.Model):\n    pass\n")
+    mig = app / "migrations"
+    mig.mkdir()
+    (mig / "__init__.py").write_text("")
+    (mig / "0001_initial.py").write_text("# generated\n")
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == 1.0
+
+
+def test_migrations_consistent_app_missing_migrations_scores_0(tmp_path: Path) -> None:
+    """Live failure mode: model added without migration. PR ships, deploy
+    breaks. Dim catches it during validate."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    app = repo / "apps" / "billing"
+    app.mkdir(parents=True)
+    (app / "models.py").write_text(
+        "from django.db import models\n\nclass Plan(models.Model):\n    pass\n"
+    )
+    # No migrations dir at all
+    sc = score_repo(repo)
+    score = sc.by_name("migrations_consistent").score
+    assert score == 0.0
+
+
+def test_migrations_consistent_partial_credit(tmp_path: Path) -> None:
+    """One app has migrations, one doesn't → 0.5."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    a = repo / "apps" / "billing"
+    a.mkdir(parents=True)
+    (a / "models.py").write_text("from django.db import models\n\nclass Plan(models.Model):\n    pass\n")
+    (a / "migrations").mkdir()
+    (a / "migrations" / "0001_initial.py").write_text("# x\n")
+
+    b = repo / "apps" / "billing2"
+    b.mkdir(parents=True)
+    (b / "models.py").write_text("from django.db import models\n\nclass Plan2(models.Model):\n    pass\n")
+    # No migrations dir for b
+
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == pytest.approx(0.5, abs=0.01)
+
+
+def test_migrations_consistent_skips_abstract_only_models(tmp_path: Path) -> None:
+    """apps/core/models.py with only abstract base classes does NOT
+    require migrations. Live observation: author-toolkit's apps/core
+    has TimestampedModel + BaseModel (both abstract); old heuristic
+    flagged it as missing migrations and dropped the score 11pp."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    app = repo / "apps" / "core"
+    app.mkdir(parents=True)
+    (app / "models.py").write_text(
+        "from django.db import models\n\n"
+        "class BaseModel(models.Model):\n"
+        "    class Meta:\n"
+        "        abstract = True\n\n"
+        "class TimestampedModel(models.Model):\n"
+        "    class Meta:\n"
+        "        abstract = True\n"
+    )
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == 1.0
+
+
+def test_migrations_consistent_requires_migrations_for_mixed_abstract_concrete(tmp_path: Path) -> None:
+    """If models.py has BOTH abstract and concrete classes, require
+    migrations. The concrete model needs a migration even if there
+    are abstract siblings."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    app = repo / "apps" / "billing"
+    app.mkdir(parents=True)
+    (app / "models.py").write_text(
+        "from django.db import models\n\n"
+        "class Base(models.Model):\n"
+        "    class Meta:\n"
+        "        abstract = True\n\n"
+        "class Plan(models.Model):\n"
+        "    name = models.CharField(max_length=64)\n"
+    )
+    # No migrations dir
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == 0.0
+
+
+def test_migrations_consistent_ignores_models_py_without_django_classes(tmp_path: Path) -> None:
+    """A models.py with just helper functions (no `models.Model`) shouldn't
+    be flagged as a Django app."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    app = repo / "lib"
+    app.mkdir()
+    (app / "models.py").write_text("# pure helpers — not Django\n\ndef fit():\n    return 1\n")
+    sc = score_repo(repo)
+    assert sc.by_name("migrations_consistent").score == 1.0
+    assert "no Django models.py" in sc.by_name("migrations_consistent").rationale
 
 
 def test_docs_present_zero_no_readme(tmp_path: Path) -> None:

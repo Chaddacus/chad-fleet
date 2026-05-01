@@ -22,6 +22,11 @@ The seven baseline dimensions:
                           codebases saturate tests_present at 1.0; this
                           gives slices that ADD test coverage measurable
                           credit even when tests_present is already pinned)
+    migrations_consistent — Django apps with models.py must have a
+                          migrations/ dir with at least one migration
+                          file. Catches the failure mode where the
+                          captain accepts a model change but the worker
+                          forgot to run makemigrations.
 """
 
 from __future__ import annotations
@@ -136,6 +141,7 @@ def score_repo(
         _dim_file_size_health(files),
         _dim_docs_present(repo),
         _dim_test_density(files, test_files),
+        _dim_migrations_consistent(repo),
     ]
     if extras:
         for fn in extras:
@@ -351,6 +357,110 @@ def _dim_test_density(files: list[Path], test_files: list[Path]) -> DimensionSco
         name="test_density", score=score,
         rationale=f"{test_loc} test LOC / {source_loc} source LOC (ratio {ratio:.3f})",
         detail={"source_loc": source_loc, "test_loc": test_loc, "ratio": round(ratio, 4)},
+    )
+
+
+def _models_py_is_abstract_only(text: str) -> bool:
+    """Lightweight check: every Django Model subclass in `text` has
+    ``abstract = True`` in its body. Used to skip abstract-only
+    models.py files (e.g. apps/core/models.py base classes) from the
+    migrations_consistent dim.
+
+    Not a real AST parse — class blocks are detected by indentation,
+    and ``abstract = True`` is matched within the next 25 non-empty
+    lines after each class header. Conservative: any non-abstract class
+    flips the file to "concrete" and requires migrations. False-positive
+    abstract → migration required (loud); false-negative abstract → no
+    migration required (silent). We err loud."""
+    class_pattern = re.compile(
+        r"^class\s+(\w+)\s*\([^)]*\bmodels\.Model\b[^)]*\)\s*:",
+        re.MULTILINE,
+    )
+    matches = list(class_pattern.finditer(text))
+    if not matches:
+        # No models.Model subclasses found — safe to treat as non-Django.
+        return True
+    abstract_pat = re.compile(r"^\s+abstract\s*=\s*True\b", re.MULTILINE)
+    lines = text.splitlines()
+    for m in matches:
+        # Find class start line index
+        upto = text[: m.start()]
+        start_line = upto.count("\n")
+        window = "\n".join(lines[start_line : start_line + 30])
+        # Only count abstract markers indented relative to the class
+        # (i.e. inside a Meta block). Cheap proxy: look for any line
+        # matching the indented `abstract = True` pattern.
+        if not abstract_pat.search(window):
+            return False
+    return True
+
+
+def _dim_migrations_consistent(repo: Path) -> DimensionScore:
+    """For every directory containing ``models.py`` with a Django model
+    declaration, require a sibling ``migrations/`` dir with at least one
+    migration file (other than ``__init__.py``).
+
+    Non-Django repos (no models.py anywhere) score 1.0 — this dim is a
+    no-op for them. Django repos missing migrations score continuously
+    (1 - missing/total).
+
+    Catches the failure mode observed live on author-toolkit PR #142:
+    captain accepted a slice that added Plan + Subscription models but
+    the migration-file check happens out-of-band. With this dim, missing
+    migrations register as a rubric drop on the validate, eligible to
+    trigger reject_retry."""
+    apps_with_models: list[Path] = []
+    for f in _walk_files(repo):
+        if f.name != "models.py":
+            continue
+        text = _safe_read(f)
+        if not text:
+            continue
+        if not re.search(r"\bmodels\.Model\b", text):
+            continue
+        # Skip abstract-only models.py (e.g. apps/core/models.py with
+        # only abstract base classes). Such modules don't require
+        # migrations. Heuristic: if every `class X(models.Model)` block
+        # contains `abstract = True` within ~25 lines, treat as abstract.
+        if _models_py_is_abstract_only(text):
+            continue
+        apps_with_models.append(f.parent)
+
+    if not apps_with_models:
+        return DimensionScore(
+            name="migrations_consistent", score=1.0,
+            rationale="no Django models.py with model classes detected",
+            detail={"apps_with_models": 0},
+        )
+
+    missing: list[str] = []
+    for app_dir in apps_with_models:
+        mig_dir = app_dir / "migrations"
+        if not mig_dir.is_dir():
+            missing.append(str(app_dir.relative_to(repo)) if app_dir.is_relative_to(repo) else str(app_dir))
+            continue
+        migration_files = [
+            p for p in mig_dir.iterdir()
+            if p.is_file() and p.suffix == ".py" and p.name != "__init__.py"
+        ]
+        if not migration_files:
+            missing.append(str(app_dir.relative_to(repo)) if app_dir.is_relative_to(repo) else str(app_dir))
+
+    total = len(apps_with_models)
+    if not missing:
+        return DimensionScore(
+            name="migrations_consistent", score=1.0,
+            rationale=f"all {total} Django app(s) have migrations",
+            detail={"apps_with_models": total, "missing": []},
+        )
+    score = 1.0 - len(missing) / total
+    return DimensionScore(
+        name="migrations_consistent", score=score,
+        rationale=f"{len(missing)}/{total} Django app(s) missing migrations",
+        detail={
+            "apps_with_models": total,
+            "missing": missing[:5],
+        },
     )
 
 
