@@ -33,6 +33,7 @@ def test_score_repo_returns_seven_dimensions(tmp_path: Path) -> None:
         "secret_hygiene",
         "file_size_health",
         "docs_present",
+        "test_density",
     ]
     assert 0.0 <= sc.aggregate <= 1.0
 
@@ -190,23 +191,25 @@ def test_file_size_health_drops_for_giant_file(tmp_path: Path) -> None:
 
 def test_file_size_health_continuous_decay(tmp_path: Path) -> None:
     """Each split should move the score by an observable amount so the
-    captain loop credits incremental progress. Previously the dim used a
-    10-giant denominator so any repo ≥10 giants stayed at 0.00."""
+    captain loop credits incremental progress. Excess-LOC formula with
+    BUDGET=20000: 4 giants × 500 excess = 2000 → 1 - 2000/20000 = 0.90."""
     repo = tmp_path / "r"
     repo.mkdir()
     # 4 giant files
     for i in range(4):
         (repo / f"big{i}.py").write_text("\n" * 1500)
     sc = score_repo(repo)
-    # 1 - 4/20 = 0.80
-    assert sc.by_name("file_size_health").score == pytest.approx(0.80, abs=0.01)
+    assert sc.by_name("file_size_health").score == pytest.approx(0.90, abs=0.01)
 
 
 def test_file_size_health_does_not_bottom_out_for_realistic_codebase(
     tmp_path: Path,
 ) -> None:
-    """A real codebase with 15 giants used to score 0.0 — no incremental
-    credit possible. New formula gives 0.25 with room to climb per split."""
+    """A real codebase with 15 giants × 1500 LOC = 7500 excess used to
+    score 0.0 under the giant-count formula. Excess-LOC continuous
+    formula gives 1 - 7500/20000 = 0.625 with room to climb per split.
+    Live observation: author-toolkit has 11887 excess LOC, so the
+    BUDGET=20000 is sized to keep that codebase off the floor."""
     repo = tmp_path / "r"
     repo.mkdir()
     for i in range(15):
@@ -214,7 +217,7 @@ def test_file_size_health_does_not_bottom_out_for_realistic_codebase(
     sc = score_repo(repo)
     score = sc.by_name("file_size_health").score
     assert score > 0.0, f"expected room to grow, got {score}"
-    assert score == pytest.approx(0.25, abs=0.01)
+    assert score == pytest.approx(0.625, abs=0.01)
 
 
 def test_file_size_health_split_moves_score(tmp_path: Path) -> None:
@@ -232,6 +235,71 @@ def test_file_size_health_split_moves_score(tmp_path: Path) -> None:
 
     delta_pp = (after - before) * 100  # convert to pp
     assert delta_pp >= 0.5, f"expected >=0.5pp from one split, got {delta_pp}"
+
+
+def test_file_size_health_within_giant_reduction_credits(tmp_path: Path) -> None:
+    """Cutting LOC out of a still-giant file (3000 → 2900) used to give 0
+    credit because the file count didn't change. Excess-LOC formula
+    rewards the 100-line cut: 100/20000 = 0.005 = 0.5pp.
+
+    Live failure that motivated this: author-toolkit S4 extracted 65 LOC
+    from runtime_service.py (3079 → 3014) — both still giants — and the
+    rubric returned +0.00pp delta, so captain issued soft_accept. Now
+    that work earns +0.3pp, which is not accept-worthy alone but
+    accumulates across slices instead of being silently zeroed."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    big = repo / "service.py"
+    big.write_text("\n" * 3000)
+    before = score_repo(repo).by_name("file_size_health").score
+
+    big.write_text("\n" * 2900)  # 100-line reduction; still a giant
+    after = score_repo(repo).by_name("file_size_health").score
+
+    delta_pp = (after - before) * 100
+    assert delta_pp > 0.0, f"expected non-zero credit for in-giant cut, got {delta_pp}"
+    assert delta_pp == pytest.approx(0.5, abs=0.05)
+
+
+def test_test_density_continuous_with_added_tests(tmp_path: Path) -> None:
+    """Adding more test LOC must produce a measurable rubric delta even
+    when tests_present is already saturated at 1.0. This is the live
+    failure mode that motivated the dim — billing/ added 53 test LOC
+    on author-toolkit and the aggregate didn't budge."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "src.py").write_text("\n" * 1000)  # 1000 source LOC
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("\n" * 50)  # ratio 0.05 → score 0.10
+
+    before = score_repo(repo).by_name("test_density").score
+    (tests / "test_b.py").write_text("\n" * 50)  # ratio 0.10 → score 0.20
+    after = score_repo(repo).by_name("test_density").score
+
+    delta_pp = (after - before) * 100
+    assert delta_pp > 0.0, f"adding tests must move test_density, got {delta_pp}"
+    assert before == pytest.approx(0.10, abs=0.01)
+    assert after == pytest.approx(0.20, abs=0.01)
+
+
+def test_test_density_saturates_at_high_ratio(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    repo.mkdir()
+    (repo / "src.py").write_text("\n" * 100)
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_a.py").write_text("\n" * 100)  # ratio 1.0 → score 1.0
+    sc = score_repo(repo)
+    assert sc.by_name("test_density").score == pytest.approx(1.0, abs=0.01)
+
+
+def test_test_density_handles_no_source(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    repo.mkdir()
+    sc = score_repo(repo)
+    # No source files at all — dim degrades to 1.0 rather than crashing.
+    assert sc.by_name("test_density").score == 1.0
 
 
 def test_docs_present_zero_no_readme(tmp_path: Path) -> None:

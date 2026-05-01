@@ -1035,16 +1035,22 @@ def test_roadmap_complete_baseline_preserved_on_pr_open_failure(
 
 
 def _seed_validate_log(
-    ws: AppWorkspace, *, verdicts: list[str], app_id: str = "test-app",
+    ws: AppWorkspace, *,
+    verdicts: list[str],
+    app_id: str = "test-app",
+    deltas: list[float | None] | None = None,
 ) -> None:
-    """Append N validate entries with the given verdicts in order."""
+    """Append N validate entries with the given verdicts in order.
+    Optional ``deltas`` parallel-list sets rubric_delta_pp per entry."""
     from chad_captain.protocol import CaptainLogEntry, append_captain_log
     for i, v in enumerate(verdicts):
+        delta = deltas[i] if deltas is not None and i < len(deltas) else None
         append_captain_log(
             ws,
             CaptainLogEntry(
                 app_id=app_id, slice_id=f"s{i}",
                 kind="validate", verdict=v, rationale=f"seeded {v}",
+                rubric_delta_pp=delta,
             ),
         )
 
@@ -1133,6 +1139,102 @@ def test_circuit_breaker_does_not_trip_on_mixed_verdicts(
 
     captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
 
+    assert not ws.pause_until_path.exists()
+
+
+def test_low_yield_streak_trips_after_threshold_zero_deltas(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """N consecutive soft_accepts with abs(delta) < 0.5pp →
+    low_yield_streak escalation + dispatch pause. This is the
+    rubric-saturation guard."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.validator import _maybe_trip_low_yield_streak
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    reg = RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        low_yield_streak_threshold=3,
+        low_yield_pause_minutes=15,
+    )
+
+    _seed_validate_log(
+        ws,
+        verdicts=["soft_accept", "soft_accept", "soft_accept"],
+        deltas=[0.0, 0.1, 0.0],
+    )
+
+    _maybe_trip_low_yield_streak(ws, reg)
+
+    assert ws.pause_until_path.exists()
+    log = read_captain_log(ws)
+    tripped = [
+        e for e in log
+        if (e.references or {}).get("event") == "low_yield_streak"
+    ]
+    assert len(tripped) == 1
+    assert "low-yield streak" in tripped[0].rationale
+    assert (tripped[0].references or {}).get("threshold") == "3"
+
+
+def test_low_yield_streak_does_not_retrip_within_same_streak(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If we already wrote a low_yield_streak escalation, don't write
+    another one on the very next tick. Escalation is one event per streak."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        low_yield_streak_threshold=3,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # First trip
+    _seed_validate_log(
+        ws, verdicts=["soft_accept", "soft_accept", "soft_accept"],
+        deltas=[0.0, 0.0, 0.0],
+    )
+    from chad_captain.validator import _maybe_trip_low_yield_streak
+    _maybe_trip_low_yield_streak(ws, fake_reg.apps[0])
+
+    # Second call on same streak — no new escalation
+    _maybe_trip_low_yield_streak(ws, fake_reg.apps[0])
+
+    log = read_captain_log(ws)
+    tripped = [
+        e for e in log
+        if (e.references or {}).get("event") == "low_yield_streak"
+    ]
+    assert len(tripped) == 1
+
+
+def test_low_yield_streak_ignores_real_deltas(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single soft_accept with delta >= 0.5pp resets the streak."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.validator import _maybe_trip_low_yield_streak
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    reg = RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous", low_yield_streak_threshold=3,
+    )
+
+    _seed_validate_log(
+        ws, verdicts=["soft_accept", "soft_accept", "soft_accept"],
+        deltas=[0.0, 1.5, 0.0],  # middle one has real delta
+    )
+    _maybe_trip_low_yield_streak(ws, reg)
     assert not ws.pause_until_path.exists()
 
 

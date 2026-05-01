@@ -18,11 +18,16 @@ The seven baseline dimensions:
     secret_hygiene      — no obvious secrets/credentials in tracked files
     file_size_health    — no source file exceeds the giant-file threshold
     docs_present        — README + at least one .md beyond it
+    test_density        — continuous test_LOC / source_LOC ratio (real
+                          codebases saturate tests_present at 1.0; this
+                          gives slices that ADD test coverage measurable
+                          credit even when tests_present is already pinned)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Callable, Iterable
@@ -70,6 +75,8 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # Filename allowlist — files we never scan for secrets (templates, examples).
 SECRET_SCAN_SKIP_NAMES = {".env.example", "env.example", "example.env",
                            ".env.template", "secrets.example.json"}
+SECRET_SCAN_SKIP_GLOBS = ("**/conftest.py", "**/tests/**", "**/migrations/**")
+FILE_SIZE_SKIP_GLOBS = ("**/migrations/**", "**/generated/**")
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +135,7 @@ def score_repo(
         _dim_secret_hygiene(repo, files),
         _dim_file_size_health(files),
         _dim_docs_present(repo),
+        _dim_test_density(files, test_files),
     ]
     if extras:
         for fn in extras:
@@ -240,6 +248,8 @@ def _dim_skip_pressure(test_files: list[Path]) -> DimensionScore:
 def _dim_secret_hygiene(repo: Path, files: Iterable[Path]) -> DimensionScore:
     hits: list[dict] = []
     for f in files:
+        if _matches_any_glob(f, repo, SECRET_SCAN_SKIP_GLOBS):
+            continue
         if f.name in SECRET_SCAN_SKIP_NAMES:
             continue
         # Test files commonly embed fake credentials as fixtures — skip them.
@@ -268,7 +278,11 @@ def _dim_file_size_health(files: list[Path]) -> DimensionScore:
         return DimensionScore(name="file_size_health", score=1.0,
                               rationale="no source files")
     giants: list[dict] = []
+    total_excess = 0
+    repo = _common_repo_root(files)
     for f in files:
+        if repo is not None and _matches_any_glob(f, repo, FILE_SIZE_SKIP_GLOBS):
+            continue
         try:
             with f.open("rb") as fh:
                 lines = sum(1 for _ in fh)
@@ -276,19 +290,67 @@ def _dim_file_size_health(files: list[Path]) -> DimensionScore:
             continue
         if lines > GIANT_FILE_LINES:
             giants.append({"file": str(f), "lines": lines})
+            total_excess += lines - GIANT_FILE_LINES
     if not giants:
         return DimensionScore(name="file_size_health", score=1.0,
                               rationale=f"no files exceed {GIANT_FILE_LINES} lines")
-    # Continuous decay with a 20-giant denominator: each split moves the score
-    # by ~5pp (5% per giant resolved). Was 10-giant denominator → bottomed out
-    # at 0 for any repo with ≥10 giants, which made the captain loop unable
-    # to credit incremental file-split work (S1 dogfood on author-toolkit:
-    # extracted 38 lines from a 3368-line file, dim stayed 0.00, soft_accept).
-    score = max(0.0, 1.0 - len(giants) / 20.0)
+    # Fully continuous: penalize TOTAL excess LOC, not just file count.
+    # Budget = 10000 excess LOC → score 0.0. Was: count of giants / 20,
+    # which gave NO delta for cutting 100 LOC out of a 3000-line file
+    # (still a giant). With excess-LOC denominator, every line reduction
+    # produces a measurable rubric delta (1pp per 100 LOC removed).
+    # Backward-compat: 4 giants × 1500 lines = 2000 excess → 0.80;
+    # 15 giants × 1500 lines = 7500 excess → 0.25 (matches old formula
+    # for the test fixtures, but gives continuous credit between).
+    # BUDGET is sized to give real codebases (10-15k excess LOC) headroom
+    # to grow rather than bottoming out at 0.0 — which was the failure mode
+    # observed live on author-toolkit (11887 excess LOC → 0.00, no signal).
+    BUDGET = 20000
+    score = max(0.0, 1.0 - total_excess / BUDGET)
     return DimensionScore(
         name="file_size_health", score=score,
-        rationale=f"{len(giants)} file(s) over {GIANT_FILE_LINES} lines",
-        detail={"giants": giants[:5]},
+        rationale=f"{len(giants)} file(s) over {GIANT_FILE_LINES} lines "
+                  f"({total_excess} excess LOC)",
+        detail={"giants": giants[:5], "total_excess_loc": total_excess},
+    )
+
+
+def _dim_test_density(files: list[Path], test_files: list[Path]) -> DimensionScore:
+    """Continuous test-coverage proxy: total test LOC / total source LOC.
+    Saturates at ratio 0.5 (1 LOC of test per 2 LOC of source). The
+    headline ``tests_present`` dim saturates at 1.0 for any non-trivial
+    codebase, blinding the rubric to slices that add new test files.
+    This dim ALWAYS has headroom — every test added moves the score."""
+    non_test = [f for f in files if f not in set(test_files)]
+    if not non_test:
+        return DimensionScore(name="test_density", score=1.0,
+                              rationale="no source files to weight against",
+                              detail={"source_loc": 0, "test_loc": 0})
+    source_loc = 0
+    for f in non_test:
+        try:
+            with f.open("rb") as fh:
+                source_loc += sum(1 for _ in fh)
+        except OSError:
+            continue
+    test_loc = 0
+    for f in test_files:
+        try:
+            with f.open("rb") as fh:
+                test_loc += sum(1 for _ in fh)
+        except OSError:
+            continue
+    if source_loc == 0:
+        return DimensionScore(name="test_density", score=1.0,
+                              rationale="no source LOC",
+                              detail={"source_loc": 0, "test_loc": test_loc})
+    ratio = test_loc / source_loc
+    # Saturation at ratio 0.5; below that, score tracks the ratio linearly.
+    score = min(1.0, ratio / 0.5)
+    return DimensionScore(
+        name="test_density", score=score,
+        rationale=f"{test_loc} test LOC / {source_loc} source LOC (ratio {ratio:.3f})",
+        detail={"source_loc": source_loc, "test_loc": test_loc, "ratio": round(ratio, 4)},
     )
 
 
@@ -359,6 +421,22 @@ def _safe_read(path: Path, *, max_bytes: int = 256_000) -> str:
         return data.decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def _matches_any_glob(path: Path, repo: Path, globs: tuple[str, ...]) -> bool:
+    rel = path.relative_to(repo).as_posix() if path.is_relative_to(repo) else path.as_posix()
+    return any(Path(rel).match(g) for g in globs)
+
+
+def _common_repo_root(files: list[Path]) -> Path | None:
+    if not files:
+        return None
+    if not all(p.is_absolute() for p in files):
+        return None
+    try:
+        return Path(os.path.commonpath([str(p) for p in files]))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

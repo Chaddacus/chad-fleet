@@ -459,6 +459,12 @@ def captain_tick(
     # tick (and subsequent ticks until pause expires).
     if completion is not None and reg_app is not None:
         _maybe_trip_circuit_breaker(ws, reg_app)
+        # C12 — low-yield streak: detect rubric saturation / no-op slice
+        # spinning by counting consecutive soft_accepts with rubric_delta_pp
+        # below the noise floor. Pauses the same way the circuit breaker
+        # does, but signals "the rubric isn't measuring this work" rather
+        # than "the work is breaking things."
+        _maybe_trip_low_yield_streak(ws, reg_app)
 
     # C8 pause gate — applies only to dispatch (not validation, which
     # we always want to process).
@@ -718,6 +724,66 @@ def _maybe_trip_circuit_breaker(ws: AppWorkspace, reg_app) -> None:
             ),
             references={
                 "event": "circuit_breaker_tripped",
+                "threshold": str(threshold),
+                "pause_minutes": str(pause_min),
+                "pause_until": until.isoformat(),
+            },
+        ),
+    )
+
+
+_LOW_YIELD_PP_FLOOR = 0.5
+
+
+def _maybe_trip_low_yield_streak(ws: AppWorkspace, reg_app) -> None:
+    """If the most recent N validate entries are all `soft_accept` with
+    abs(rubric_delta_pp) below the noise floor, pause dispatch and log a
+    `low_yield_streak` escalation. This catches two failure modes:
+      1. Rubric saturated — every dim is pinned at 1.0, no slice can move it.
+      2. Replanner spinning on cosmetic work that doesn't affect any dim.
+
+    Re-trips are guarded: if the most recent log entry is already a
+    low_yield_streak escalation, this is a no-op until the streak breaks
+    (i.e. an `accept` or non-soft `validate` shifts the trailing window)."""
+    threshold = max(1, int(getattr(reg_app, "low_yield_streak_threshold", 5)))
+    pause_min = max(1, int(getattr(reg_app, "low_yield_pause_minutes", 30)))
+
+    from chad_captain.protocol import read_captain_log
+    log = read_captain_log(ws, limit=threshold * 4)
+    validates = [e for e in log if e.kind == "validate"]
+    recent = validates[-threshold:]
+    if len(recent) < threshold:
+        return
+    if not all(
+        e.verdict == "soft_accept"
+        and e.rubric_delta_pp is not None
+        and abs(e.rubric_delta_pp) < _LOW_YIELD_PP_FLOOR
+        for e in recent
+    ):
+        return
+    # Idempotency: bail out if we already tripped within this same streak
+    # (most recent log entry is the escalation we'd write).
+    if log:
+        last = log[-1]
+        if (last.kind == "escalation_raised"
+                and (last.references or {}).get("event") == "low_yield_streak"):
+            return
+
+    until = datetime.now(timezone.utc) + timedelta(minutes=pause_min)
+    _write_pause_until(ws, until.isoformat())
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None,
+            kind="escalation_raised",
+            rationale=(
+                f"low-yield streak: {threshold} consecutive soft_accepts "
+                f"with abs(delta) < {_LOW_YIELD_PP_FLOOR}pp — rubric is "
+                f"saturated or dispatch is generating no-op slices; "
+                f"dispatch paused for {pause_min}m"
+            ),
+            references={
+                "event": "low_yield_streak",
                 "threshold": str(threshold),
                 "pause_minutes": str(pause_min),
                 "pause_until": until.isoformat(),

@@ -89,6 +89,14 @@ class RegisteredApp(BaseModel):
     circuit_breaker_threshold: int = 3
     circuit_breaker_pause_minutes: int = 60
 
+    # --- C12 low-yield streak detector ---
+    # When N consecutive validates are soft_accept with abs(delta_pp) below
+    # the noise floor, pause + escalate. Catches rubric saturation (every
+    # dim pinned at 1.0) AND captain spinning on cosmetic slices the
+    # rubric isn't measuring. Admiral can extend the rubric, then unpause.
+    low_yield_streak_threshold: int = 5
+    low_yield_pause_minutes: int = 30
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)
