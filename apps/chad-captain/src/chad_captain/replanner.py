@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -264,6 +265,34 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
     )
 
 
+def _rubric_is_stalled(recent_decisions: list[dict]) -> bool:
+    """Heuristic: if the last 4 validate entries are all soft_accept with
+    abs(delta_pp) < 0.5, the rubric isn't responding to the work being
+    done. Return True so the prompt pivots the next batch toward
+    feature work instead of more remediation."""
+    validates = [
+        d for d in recent_decisions if d.get("kind") == "validate"
+    ]
+    if len(validates) < 4:
+        return False
+    tail = validates[-4:]
+    for d in tail:
+        if d.get("verdict") != "soft_accept":
+            return False
+        # rationale carries delta info as string '+0.41pp' / '+0.00pp'.
+        # If we can't parse it, conservatively don't flag stall.
+        rat = d.get("rationale") or ""
+        m = re.search(r"([+-]?\d+\.\d+)\s*pp", rat)
+        if not m:
+            return False
+        try:
+            if abs(float(m.group(1))) >= 0.5:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
 def _build_prompt(ctx: ReplanContext) -> str:
     p = ctx.profile
     sc = ctx.scorecard
@@ -298,10 +327,36 @@ def _build_prompt(ctx: ReplanContext) -> str:
         lines.append("## Competitive landscape (excerpt)")
         lines.append(p.web.landscape_md[:1200])
         lines.append("")
+
+    # Add cycle-progress context. If trailing rubric deltas have been
+    # tiny, the lowest-scoring dim is likely insensitive to incremental
+    # work — pivot the next batch toward feature/product work.
+    rubric_stalled = _rubric_is_stalled(ctx.recent_decisions)
+    if rubric_stalled:
+        lines.append("## ⚠ Rubric stall detected")
+        lines.append(
+            "The last several validates have rubric_delta_pp ≈ 0. The "
+            "lowest-scoring dim isn't moving. Do NOT generate another "
+            "round of remediation slices targeting the same dim — that "
+            "loop has already been tried and the rubric is insensitive "
+            "to it. Instead, this batch should be majority FEATURE work "
+            "(building the product described in the summary above) plus "
+            "at most ONE remediation slice."
+        )
+        lines.append("")
+
     lines.append(
-        "Produce 3-7 surgical slices that move the lowest-scoring "
-        "scorecard dimensions upward. Each slice's slice_id must be "
-        "unique within this roadmap (e.g. S1, S2, S3). When sequencing "
+        "Produce 3-7 surgical slices. Mix work types so the cycle "
+        "ships both product progress AND code-health gains:\n"
+        "  - At least 1-2 FEATURE slices that advance the product "
+        "described in the summary (new endpoints, new UI surface, "
+        "new domain logic, new CLI flag, etc).\n"
+        "  - 1-2 remediation slices targeting the lowest-scoring "
+        "dimensions (file_size_health, test_density, "
+        "migrations_consistent, etc).\n"
+        "  - At most 1 housekeeping slice (docs, config, lint).\n"
+        "Each slice's slice_id must be unique within this roadmap "
+        "(e.g. S1, S2, S3). When sequencing "
         "matters, set blocked_by to the prerequisite slice_id(s)."
     )
     return "\n".join(lines)

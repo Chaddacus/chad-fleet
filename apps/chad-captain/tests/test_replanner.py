@@ -264,3 +264,75 @@ def test_replan_triggers_match_documentation() -> None:
     assert "initial" in REPLAN_TRIGGERS
     assert "exhausted" in REPLAN_TRIGGERS
     assert "admiral_note" in REPLAN_TRIGGERS
+
+
+def test_rubric_is_stalled_detects_consecutive_zero_deltas() -> None:
+    from chad_captain.replanner import _rubric_is_stalled
+    decisions = [
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "low-yield rubric delta +0.00pp"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "low-yield rubric delta +0.00pp"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "rubric delta +0.80pp"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "low-yield rubric delta +0.00pp"},
+    ]
+    # Last 4 includes one +0.80pp ≥ 0.5pp threshold → not stalled
+    assert _rubric_is_stalled(decisions) is False
+
+    # All 4 below 0.5pp → stalled
+    decisions[2]["rationale"] = "low-yield rubric delta +0.00pp"
+    assert _rubric_is_stalled(decisions) is True
+
+
+def test_rubric_is_stalled_requires_min_history() -> None:
+    from chad_captain.replanner import _rubric_is_stalled
+    # Only 3 validates, need 4 → conservatively not stalled
+    decisions = [
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "+0.00pp"},
+    ] * 3
+    assert _rubric_is_stalled(decisions) is False
+
+
+def test_rubric_is_stalled_resets_on_real_accept() -> None:
+    from chad_captain.replanner import _rubric_is_stalled
+    decisions = [
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "+0.00pp"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "accept", "rationale": "real progress"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "+0.00pp"},
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "+0.00pp"},
+    ]
+    # 'accept' breaks the soft_accept streak → not stalled
+    assert _rubric_is_stalled(decisions) is False
+
+
+def test_build_prompt_adds_stall_warning_when_deltas_tiny() -> None:
+    """When trailing deltas are all near zero, the prompt must instruct
+    the LLM to pivot to feature work instead of more remediation."""
+    from chad_captain.replanner import _build_prompt, ReplanContext
+    from chad_captain.research.synthesize import AppProfile, LocalProfile, WebProfile
+    from chad_captain.scorecard import Scorecard, DimensionScore
+
+    profile = AppProfile(
+        app_id="x",
+        local=LocalProfile(repo_path="/tmp/x"),
+        web=WebProfile(),
+        summary="A SaaS for tracking widgets.",
+    )
+    sc = Scorecard(
+        repo_path="/tmp/x",
+        dimensions=[
+            DimensionScore(name="file_size_health", score=0.4),
+            DimensionScore(name="tests_present", score=1.0),
+        ],
+        aggregate=0.7,
+    )
+    decisions = [
+        {"ts": "2026-05-01T00:00:00Z", "kind": "validate", "verdict": "soft_accept", "rationale": "low-yield rubric delta +0.00pp"},
+    ] * 4
+    ctx = ReplanContext(
+        trigger="exhausted", profile=profile, scorecard=sc,
+        recent_decisions=decisions, admiral_notes=[],
+    )
+    prompt = _build_prompt(ctx)
+    assert "Rubric stall detected" in prompt
+    assert "FEATURE work" in prompt
+    # Always-on feature-mix instruction
+    assert "FEATURE slices" in prompt
