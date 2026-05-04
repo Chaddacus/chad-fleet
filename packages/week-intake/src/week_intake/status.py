@@ -367,6 +367,7 @@ def rollup(items: list[WeekItem]) -> dict[str, Any]:
     unreachable_apps: set[str] = set()
     routed_n = 0
     needs_attention_n = 0
+    per_app_log_window: dict[str, dict[str, Any]] = {}
 
     for it in items:
         detail = per_item_captain_detail(it, bundle_cache=bundle_cache)
@@ -376,6 +377,29 @@ def rollup(items: list[WeekItem]) -> dict[str, Any]:
             unreachable_apps.add(it.target.app_id)
         if detail.needs_attention:
             needs_attention_n += 1
+        # After per_item_captain_detail runs, the bundle_cache holds the
+        # bundle (or sentinel) for this app. Capture log_tail once per app.
+        app_id = it.target.app_id
+        if (
+            app_id
+            and app_id not in per_app_log_window
+            and isinstance(bundle_cache.get(app_id), dict)
+        ):
+            cached = bundle_cache[app_id]
+            assert isinstance(cached, dict)
+            tail = cached.get("captain_log_tail")
+            entries = tail if isinstance(tail, list) else []
+            tail_oldest_ts: str | None = None
+            for e in entries:
+                if isinstance(e, dict):
+                    ts = e.get("ts")
+                    if isinstance(ts, str):
+                        tail_oldest_ts = ts
+                        break  # captain returns oldest-first
+            per_app_log_window[app_id] = {
+                "entries": entries,
+                "tail_oldest_ts": tail_oldest_ts,
+            }
         rows.append(
             {
                 "item_id": it.item_id,
@@ -415,6 +439,10 @@ def rollup(items: list[WeekItem]) -> dict[str, Any]:
             "captain_unreachable": _count_items_for_unreachable_apps(items, unreachable_apps),
             "needs_attention": needs_attention_n,
         },
+        # Cycle-3 hook: brief.py reads this to do windowed log aggregation.
+        # Same bundle as cycle-2 — no extra HTTP. Apps that were unreachable
+        # or 404'd do not appear here.
+        "per_app_log_window": per_app_log_window,
     }
 
 

@@ -265,6 +265,34 @@ def _cmd_clarify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_brief(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    from week_intake.brief import build_brief, render_markdown
+
+    brief = build_brief(
+        week=args.week,
+        use_llm=not args.no_llm,
+        refresh=args.refresh,
+    )
+    if args.format == "json":
+        payload = {
+            "week": brief.week,
+            "week_start_utc": brief.week_start_utc,
+            "week_end_utc": brief.week_end_utc,
+            "totals": brief.totals,
+            "apps": [asdict(a) for a in brief.apps],
+            "attention_items": [asdict(a) for a in brief.attention_items],
+            "narrative": brief.narrative,
+            "prompt_version": brief.prompt_version,
+            "used_cache": brief.used_cache,
+        }
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render_markdown(brief), end="")
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     from week_intake.status import rollup
 
@@ -470,6 +498,15 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--week", default=None)
     ps.add_argument("--format", choices=("json", "table"), default="table")
     ps.set_defaults(func=_cmd_status)
+
+    pb = sub.add_parser("brief", help="narrative weekly digest with LLM-generated summary")
+    pb.add_argument("--week", default=None)
+    pb.add_argument("--format", choices=("json", "markdown"), default="markdown")
+    pb.add_argument("--no-llm", dest="no_llm", action="store_true",
+                    help="skip LLM call and cache; print deterministic-only brief")
+    pb.add_argument("--refresh", action="store_true",
+                    help="ignore cached narrative even if hash matches")
+    pb.set_defaults(func=_cmd_brief)
 
     return p
 
