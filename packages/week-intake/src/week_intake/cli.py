@@ -279,10 +279,40 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _truncate(s: str, n: int) -> str:
+    """Truncate to n chars with an ellipsis. n must be ≥ 1."""
+    if len(s) <= n:
+        return s
+    if n <= 1:
+        return s[:n]
+    return s[: n - 1] + "…"
+
+
+def _attn_indicator(row: dict[str, Any]) -> str:
+    """Compact attention indicator for the ATTN column."""
+    reason = row.get("attention_reason")
+    if reason == "escalation":
+        return "!E"
+    if reason == "pause":
+        return "!P"
+    if reason == "pause_parse_error":
+        return "!?"
+    return "-"
+
+
 def _print_status_table(week: str, report: dict[str, Any]) -> None:
-    print(f"week {week}: {report['totals']['items']} items "
-          f"({report['totals']['routed']} routed, "
-          f"{report['totals']['captain_unreachable']} captain-unreachable)")
+    import shutil
+
+    totals = report["totals"]
+    parts = [
+        f"{totals['items']} items",
+        f"{totals['routed']} routed",
+        f"{totals['captain_unreachable']} captain-unreachable",
+    ]
+    needs_attn = totals.get("needs_attention", 0)
+    if needs_attn:
+        parts.append(f"{needs_attn} need attention")
+    print(f"week {week}: " + ", ".join(parts))
     print()
     print("by state:")
     for k, v in sorted(report["by_state"].items()):
@@ -294,20 +324,61 @@ def _print_status_table(week: str, report: dict[str, Any]) -> None:
     print()
     if not report["items"]:
         return
-    headers = ("ID", "STATE", "APP", "NOTE", "TITLE")
-    rows: list[tuple[str, ...]] = [headers]
+
+    cols = shutil.get_terminal_size((120, 24)).columns
+    show_slice = cols >= 120
+    show_action = cols >= 80
+
+    headers: list[str] = ["ID", "STATE", "APP", "NOTE"]
+    if show_slice:
+        headers.append("SLICE")
+    if show_action:
+        headers.append("ACTION")
+    headers += ["ATTN", "TITLE"]
+
+    rows: list[tuple[str, ...]] = [tuple(headers)]
     for r in report["items"]:
-        rows.append(
-            (
-                r["item_id"],
-                r["state"],
-                r.get("app_id") or "-",
-                r["captain_note_status"],
-                (r["title"] or "")[:60],
-            )
+        slice_label = _truncate(r.get("slice_in_flight") or "-", 24)
+        action = (
+            r.get("last_meaningful_action")
+            or r.get("last_captain_action")
+            or "-"
         )
-    widths = [max(len(c) for c in (row[i] for row in rows)) for i in range(len(headers))]
-    for r in rows:
+        action_label = _truncate(action, 32)
+        attn = _attn_indicator(r)
+        title = r.get("title") or ""
+        row_data: list[str] = [
+            r["item_id"],
+            r["state"],
+            r.get("app_id") or "-",
+            r["captain_note_status"],
+        ]
+        if show_slice:
+            row_data.append(slice_label)
+        if show_action:
+            row_data.append(action_label)
+        row_data.append(attn)
+        row_data.append(title)  # truncated below using remaining width
+        rows.append(tuple(row_data))
+
+    # Compute column widths from data, then cap title to remaining terminal width.
+    base_widths = [
+        max(len(row[i]) for row in rows)
+        for i in range(len(headers) - 1)  # all cols except TITLE
+    ]
+    title_idx = len(headers) - 1
+    fixed_total = sum(base_widths) + 2 * (len(headers) - 1)  # 2 spaces between cols
+    title_max = max(20, cols - fixed_total)
+    final_rows: list[list[str]] = []
+    for ridx, row in enumerate(rows):
+        out_row = list(row)
+        if ridx == 0:
+            out_row[title_idx] = _truncate(out_row[title_idx], title_max)
+        else:
+            out_row[title_idx] = _truncate(out_row[title_idx], title_max)
+        final_rows.append(out_row)
+    widths = base_widths + [title_max]
+    for r in final_rows:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)))
 
 
