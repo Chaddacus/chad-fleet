@@ -19,5 +19,6 @@ members = [
     "packages/notifier-hub/adapters/ntfy",
     "packages/notifier-hub/adapters/email",
     "packages/captain-core",
+    "packages/week-intake",
     "apps/chad-captain",
 ]

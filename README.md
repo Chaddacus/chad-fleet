@@ -29,6 +29,7 @@ Seven modules are Apache 2.0 open source. Three are proprietary:
 | [notifier-hub/adapters/ntfy](packages/notifier-hub/adapters/ntfy/README.md) | Notifier adapter: pushes to ntfy.sh topics |
 | [notifier-hub/adapters/email](packages/notifier-hub/adapters/email/README.md) | Notifier adapter: sends email via SMTP/SES |
 | [genui-renderer](packages/genui-renderer/README.md) | React component library for rendering GenUI card specs |
+| [week-intake](packages/week-intake/README.md) | Weekly task intake + router; LLM-in-chat drives captain via thin CLIs |
 | [captain-core](packages/captain-core/README.md) | Core reasoning engine for Chad Captain (closed source) |
 | [captain-playbooks](packages/captain-playbooks/README.md) | Playbook data for Chad Captain (closed source) |
 
