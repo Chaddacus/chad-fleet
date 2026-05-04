@@ -265,6 +265,52 @@ def _cmd_clarify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _lookback_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--lookback must be int, got {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"--lookback must be >= 0, got {n}")
+    return n
+
+
+def _cmd_active(args: argparse.Namespace) -> int:
+    from week_intake.active import list_active
+
+    rows = list_active(lookback=args.lookback, state=args.state)
+    if args.format == "json":
+        payload = [
+            {"week": r.week, "item": r.item.model_dump(mode="json")}
+            for r in rows
+        ]
+        print(json.dumps(payload, indent=2))
+        return 0
+    # Table
+    if not rows:
+        print("(no active items)")
+        return 0
+    headers = ("ID", "WEEK", "STATE", "KIND", "APP", "TITLE")
+    out_rows: list[tuple[str, ...]] = [headers]
+    for r in rows:
+        it = r.item
+        title = (it.title or it.raw_text or "")[:60]
+        out_rows.append(
+            (
+                it.item_id,
+                r.week,
+                it.state,
+                it.kind,
+                it.target.app_id or "-",
+                title,
+            )
+        )
+    widths = [max(len(row[i]) for row in out_rows) for i in range(len(headers))]
+    for row in out_rows:
+        print("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
+    return 0
+
+
 def _cmd_brief(args: argparse.Namespace) -> int:
     from dataclasses import asdict
 
@@ -498,6 +544,19 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--week", default=None)
     ps.add_argument("--format", choices=("json", "table"), default="table")
     ps.set_defaults(func=_cmd_status)
+
+    pa = sub.add_parser(
+        "active",
+        help="list non-terminal items across the current week and N prior weeks",
+    )
+    pa.add_argument("--lookback", type=_lookback_arg, default=4,
+                    help="number of prior weeks to include (default 4)")
+    pa.add_argument("--format", choices=("json", "table"), default="table")
+    # Import here so build_parser doesn't pay module-load cost when unused.
+    from week_intake.active import ACTIVE_STATES
+    pa.add_argument("--state", choices=sorted(ACTIVE_STATES), default=None,
+                    help="filter to one active state")
+    pa.set_defaults(func=_cmd_active)
 
     pb = sub.add_parser("brief", help="narrative weekly digest with LLM-generated summary")
     pb.add_argument("--week", default=None)
