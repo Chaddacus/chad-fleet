@@ -75,6 +75,21 @@ class RouteTarget(BaseModel):
     greenfield_name: str | None = None  # human label for net-new projects
 
 
+class LifecycleEvent(BaseModel):
+    """One lifecycle transition (complete/abandon/reopen) recorded on a WeekItem.
+
+    Append-only. Reopen reads the most recent complete/abandon entry to
+    restore the prior state.
+    """
+
+    transition: Literal["complete", "abandon", "reopen"]
+    from_state: WeekItemState
+    to_state: WeekItemState
+    reason: str | None = None
+    at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    by: str = "chad"
+
+
 class WeekItem(BaseModel):
     """One unit of weekly work — from raw brain-dump bullet to routed admiral-note."""
 
@@ -101,6 +116,9 @@ class WeekItem(BaseModel):
     # workspace, invalid repo hint, etc.). Cleared when the next refresh
     # produces clean output.
     refresh_warnings: list[str] = Field(default_factory=list)
+    # Cycle 5: append-only audit log of complete/abandon/reopen transitions.
+    # Pre-cycle-5 items load with empty list (default factory).
+    lifecycle_log: list[LifecycleEvent] = Field(default_factory=list)
 
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

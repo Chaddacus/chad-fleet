@@ -105,13 +105,21 @@ def _cmd_route(args: argparse.Namespace) -> int:
             print(f"ERROR: item {args.item_id!r} not found in week {week}", file=sys.stderr)
             return 4
 
-        # Refuse to re-route an already-routed item — the user must
-        # explicitly create a new item or reset state if they really want
-        # to file a second admiral note for the same week-item.
-        if item.state == "routed" and item.captain_note_id:
+        # Cycle-5 guards: refuse to route terminal items, and refuse any
+        # item that already has a captain_note_id (covers in_progress,
+        # blocked, and legacy ready+note items).
+        if item.state in {"done", "abandoned"}:
             print(
-                f"ERROR: item {args.item_id!r} is already routed "
-                f"(note_id={item.captain_note_id}); refusing to double-file",
+                f"ERROR: cannot route {args.item_id!r}: state is {item.state!r}. "
+                f"Run `chad-week reopen {args.item_id}` first.",
+                file=sys.stderr,
+            )
+            return 1
+        if item.captain_note_id:
+            print(
+                f"ERROR: item {args.item_id!r} already has captain_note_id="
+                f"{item.captain_note_id!r}. Captain dedups deterministic note "
+                "ids; refusing to re-route.",
                 file=sys.stderr,
             )
             return 6
@@ -263,6 +271,44 @@ def _cmd_clarify(args: argparse.Namespace) -> int:
             + next_q
         )
     return 0
+
+
+def _cmd_lifecycle(transition: str):
+    """Factory: returns a _cmd_* fn for complete/abandon/reopen."""
+
+    def _cmd(args: argparse.Namespace) -> int:
+        from week_intake.lifecycle import (
+            TransitionError,
+            abandon_item,
+            complete_item,
+            reopen_item,
+        )
+
+        week = args.week or iso_week_for()
+        try:
+            if transition == "complete":
+                item = complete_item(week, args.item_id)
+            elif transition == "abandon":
+                item = abandon_item(week, args.item_id, reason=args.reason)
+            else:
+                item = reopen_item(week, args.item_id)
+        except TransitionError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
+        if args.format == "json":
+            print(json.dumps(item.model_dump(mode="json"), indent=2, default=str))
+        else:
+            ev = item.lifecycle_log[-1] if item.lifecycle_log else None
+            from_s = ev.from_state if ev else "?"
+            to_s = ev.to_state if ev else item.state
+            print(f"{item.item_id} ({item.week}): {from_s} → {to_s}")
+            if item.refresh_warnings:
+                for w in item.refresh_warnings:
+                    print(f"  warning: {w}")
+        return 0
+
+    return _cmd
 
 
 def _lookback_arg(value: str) -> int:
@@ -544,6 +590,23 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--week", default=None)
     ps.add_argument("--format", choices=("json", "table"), default="table")
     ps.set_defaults(func=_cmd_status)
+
+    for trans in ("complete", "abandon", "reopen"):
+        helptext = {
+            "complete": "mark a routed/in_progress/blocked item as done",
+            "abandon": "mark any non-terminal item as abandoned (does NOT halt captain)",
+            "reopen": "undo a complete/abandon — restores the prior state",
+        }[trans]
+        sp = sub.add_parser(trans, help=helptext)
+        sp.add_argument("item_id")
+        sp.add_argument("--week", default=None)
+        sp.add_argument("--format", choices=("json", "table"), default="table")
+        if trans == "abandon":
+            sp.add_argument("--reason", default=None,
+                            help="optional reason recorded in lifecycle_log")
+        else:
+            sp.set_defaults(reason=None)
+        sp.set_defaults(func=_cmd_lifecycle(trans))
 
     pa = sub.add_parser(
         "active",

@@ -41,7 +41,15 @@ from typing import Any
 from week_intake.captain_client import CaptainError, get_app_status_http
 from week_intake.types import WeekItem
 
-CaptainNoteStatus = str  # "queued" | "consumed" | "no_note" | "unreachable" | "unknown_app" | "not_routed"
+CaptainNoteStatus = str
+# "queued" | "consumed" | "no_note" | "unreachable" | "unknown_app"
+# | "not_routed" | "done" | "abandoned"
+
+# Cycle 5: states for which it is meaningful to ask the captain. Items in
+# pre-route states (parsed, needs_clarification, ready) and terminal states
+# (done, abandoned) do NOT round-trip to captain. Cycle 4 active view uses
+# the broader ACTIVE_STATES; this is captain-link-specific.
+CAPTAIN_LINKED_STATES: frozenset[str] = frozenset({"routed", "in_progress", "blocked"})
 
 # ---------------------------------------------------------------------------
 # Sentinels for the per-rollup bundle cache
@@ -98,7 +106,11 @@ def per_item_captain_status(
     Back-compat shape from cycle 1; ``rollup`` now uses
     ``per_item_captain_detail`` internally.
     """
-    if item.state != "routed":
+    if item.state == "done":
+        return ("done", None)
+    if item.state == "abandoned":
+        return ("abandoned", None)
+    if item.state not in CAPTAIN_LINKED_STATES:
         return ("not_routed", None)
     app_id = item.target.app_id
     if not app_id:
@@ -130,7 +142,11 @@ def per_item_captain_detail(
     sentinel string (``_CACHE_UNREACHABLE`` / ``_CACHE_NOT_FOUND``). If
     provided, this helper will reuse cached results instead of refetching.
     """
-    if item.state != "routed":
+    if item.state == "done":
+        return CaptainItemStatus(note_status="done")
+    if item.state == "abandoned":
+        return CaptainItemStatus(note_status="abandoned")
+    if item.state not in CAPTAIN_LINKED_STATES:
         return CaptainItemStatus(note_status="not_routed")
     app_id = item.target.app_id
     if not app_id:
@@ -459,7 +475,7 @@ def _count_items_for_unreachable_apps(
     return sum(
         1
         for it in items
-        if it.state == "routed"
+        if it.state in CAPTAIN_LINKED_STATES
         and it.target.app_id
         and it.target.app_id in unreachable_apps
     )

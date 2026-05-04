@@ -36,7 +36,7 @@ from tracked_app_registry.storage import atomic_write
 
 from week_intake.llm import LLMError, claude_complete
 from week_intake.protocol import WeekFolder, iso_week_for
-from week_intake.status import _parse_iso, rollup
+from week_intake.status import CAPTAIN_LINKED_STATES, _parse_iso, rollup
 from week_intake.types import WeekItem
 
 logger = logging.getLogger(__name__)
@@ -193,19 +193,23 @@ def _build_apps(
     week_start: datetime,
     week_end: datetime,
 ) -> list[AppActivity]:
-    """One AppActivity per unique app_id with at least one routed WeekItem."""
+    """One AppActivity per unique app_id with at least one captain-linked WeekItem."""
     items_by_app: dict[str, list[WeekItem]] = {}
     for it in items:
-        if it.state != "routed":
+        if it.state not in CAPTAIN_LINKED_STATES:
             continue
         app_id = it.target.app_id
         if not app_id:
             continue
         items_by_app.setdefault(app_id, []).append(it)
 
+    # Filter rollup rows to linked states FIRST so a terminal row for app-a
+    # does not shadow live captain detail for that same app.
     rows = rollup_data.get("items", [])
     detail_by_app: dict[str, dict[str, Any]] = {}
     for r in rows:
+        if r.get("state") not in CAPTAIN_LINKED_STATES:
+            continue
         app_id = r.get("app_id")
         if app_id and app_id not in detail_by_app:
             detail_by_app[app_id] = r
@@ -243,7 +247,7 @@ def _build_attention(rollup_data: dict[str, Any]) -> list[AttentionRow]:
     by_app: dict[str, dict[str, Any]] = {}
     items_by_app: dict[str, list[str]] = {}
     for r in rows:
-        if r.get("state") != "routed":
+        if r.get("state") not in CAPTAIN_LINKED_STATES:
             continue
         reason = r.get("attention_reason")
         app_id = r.get("app_id")
