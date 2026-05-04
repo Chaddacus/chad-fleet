@@ -322,35 +322,76 @@ def _lookback_arg(value: str) -> int:
 
 
 def _cmd_active(args: argparse.Namespace) -> int:
-    from week_intake.active import list_active
+    from week_intake.active import list_active, list_active_enriched
 
-    rows = list_active(lookback=args.lookback, state=args.state)
+    if args.enrich:
+        rows, enrichment = list_active_enriched(
+            lookback=args.lookback, state=args.state,
+        )
+    else:
+        rows = list_active(lookback=args.lookback, state=args.state)
+        enrichment = {}
+
+    def _enrich_for(row) -> dict:
+        return enrichment.get((row.week, row.item.item_id), {})
+
     if args.format == "json":
-        payload = [
-            {"week": r.week, "item": r.item.model_dump(mode="json")}
-            for r in rows
-        ]
+        payload: list[dict[str, Any]] = []
+        for r in rows:
+            entry: dict[str, Any] = {
+                "week": r.week,
+                "item": r.item.model_dump(mode="json"),
+            }
+            if args.enrich:
+                e = _enrich_for(r)
+                entry["captain"] = {
+                    "note_status": e.get("captain_note_status"),
+                    "last_meaningful_action": e.get("last_meaningful_action"),
+                    "last_captain_action": e.get("last_captain_action"),
+                    "needs_attention": e.get("needs_attention", False),
+                    "attention_reason": e.get("attention_reason"),
+                    "slice_in_flight": e.get("slice_in_flight"),
+                    "pause_active": e.get("pause_active", False),
+                }
+            payload.append(entry)
         print(json.dumps(payload, indent=2))
         return 0
+
     # Table
     if not rows:
         print("(no active items)")
         return 0
-    headers = ("ID", "WEEK", "STATE", "KIND", "APP", "TITLE")
+    if args.enrich:
+        headers = ("ID", "WEEK", "STATE", "KIND", "APP", "NOTE", "ACTION", "ATTN", "TITLE")
+    else:
+        headers = ("ID", "WEEK", "STATE", "KIND", "APP", "TITLE")
     out_rows: list[tuple[str, ...]] = [headers]
     for r in rows:
         it = r.item
         title = (it.title or it.raw_text or "")[:60]
-        out_rows.append(
-            (
-                it.item_id,
-                r.week,
-                it.state,
-                it.kind,
-                it.target.app_id or "-",
-                title,
+        if args.enrich:
+            e = _enrich_for(r)
+            note = e.get("captain_note_status") or "-"
+            action = (
+                e.get("last_meaningful_action")
+                or e.get("last_captain_action")
+                or "-"
             )
-        )
+            attn = _attn_indicator(e)
+            out_rows.append(
+                (
+                    it.item_id, r.week, it.state, it.kind,
+                    it.target.app_id or "-",
+                    str(note), str(action)[:24], attn, title,
+                )
+            )
+        else:
+            out_rows.append(
+                (
+                    it.item_id, r.week, it.state, it.kind,
+                    it.target.app_id or "-", title,
+                )
+            )
     widths = [max(len(row[i]) for row in out_rows) for i in range(len(headers))]
     for row in out_rows:
         print("  ".join(c.ljust(widths[i]) for i, c in enumerate(row)))
@@ -619,6 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
     from week_intake.active import ACTIVE_STATES
     pa.add_argument("--state", choices=sorted(ACTIVE_STATES), default=None,
                     help="filter to one active state")
+    pa.add_argument("--enrich", action="store_true",
+                    help="add live captain status per row (one HTTP per unique app)")
     pa.set_defaults(func=_cmd_active)
 
     pb = sub.add_parser("brief", help="narrative weekly digest with LLM-generated summary")

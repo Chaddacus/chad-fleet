@@ -292,3 +292,113 @@ def test_list_active_returns_active_row_dataclass(tmp_week_dir) -> None:
     assert isinstance(rows[0], ActiveRow)
     assert rows[0].week == "2026-W19"
     assert rows[0].item.item_id == "wk-1"
+
+
+# ---------------------------------------------------------------------------
+# Cycle 6: list_active_enriched
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch
+
+from week_intake.active import list_active_enriched
+from week_intake.captain_client import CaptainError
+
+
+def _seed_routed(week: str, item_id: str, app_id: str, note_id: str) -> None:
+    folder = WeekFolder(week=week)
+    folder.upsert_item(WeekItem(
+        item_id=item_id, week=week, raw_text="x", title=item_id,
+        kind="wip", state="routed", confidence=0.9,
+        target=RouteTarget(app_id=app_id),
+        captain_note_id=note_id,
+    ))
+
+
+def test_enriched_returns_empty_dict_when_no_active(tmp_week_dir) -> None:
+    rows, enrichment = list_active_enriched(now_week="2026-W19")
+    assert rows == []
+    assert enrichment == {}
+
+
+def test_enriched_keys_by_week_and_item_id(tmp_week_dir) -> None:
+    _seed_routed("2026-W19", "wk-001", "chad-agent", "n-A")
+    bundle = {"admiral_notes_queued": [{"note_id": "n-A"}]}
+    with patch("week_intake.status.get_app_status_http", return_value=bundle):
+        rows, enrichment = list_active_enriched(now_week="2026-W19")
+    assert len(rows) == 1
+    key = (rows[0].week, rows[0].item.item_id)
+    assert key in enrichment
+    assert enrichment[key]["captain_note_status"] == "queued"
+
+
+def test_enriched_dedups_app_get_across_weeks(tmp_week_dir) -> None:
+    _seed_routed("2026-W18", "wk-001", "chad-agent", "n-A")
+    _seed_routed("2026-W19", "wk-001", "chad-agent", "n-B")  # same item_id different week
+    bundle = {"admiral_notes_queued": [{"note_id": "n-A"}, {"note_id": "n-B"}]}
+    with patch(
+        "week_intake.status.get_app_status_http", return_value=bundle
+    ) as m:
+        rows, enrichment = list_active_enriched(now_week="2026-W19")
+    assert m.call_count == 1  # bundle_cache dedups
+    assert len(rows) == 2
+    # Both keys present, distinct.
+    assert ("2026-W18", "wk-001") in enrichment
+    assert ("2026-W19", "wk-001") in enrichment
+    # Both rows reflect the queued status correctly (no cross-talk).
+    assert enrichment[("2026-W18", "wk-001")]["captain_note_status"] == "queued"
+    assert enrichment[("2026-W19", "wk-001")]["captain_note_status"] == "queued"
+
+
+def test_enriched_unreachable_for_linked_state_only(tmp_week_dir) -> None:
+    # routed (captain-linked) + parsed (not linked) — only routed should
+    # appear with note_status=unreachable; parsed shows not_routed and
+    # never triggers the HTTP call.
+    _seed_routed("2026-W19", "wk-001", "dead-app", "n-A")
+    folder = WeekFolder(week="2026-W19")
+    folder.upsert_item(WeekItem(
+        item_id="wk-002", week="2026-W19", raw_text="x", title="wk-002",
+        state="parsed", kind="wip", confidence=0.5,
+    ))
+    with patch(
+        "week_intake.status.get_app_status_http",
+        side_effect=CaptainError("boom"),
+    ) as m:
+        rows, enrichment = list_active_enriched(now_week="2026-W19")
+    # Exactly one HTTP call: the parsed item's app fetch was skipped.
+    assert m.call_count == 1
+    routed_e = enrichment[("2026-W19", "wk-001")]
+    parsed_e = enrichment[("2026-W19", "wk-002")]
+    assert routed_e["captain_note_status"] == "unreachable"
+    assert parsed_e["captain_note_status"] == "not_routed"
+
+
+def test_enriched_state_filter_narrows(tmp_week_dir) -> None:
+    _seed_routed("2026-W19", "wk-001", "app-a", "n-1")
+    folder = WeekFolder(week="2026-W19")
+    folder.upsert_item(WeekItem(
+        item_id="wk-002", week="2026-W19", raw_text="x",
+        kind="wip", state="blocked", confidence=0.5,
+        target=RouteTarget(app_id="app-b"),
+    ))
+    with patch("week_intake.status.get_app_status_http", return_value={}):
+        rows, enrichment = list_active_enriched(
+            now_week="2026-W19", state="routed"
+        )
+    assert [r.item.item_id for r in rows] == ["wk-001"]
+    assert list(enrichment.keys()) == [("2026-W19", "wk-001")]
+
+
+def test_enriched_preserves_row_order(tmp_week_dir) -> None:
+    _seed_routed("2026-W17", "wk-001", "app-a", "n-1")
+    _seed_routed("2026-W18", "wk-001", "app-a", "n-2")
+    _seed_routed("2026-W19", "wk-001", "app-a", "n-3")
+    bundle = {"admiral_notes_queued": [
+        {"note_id": "n-1"}, {"note_id": "n-2"}, {"note_id": "n-3"},
+    ]}
+    with patch("week_intake.status.get_app_status_http", return_value=bundle):
+        rows, enrichment = list_active_enriched(now_week="2026-W19", lookback=4)
+    # Newest first across weeks.
+    assert [r.week for r in rows] == ["2026-W19", "2026-W18", "2026-W17"]
+    # Enrichment matches each row.
+    for r in rows:
+        assert (r.week, r.item.item_id) in enrichment

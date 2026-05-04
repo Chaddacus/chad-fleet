@@ -106,6 +106,53 @@ def test_cli_active_state_filter_blocked(tmp_week, capsys) -> None:
     assert [r["item"]["item_id"] for r in payload] == ["wk-2"]
 
 
+def test_cli_active_enrich_table_adds_columns(tmp_week, capsys) -> None:
+    from unittest.mock import patch
+
+    WeekFolder(week="2026-W19").upsert_item(WeekItem(
+        item_id="wk-001", week="2026-W19", raw_text="x", title="x",
+        kind="wip", state="routed", confidence=0.9,
+        target=RouteTarget(app_id="chad-agent"), captain_note_id="n",
+    ))
+    bundle = {"admiral_notes_queued": [{"note_id": "n"}]}
+    with patch("week_intake.status.get_app_status_http", return_value=bundle):
+        rc = main(["active", "--lookback", "0", "--enrich"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "NOTE" in out
+    assert "ACTION" in out
+    assert "ATTN" in out
+    assert "queued" in out
+
+
+def test_cli_active_enrich_json_has_captain_block(tmp_week, capsys) -> None:
+    from unittest.mock import patch
+
+    WeekFolder(week="2026-W19").upsert_item(WeekItem(
+        item_id="wk-001", week="2026-W19", raw_text="x", title="x",
+        kind="wip", state="routed", confidence=0.9,
+        target=RouteTarget(app_id="chad-agent"), captain_note_id="n",
+    ))
+    bundle = {"admiral_notes_queued": [{"note_id": "n"}]}
+    with patch("week_intake.status.get_app_status_http", return_value=bundle):
+        rc = main(["active", "--lookback", "0", "--enrich", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "captain" in payload[0]
+    assert payload[0]["captain"]["note_status"] == "queued"
+
+
+def test_cli_active_without_enrich_unchanged(tmp_week, capsys) -> None:
+    _seed("2026-W19", "wk-1", "routed")
+    rc = main(["active", "--lookback", "0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # No new columns when --enrich is absent.
+    assert "NOTE" not in out
+    assert "ACTION" not in out
+    assert "ATTN" not in out
+
+
 def test_cli_active_lookback_zero_excludes_prior(tmp_week, capsys) -> None:
     _seed("2026-W18", "wk-old", "routed")
     _seed("2026-W19", "wk-new", "routed")

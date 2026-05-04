@@ -147,8 +147,41 @@ def list_active(
     return rows
 
 
+def list_active_enriched(
+    *,
+    lookback: int = 4,
+    state: str | None = None,
+    base: Path | None = None,
+    now_week: str | None = None,
+) -> tuple[list[ActiveRow], dict[tuple[str, str], dict]]:
+    """Return active rows + per-row captain enrichment.
+
+    The enrichment dict is keyed by (week, item_id) so cross-week duplicate
+    item ids round-trip correctly. Each value is the rollup-emitted row dict
+    (cycle-2 enriched fields: captain_note_status, slice_in_flight,
+    pause_active, last_meaningful_action, attention_reason, ...). Pre-route
+    active items still appear with note_status="not_routed".
+
+    Captain GETs are deduped across weeks by rollup's local bundle_cache —
+    one HTTP call per unique app_id even if items span multiple weeks.
+    """
+    from week_intake.status import rollup
+
+    rows = list_active(lookback=lookback, state=state, base=base, now_week=now_week)
+    if not rows:
+        return rows, {}
+    items = [r.item for r in rows]
+    report = rollup(items)
+    report_items = report.get("items") or []
+    enrichment: dict[tuple[str, str], dict] = {}
+    for row, rep in zip(rows, report_items):
+        enrichment[(row.week, row.item.item_id)] = rep
+    return rows, enrichment
+
+
 __all__ = [
     "ACTIVE_STATES",
     "ActiveRow",
     "list_active",
+    "list_active_enriched",
 ]
