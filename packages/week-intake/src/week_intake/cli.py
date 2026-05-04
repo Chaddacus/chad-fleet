@@ -273,6 +273,33 @@ def _cmd_clarify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_note(args: argparse.Namespace) -> int:
+    from week_intake.lifecycle import TransitionError, record_note
+
+    week = args.week or iso_week_for()
+    text = args.text
+    if text is None or not text.strip():
+        print("ERROR: --text is required and must be non-empty", file=sys.stderr)
+        return 1
+    try:
+        item = record_note(week, args.item_id, text)
+    except TransitionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == "json":
+        print(json.dumps(item.model_dump(mode="json"), indent=2, default=str))
+    else:
+        latest = item.notes[-1]
+        snippet = latest.text if len(latest.text) <= 80 else latest.text[:77] + "..."
+        print(f"{item.item_id} ({item.week}): note recorded ({len(item.notes)} total)")
+        print(f"  {snippet}")
+    return 0
+
+
 def _cmd_lifecycle(transition: str):
     """Factory: returns a _cmd_* fn for complete/abandon/reopen."""
 
@@ -631,6 +658,13 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--week", default=None)
     ps.add_argument("--format", choices=("json", "table"), default="table")
     ps.set_defaults(func=_cmd_status)
+
+    pn = sub.add_parser("note", help="record an ad-hoc observation on a WeekItem (any state)")
+    pn.add_argument("item_id")
+    pn.add_argument("--text", required=True, help="note body (required, non-empty)")
+    pn.add_argument("--week", default=None)
+    pn.add_argument("--format", choices=("json", "table"), default="table")
+    pn.set_defaults(func=_cmd_note)
 
     for trans in ("complete", "abandon", "reopen"):
         helptext = {
