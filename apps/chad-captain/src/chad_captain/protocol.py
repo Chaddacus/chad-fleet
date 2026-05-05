@@ -233,6 +233,11 @@ class CaptainLogEntry(BaseModel):
         # local main + clears roadmap to begin a new cycle.
         "pull_request_merged",
         "post_merge_cycle",
+        # Cycle B: captain detected its open PR is in a non-mergeable state
+        # (DIRTY/BLOCKED — typically merge conflicts or failing required
+        # checks). Emitted ONCE per pending PR; admiral resolves manually.
+        # Suppresses re-firing of roadmap_complete + pull_request_opened.
+        "pr_conflict",
     ]
     verdict: CaptainVerdict | None = None
     rubric_delta_pp: float | None = None

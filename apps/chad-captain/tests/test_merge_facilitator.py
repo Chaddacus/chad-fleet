@@ -10,6 +10,7 @@ import pytest
 
 from chad_captain.merge_facilitator import (
     CmdResult,
+    PR_ALREADY_EXISTS_MARKER,
     auto_merge_pr,
     branch_exists_local,
     current_branch,
@@ -538,3 +539,71 @@ def test_pr_title_includes_slice_count() -> None:
     title = format_pr_title(app_id="x", roadmap=rm)
     # 2 done slices (skipped not counted)
     assert "2 slices" in title
+
+
+# ---------------------------------------------------------------------------
+# Cycle B — get_pr_state requests mergeStateStatus + open_pull_request marker
+# ---------------------------------------------------------------------------
+
+
+def test_get_pr_state_requests_merge_state_status(tmp_path: Path) -> None:
+    """get_pr_state must include mergeStateStatus in the gh JSON field list."""
+    payload = (
+        '{"state":"OPEN","number":1,"url":"https://x",'
+        '"mergeStateStatus":"DIRTY","mergeable":"CONFLICTING"}'
+    )
+    with patch("chad_captain.merge_facilitator.subprocess.run") as mock_run:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=payload, stderr="",
+        )
+        state, raw = get_pr_state(repo_path=str(tmp_path), head="codex/x")
+
+    assert state == "OPEN"
+    assert raw["mergeStateStatus"] == "DIRTY"
+    assert raw["mergeable"] == "CONFLICTING"
+    # Inspect the gh command we issued — must include mergeStateStatus.
+    called_cmd = mock_run.call_args.args[0]
+    json_arg_idx = called_cmd.index("--json")
+    field_csv = called_cmd[json_arg_idx + 1]
+    assert "mergeStateStatus" in field_csv
+    assert "mergeable" in field_csv
+
+
+def test_open_pull_request_marks_already_existed(tmp_path: Path) -> None:
+    """When gh exits 1 with 'already exists', summary starts with marker."""
+    create_fail = subprocess.CompletedProcess(
+        args=[], returncode=1, stdout="",
+        stderr="a pull request for branch ... already exists:\nhttps://x/pull/9\n",
+    )
+    view_ok = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout='{"url":"https://x/pull/9","number":9,"state":"OPEN"}',
+        stderr="",
+    )
+    with patch("chad_captain.merge_facilitator.subprocess.run",
+               side_effect=[create_fail, view_ok]):
+        res = open_pull_request(
+            repo_path=str(tmp_path),
+            base="main", head="codex/x",
+            title="t", body="b", draft=False,
+        )
+    assert res.ok is True
+    assert res.summary.startswith(PR_ALREADY_EXISTS_MARKER)
+    assert res.stdout == "https://x/pull/9"
+
+
+def test_open_pull_request_fresh_open_does_not_have_marker(tmp_path: Path) -> None:
+    """Successful fresh PR open does NOT carry the already-exists marker."""
+    fresh_ok = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout="https://x/pull/100\n", stderr="",
+    )
+    with patch("chad_captain.merge_facilitator.subprocess.run",
+               side_effect=[fresh_ok]):
+        res = open_pull_request(
+            repo_path=str(tmp_path),
+            base="main", head="codex/y",
+            title="t", body="b", draft=False,
+        )
+    assert res.ok is True
+    assert not res.summary.startswith(PR_ALREADY_EXISTS_MARKER)

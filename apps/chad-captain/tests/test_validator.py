@@ -2731,3 +2731,218 @@ def test_backlog_skips_already_shipped(tmp_path: Path) -> None:
     assert shipped == []
     bl2 = read_feature_backlog(ws)
     assert bl2.by_id("fb-001").shipped_in == "PR#1"  # not overwritten
+
+
+# ===========================================================================
+# Cycle B — PR-conflict 3-source loop break
+# ===========================================================================
+
+
+def test_pr_conflict_emits_log_and_admiral_note_once(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the captain's pending PR is OPEN+DIRTY, _maybe_handle_pr_merge:
+      - returns True (suppresses the re-emit fall-through)
+      - emits ONE pr_conflict log entry
+      - writes ONE admiral_note
+    A second tick must NOT re-emit either (de-dup by reading log history).
+    """
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        list_unread_admiral_notes,
+        read_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pr_url = "https://github.com/owner/repo/pull/174"
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id="test-app", slice_id=None, kind="pull_request_opened",
+            rationale="PR opened",
+            references={"pr_url": pr_url, "branch": "codex/captain-test-app"},
+        ),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: (
+            "OPEN",
+            {
+                "number": 174, "url": pr_url,
+                "mergeStateStatus": "DIRTY", "mergeable": "CONFLICTING",
+                "isDraft": False,
+            },
+        ),
+    )
+    # Mock these so they fail loudly if reached (they shouldn't be).
+    sentinel_calls = {"push": 0, "open_pr": 0}
+
+    def fake_push(**_kw):
+        sentinel_calls["push"] += 1
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_open_pr(**_kw):
+        sentinel_calls["open_pr"] += 1
+        return mf.CmdResult(ok=True, summary="ok", stdout=pr_url)
+
+    monkeypatch.setattr(mf, "push_captain_branch", fake_push)
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    # Tick 1: should emit pr_conflict + admiral_note, suppress re-emit.
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    pr_conflict_entries = [e for e in log if e.kind == "pr_conflict"]
+    assert len(pr_conflict_entries) == 1
+    entry = pr_conflict_entries[0]
+    assert entry.references["merge_state_status"] == "DIRTY"
+    assert entry.references["pr_url"] == pr_url
+
+    notes = list_unread_admiral_notes(ws)
+    assert len(notes) == 1
+    note_body = notes[0].read_text()
+    assert "DIRTY" in note_body
+    assert pr_url in note_body
+    # Suppression: roadmap_complete + new pull_request_opened did NOT fire
+    # this tick (push and open_pr were never called).
+    assert sentinel_calls["push"] == 0
+    assert sentinel_calls["open_pr"] == 0
+    # Count check: only the 1 seeded pull_request_opened exists; no new one.
+    pr_opened_count = sum(1 for e in log if e.kind == "pull_request_opened")
+    assert pr_opened_count == 1
+    # No roadmap_complete was emitted this tick (handler didn't run).
+    assert all(e.kind != "roadmap_complete" for e in log)
+
+    # Tick 2: same conflict state — must NOT re-emit pr_conflict.
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log2 = read_captain_log(ws)
+    pr_conflict_entries_2 = [e for e in log2 if e.kind == "pr_conflict"]
+    assert len(pr_conflict_entries_2) == 1, "pr_conflict must not re-emit"
+
+
+def test_roadmap_complete_log_dedups_within_run(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two consecutive ticks with all-done roadmap must NOT emit two
+    roadmap_complete entries when no intervening terminal event happened.
+    """
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log, read_captain_log, write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=False,  # keep test simple — just probe the dedup
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log_after_tick1 = read_captain_log(ws)
+    rc1 = [e for e in log_after_tick1 if e.kind == "roadmap_complete"]
+    assert len(rc1) == 1
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log_after_tick2 = read_captain_log(ws)
+    rc2 = [e for e in log_after_tick2 if e.kind == "roadmap_complete"]
+    # Cycle B: dedup. Second tick must NOT add another roadmap_complete.
+    assert len(rc2) == 1
+
+
+def test_pull_request_opened_suppressed_when_already_exists(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When open_pull_request reports PR_ALREADY_EXISTS_MARKER, the
+    pull_request_opened log entry must NOT be appended again."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log, read_captain_log, write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    pr_url = "https://github.com/owner/repo/pull/9"
+
+    # No pre-existing pull_request_opened entry — _maybe_handle_pr_merge
+    # short-circuits (no pending_pr_url) and we fall through to
+    # _handle_roadmap_complete. open_pull_request reports already-exists.
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(
+            ok=True,
+            summary=f"{mf.PR_ALREADY_EXISTS_MARKER} (#9, OPEN)",
+            stdout=pr_url,
+        ),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    pr_opened = [e for e in log if e.kind == "pull_request_opened"]
+    # Suppression: marker means "no fresh open" → no log entry.
+    assert len(pr_opened) == 0
+    # roadmap_complete still fires (first time).
+    assert any(e.kind == "roadmap_complete" for e in log)
