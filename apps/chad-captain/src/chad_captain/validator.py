@@ -213,15 +213,26 @@ def run_verify_gate(
     repo_path: str,
     verify_cmd: str | None,
     timeout_seconds: int = 300,
+    verify_host: "VerifyHost | None" = None,
 ) -> tuple[bool, str]:
     """Run the per-app verify command (e.g. 'make check', 'npm test').
 
     Returns ``(passed, summary)`` — when ``verify_cmd`` is None/empty the gate
     is skipped (passed=True). Tails stderr/stdout on failure so the captain
     log captures *why* CI failed without dumping the full build log.
+
+    PR12 R3#7: when ``verify_host`` is provided, the command runs on the
+    remote host via SSH instead of in repo_path locally. SSH must be
+    passwordless; captain does not prompt.
     """
     if not verify_cmd or not verify_cmd.strip():
         return True, "no verify_cmd configured"
+    if verify_host is not None:
+        return _run_verify_remote(
+            verify_host=verify_host,
+            verify_cmd=verify_cmd,
+            timeout_seconds=timeout_seconds,
+        )
     try:
         proc = subprocess.run(  # noqa: S602 — operator-configured local cmd
             verify_cmd,
@@ -241,6 +252,59 @@ def run_verify_gate(
     return True, f"verify_cmd passed ({verify_cmd!r})"
 
 
+def _run_verify_remote(
+    *,
+    verify_host: "VerifyHost",
+    verify_cmd: str,
+    timeout_seconds: int,
+) -> tuple[bool, str]:
+    """PR12 R3#7: SSH to verify_host and run verify_cmd in remote_workdir.
+
+    Builds an ssh argv (no shell=True so we don't double-quote things)
+    and lets ssh handle the remote shell. Captures stdout+stderr; on
+    non-zero exit returns the tail so the captain log shows why CI
+    failed remotely.
+    """
+    import shlex
+    target = f"{verify_host.user}@{verify_host.hostname}"
+    remote_cmd = (
+        f"cd {shlex.quote(verify_host.remote_workdir)} && {verify_cmd}"
+    )
+    ssh_argv: list[str] = ["ssh"]
+    if verify_host.identity_file:
+        ssh_argv += ["-i", verify_host.identity_file]
+    if verify_host.port and verify_host.port != 22:
+        ssh_argv += ["-p", str(verify_host.port)]
+    for opt in verify_host.ssh_options:
+        ssh_argv += ["-o", opt]
+    # Default to BatchMode=yes so ssh won't hang waiting for a password
+    # prompt — captain has no terminal.
+    if not any(o.startswith("BatchMode=") for o in verify_host.ssh_options):
+        ssh_argv += ["-o", "BatchMode=yes"]
+    ssh_argv += [target, remote_cmd]
+
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv list, no shell injection
+            ssh_argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"verify_cmd (remote {target}) timed out after {timeout_seconds}s"
+        )
+    except OSError as e:
+        return False, f"ssh failed to launch: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1024:].strip()
+        return False, (
+            f"verify_cmd (remote {target}) exit {proc.returncode}: "
+            f"{tail[:500]}"
+        )
+    return True, f"verify_cmd passed (remote {target}: {verify_cmd!r})"
+
+
 def apply_verify_gate(
     result: ValidationResult,
     *,
@@ -248,12 +312,16 @@ def apply_verify_gate(
     repo_path: str,
     verify_cmd: str | None,
     timeout_seconds: int = 300,
+    verify_host: "VerifyHost | None" = None,
 ) -> ValidationResult:
     """Run the verify gate against an accepted slice and downgrade if CI fails.
 
     Only runs for verdicts where goose claims success (``accept``, ``soft_accept``).
     For already-rejecting verdicts the gate is a no-op — the slice is going to
     be retried/escalated regardless.
+
+    PR12: ``verify_host`` propagated to run_verify_gate so apps configured
+    with a remote VerifyHost run their verify_cmd over SSH.
     """
     if result.verdict not in ("accept", "soft_accept"):
         return result
@@ -261,6 +329,7 @@ def apply_verify_gate(
         repo_path=repo_path,
         verify_cmd=verify_cmd,
         timeout_seconds=timeout_seconds,
+        verify_host=verify_host,
     )
     if passed:
         return result
@@ -426,6 +495,7 @@ def validate_app_completion(
             )
 
     # C1 verify gate: per-app `verify_cmd` must pass for the slice to ship.
+    # PR12: pass verify_host so remote-CI captains run gate over SSH.
     if reg_app is not None:
         result = apply_verify_gate(
             result,
@@ -433,6 +503,7 @@ def validate_app_completion(
             repo_path=repo_path,
             verify_cmd=reg_app.verify_cmd,
             timeout_seconds=reg_app.verify_timeout_seconds,
+            verify_host=reg_app.verify_host,
         )
 
     return result
@@ -657,6 +728,7 @@ def captain_tick(
                         repo_path=repo_path,
                         verify_cmd=reg_app.verify_cmd,
                         timeout_seconds=reg_app.verify_timeout_seconds,
+                        verify_host=reg_app.verify_host,
                     )
                     if not pre_passed:
                         verdict_kind: CaptainVerdict = (

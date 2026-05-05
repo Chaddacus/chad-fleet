@@ -3918,3 +3918,136 @@ def test_default_validator_is_unaffected_by_verify_pre_check(
     # NOT the new "BEFORE custom validator" message.
     assert "BEFORE custom validator" not in rejects[0].rationale
     assert "verify_cmd" in rejects[0].rationale
+
+
+# ---------------------------------------------------------------------------
+# PR12 R3#7 v6 §validation close: remote verify_cmd via SSH
+# ---------------------------------------------------------------------------
+
+
+def test_run_verify_gate_local_path_unchanged(tmp_path: Path) -> None:
+    """No verify_host => existing local subprocess path."""
+    from chad_captain.validator import run_verify_gate
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd="true", timeout_seconds=10,
+    )
+    assert passed is True
+    assert "passed" in summary
+
+
+def test_run_verify_gate_with_verify_host_invokes_ssh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """verify_host present => ssh argv built + executed."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = "remote ok"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(
+        hostname="ci.example.com", user="builder", port=2222,
+        identity_file="/keys/id", remote_workdir="/srv/build",
+        ssh_options=["ConnectTimeout=10"],
+    )
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=120, verify_host=vh,
+    )
+    assert passed is True
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    assert "-i" in argv and "/keys/id" in argv
+    assert "-p" in argv and "2222" in argv
+    assert "-o" in argv and "ConnectTimeout=10" in argv
+    # BatchMode default added since user didn't set it.
+    assert "BatchMode=yes" in argv
+    # Target + remote command at the end.
+    assert "builder@ci.example.com" in argv
+    assert any("cd /srv/build && make check" in a for a in argv)
+
+
+def test_run_verify_gate_remote_failure_returns_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote non-zero exit => passed=False with stderr tail."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    class FakeProc:
+        returncode = 2
+        stdout = ""
+        stderr = "build broke at line 42"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+
+    vh = VerifyHost(hostname="h")
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=10, verify_host=vh,
+    )
+    assert passed is False
+    assert "exit 2" in summary
+    assert "build broke at line 42" in summary
+
+
+def test_run_verify_gate_remote_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SSH timeout => passed=False with a timeout summary."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(hostname="h")
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=5, verify_host=vh,
+    )
+    assert passed is False
+    assert "timed out" in summary
+
+
+def test_run_verify_gate_user_batchmode_not_double_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If user already specified BatchMode, captain must not duplicate it."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(hostname="h", ssh_options=["BatchMode=no"])
+    run_verify_gate(
+        repo_path="/x", verify_cmd="t", timeout_seconds=5, verify_host=vh,
+    )
+    batch_modes = [a for a in captured["argv"] if a.startswith("BatchMode=")]
+    assert batch_modes == ["BatchMode=no"]
