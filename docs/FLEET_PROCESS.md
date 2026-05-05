@@ -1,6 +1,6 @@
-# Fleet Process — End-to-End Spec (v4)
+# Fleet Process — End-to-End Spec (v6)
 
-> **Status:** v4 after codex R1 (22) + R2 (10) + R3 (10) addressed. **Ready for Chad's approval.**
+> **Status:** v6 — codex R4 (13 findings on v5 additions) addressed. v5 = Chad-requested SMS + planning/validation expansion; v6 = sealed the gaps R4 caught (trigger collision, scope-change mid-flight, L1-vs-L2 ordering, scaffold preimage backup, noob-root verify, SMS P0/P1 tiers, reply grammar, backlog generation lock).
 
 ## Engine prep work (R3 found 5 HIGH engine bugs the spec assumed away)
 
@@ -14,8 +14,18 @@ Before any Twin daemon code can ship, the chad-captain engine needs these change
 | Dynamic extras discovery with safe import semantics (R3#8 + R2#2) | `extras/__init__.py` | New `get_extras` does `importlib.import_module` + `importlib.invalidate_caches()` after scaffold install. ONLY swallows `ModuleNotFoundError` when `e.name == f"chad_captain.extras.{slug}"`; everything else escalates. | ~60 |
 | Synthetic canary captain support (R3#5) | `cli.py` (new `chad-captain canary` subcommand) | Twin's engine-repair canary needs a no-push/no-merge dispatch mode that runs one tick against a deliberately-empty repo, not "the lowest-stakes paused captain." | ~150 |
 | JSONL append/tail safety (R3#6) | `protocol.py` (append helpers) + new tail helper in `apps/chad-twin-daemon/jsonl_tail.py` | Use `os.open(O_APPEND)` + single `os.write` per encoded line; tailer buffers until newline so partial-line reads don't checkpoint past unterminated bytes. Diff snippets > 4KB go in referenced files, not log JSON. | ~150 |
+| Replan rate limit + sanity helpers (v5 §6) | `replanner.py` + `protocol.py` + `cli.py` | `_slice_shape_signature` for drained-replan sanity; per-captain replan-count tracking (5/hour cap); `chad-captain backlog reprioritize` subcommand; verify_cmd-required validation in `apps_registry.py` | ~120 |
+| Twilio SMS sender (v5 §10) | `apps/chad-twin-daemon/sms.py` (NEW) | Twilio REST POST to send SMS; rate limiter (3/hour, 8/day) with collapse-to-digest fallback; FAIL-CLOSED to Zoom DM on Twilio outage | ~80 |
+| Cross-task artifact schema validation (v5 §validation) | `apps/chad-captain-scaffold/artifacts.py` | Schema register + validate at put/get; Pydantic JSON Schema emit | ~100 |
+| Verify-cmd enforcement OUTSIDE custom validator (v6 §validation L2) | `validator.py::_resolve_validate_fn` | Wrap custom validator so verify_cmd always runs first and short-circuits on failure; custom hook receives verify-passed result only | ~60 |
+| `RegisteredApp.verify_host` for SSH/remote verify (v6 §validation close) | `apps_registry.py` + new `run_verify` helper | New VerifyHost Pydantic model; ssh execution with timeout, stdout/stderr capture, exit propagation | ~120 |
+| Trigger queue + scope-change mid-flight handling (v6 §6.1, §6.3.1) | `replanner.py` + `protocol.py` + `daemon.py` | `pending_replan_reasons.json` queue with priority order; `send_goose_abort_signal` (SIGTERM via tracked PID); `superseded_by_scope_change` slice status | ~100 |
+| Backlog generation lock (v6 §6.3) | `protocol.py` (FeatureBacklog model) | Monotonic generation int + flock; replanner reads-then-checks before write | ~40 |
+| `slice_complete.removed_tests_reason` field + diff-deletion check (v6 test gate) | `protocol.py` + `validator.py` | New SliceComplete field; validator inspects diff for test-file/test-function deletions; PR body trailer copy | ~80 |
+| `twin_holds/` directory + close handler integration (v6 §validation L4) | `protocol.py` (paths) + close handler | New AppWorkspace.twin_holds_dir; close blocks if any unexpired hold | ~30 |
+| Producer-pending state for split_task (v6 §6.4) | `validator.py` (roadmap_complete flow) | Check task manifest produces against artifact bus before opening PR | ~50 |
 
-**Total engine prep:** ~560 LOC + tests. Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
+**Total engine prep:** ~1,340 LOC + tests. Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
 > **Goal:** Chad pushes a task; the fleet returns a finished task. Chad is the LAST stop, not stops 3, 5, 7, and 9.
 
 ---
@@ -559,12 +569,38 @@ phase 2: VERIFY (against staging via PYTHONPATH overlay — R3#3 fix)
   - On failure → mark manifest.phase = "FAILED_VERIFY", surface in AGGREGATE, exit
   - Update manifest.phase = "VERIFIED"
 
-phase 3: INSTALL (atomic, in dependency order)
-  - For each file in files_to_create:
-      - Copy staging → live path via tempfile + rename
-      - Append to manifest.installed_files
-  - Init workspace dir; write backlog seed
-  - Update manifest.phase = "INSTALLED"
+phase 3: INSTALL (atomic, in dependency order — R4 fix: explicit create vs replace + preimage backup)
+
+  Manifest carries TWO file lists:
+    files_to_create: paths that MUST NOT exist before install (errors if present)
+    files_to_replace: paths that DO exist; each entry has preimage_sha256 +
+                      preimage_backup_path (~/.chad/fleet/scaffolds/<txn_id>/preimages/<path>)
+
+  Before install:
+    - Refuse install if any files_to_create path already exists (suggests
+      stale prior scaffold; admin must clean up scaffolds/failed/ first)
+    - For every path in files_to_replace: copy current contents to
+      preimage_backup_path (do NOT use git HEAD — worktree may be dirty
+      with pending Twin daemon edits)
+
+  Install loop:
+    - For each file in files_to_create:
+        - Copy staging → live path via tempfile in same dir + os.replace
+        - Append to manifest.installed_files
+    - For each file in files_to_replace:
+        - Copy staging → live path via tempfile in same dir + os.replace
+        - Append to manifest.replaced_files (already preimaged)
+
+  Init workspace dir; write backlog seed (always create-only)
+  Update manifest.phase = "INSTALLED"
+
+  ROLLBACK (any phase ≥ 3 failure):
+    - For each path in installed_files: delete (back to non-existent)
+    - For each path in replaced_files: copy preimage_backup_path → live path
+      via tempfile + os.replace (restores EXACT prior contents, ignores git HEAD)
+    - Verify by sha256 match against preimage_sha256
+    - On preimage restore failure → escalate IMMEDIATELY to Chad (this is
+      the worst-case scenario; live src is in unknown state)
 
 phase 4: REGISTER
   - Write registry entry with enabled=false (atomic + flock)
@@ -640,17 +676,139 @@ Future captains in this class+profile register without asking.
 
 ---
 
-### Step 6 — PLAN (existing — captain replanner; Twin auto-approves; R1#1, #15 fixes)
+### Step 6 — PLAN / REPLAN (Twin auto-approves; v5 expanded — full lifecycle, sanity criteria, backlog ownership)
 
-**Goal:** Captain reads backlog, generates roadmap.
+**Goal:** Captain reads backlog, generates roadmap. Twin owns the planning lifecycle end-to-end without bouncing to Chad except on persistent failure.
 
-**Twin's role:**
-1. After SCAFFOLD installs the captain, Twin runs `chad-captain replan --app <app_id> --trigger initial`.
-2. Twin inspects the roadmap (sanity: slice count matches backlog, no slice exceeds estimated_slice_count from backlog by >2x, no slice has empty system_prompt).
-3. **Twin auto-approves** roadmap and flips `auto_replan=True` if sanity passes (R1#1 fix).
-4. If sanity fails → Twin re-runs replan with hint context, retries up to 2x. After 2 failures, escalate to Chad with the failed roadmap.
+#### 6.1 — Replan trigger taxonomy
 
-**S6/S7 setup dependencies (R1#15 fix):** Step 5 (specifically S5c) is the explicit owner of: workspace init, `feature_backlog.json` write, `captain_branch` setup, plist install. Step 6 only handles replan-and-inspect.
+The captain's `replan_if_needed` runs in 6 distinct contexts. **Triggers can collide on the same tick** (e.g. drained AND kill_replan, or scope_change arriving while drained is queued). v6 fix: triggers coalesce into a per-captain queue, processed under the engine lock with explicit priority.
+
+**Trigger priority (highest first):**
+```
+scope_change > kill_replan > publish > low_yield_streak > drained > initial
+```
+
+**Coalescing rule:** when multiple triggers fire within a 60s window OR while a replan is already in progress, they collapse into `~/.chad/fleet/apps/<app_id>/pending_replan_reasons.json` (a list of {trigger, reason, queued_at}). Captain processes ONE replan per lock acquisition, applying the highest-priority queued trigger and discarding lower-priority duplicates of the same trigger.
+
+**`drained` suppression:** ignored if any of (a) current_slice exists and is in flight, (b) pending higher-priority trigger queued, (c) replan rate-limit hit (§6.5).
+
+Each trigger has its own sanity criteria and Twin response:
+
+| Trigger | Source | Sanity criteria | Twin failure handling |
+|---------|--------|-----------------|------------------------|
+| `initial` | After SCAFFOLD install | (A) slice count ≤ backlog item count × 2; (B) every slice has non-empty system_prompt + user_prompt; (C) every slice cites at least one backlog item by id; (D) total slice count ≥ 1 | Re-replan with hint up to 2x; if still failing, leave registry.enabled=false + escalate to Chad as first-of-class follow-up |
+| `drained` | Engine, when current_slice empty AND auto_replan=True | (A) slice count > 0 (else `roadmap_complete` flow fires instead); (B) all sanity (A)-(D) above; (C) NEW: backlog has been re-prioritized vs last roadmap (no infinite-loop replans of the same shape) | Re-replan once with "produce a different shape" hint; if still same-shape, mark roadmap_complete + close task |
+| `kill_replan` | Validator verdict on goose timeout / structural slice failure | All sanity (A)-(D); plus retry_context from validator threaded into next slice's user_prompt | Re-replan once with the killed slice's failure as input; if still failing, escalate |
+| `low_yield_streak` | Engine circuit breaker on N soft-accept verdicts | (A)-(D); plus rubric_delta_pp distribution shows new dimensions being moved (not just the saturated ones) | Re-replan ONCE with "rubric saturated; expand backlog" hint; if rubric still saturated → escalate to Chad with explicit "extend rubric or close task" question |
+| `publish` | Manual via `chad-captain replan --trigger publish` (e.g. T1 Spark publish prep) | App-defined; replanner's prompt switches to publish-mode template | Same as initial; admiral controls so escalation ping is implicit |
+| `scope_change` | Twin, after Chad's clarification answer changes task scope | (A)-(D); plus diff against previous roadmap shows ≥1 changed slice | Re-replan with hint = the new scope; if no slices change, log warning (Chad's answer didn't materially affect plan) |
+
+#### 6.2 — Sanity criteria (decoded)
+
+```python
+def replan_sanity(roadmap, backlog, prev_roadmap=None) -> SanityResult:
+    if not roadmap.slices:
+        return Fail("empty roadmap")
+    if len(roadmap.slices) > len(backlog.items) * 2:
+        return Fail(f"roadmap explodes backlog ({len(roadmap.slices)} slices for {len(backlog.items)} items)")
+    for s in roadmap.slices:
+        if not s.system_prompt.strip() or not s.user_prompt.strip():
+            return Fail(f"slice {s.slice_id} has empty prompt")
+        if not s.references.get("backlog_item_id"):
+            return Fail(f"slice {s.slice_id} doesn't cite a backlog item")
+    if prev_roadmap is not None:
+        # drained-replan: must materially differ from previous
+        if _slice_shape_signature(roadmap) == _slice_shape_signature(prev_roadmap):
+            return Fail("drained replan produced identical shape — backlog stuck")
+    return Ok()
+```
+
+`_slice_shape_signature` = sorted tuple of (slice_id, references.backlog_item_id) — catches "captain replanning the same 3 slices over and over."
+
+#### 6.3 — Backlog editing (who owns what)
+
+**Backlog generation lock (R4 fix):** every `feature_backlog.json` carries a monotonic `generation` integer. Replanner reads `generation` at start; if it changes during the replan, replanner discards its work, enqueues a `backlog_changed` trigger, and exits. Backlog mutations bump `generation` under exclusive flock on the same lockfile.
+
+| Action | Owner | Triggers replan? |
+|--------|-------|------------------|
+| Initial backlog seed | SCAFFOLD (from research-derived items) | Yes — `initial` trigger |
+| Mid-flight item priority change | Twin (during REVIEW step), via `chad-captain backlog reprioritize` | No — affects NEXT replan; bumps `generation` |
+| Mid-flight item add | Twin only when research surfaces a new dependency; via `chad-captain backlog add --task-id <id>` | No — added items wait for next `drained` trigger; bumps `generation` |
+| Mid-flight item remove | Twin only when an item becomes unreachable (e.g. external dep deleted); writes admiral_note explaining why | No — but pruned current_slice if active; bumps `generation` |
+| Mid-flight item shipped | Captain marks via merge of slice's PR (existing engine behavior) | No; bumps `generation` |
+| Scope change from Chad clarification | Twin updates backlog from clarification answer; THEN triggers `scope_change` replan | YES — explicit |
+| Roadmap manual edit | NEVER. Roadmap is regenerated, not edited. | n/a |
+
+**Hard rule:** Twin NEVER hand-edits the roadmap. The roadmap is the captain's artifact, regenerated by replanner. Twin can edit the BACKLOG (which feeds replanner) and trigger replan.
+
+#### 6.3.1 — Scope change during mid-flight slice (R4 fix)
+
+When a `scope_change` trigger fires while a slice is dispatched:
+
+```python
+def handle_scope_change(captain, new_scope_diff):
+    active_slice = read_current_slice(captain.workspace)
+    if active_slice is None:
+        update_backlog(new_scope_diff); enqueue_trigger("scope_change"); return
+
+    # Does the scope change touch a backlog item the active slice references?
+    affected = scope_diff_touches(new_scope_diff, active_slice.references.backlog_item_id)
+
+    if affected:
+        # Pause captain, signal goose-runner to abort current dispatch
+        pause_captain(captain.app_id, reason="scope_change_supersedes_active_slice")
+        send_goose_abort_signal(active_slice.slice_id)  # SIGTERM to goose subprocess
+        # Mark slice superseded so validator doesn't process its eventual SliceComplete
+        write_slice_status(active_slice, "superseded_by_scope_change")
+        update_backlog(new_scope_diff)
+        enqueue_trigger("scope_change")
+        unpause_captain(captain.app_id)
+    else:
+        # Unrelated scope change: defer
+        update_backlog(new_scope_diff)
+        enqueue_trigger("scope_change")  # processes after active slice validates
+```
+
+Engine prep additions (PR5): `pause_captain`/`unpause_captain` already exist; need `send_goose_abort_signal` (SIGTERM to running goose subprocess via PID tracked in slice state) and `superseded_by_scope_change` status handling in validator (it just discards the eventual SliceComplete instead of running validation chain).
+
+#### 6.4 — Cross-captain replan (split_task DAG)
+
+When task X = subtasks A + B (B blocked_by A):
+- Captain A finishes its backlog. Twin sees A's `roadmap_complete` event.
+- Twin checks: does any subtask have `blocked_by: [A]`? Yes → B.
+- Twin runs `chad-captain artifact get --task <task_id> --consumes <name>` for each B `consumes` entry; verifies all artifacts present.
+- Twin triggers B's `initial` replan with the artifact paths injected into the user_prompt context.
+- B's captain replans accordingly; Twin reviews per (6.1) sanity.
+
+If A produces an artifact B needs but A's roadmap_complete is reached without that artifact → Twin emits `artifact_missing` escalation. Twin first attempts to re-replan A with a hint to produce the missing artifact (one retry); if still missing, escalate to Chad.
+
+**Drained-close suppression (R4 fix):** when a captain participates in a split_task as a producer, the engine's `roadmap_complete` flow checks the manifest at `~/.chad/fleet/tasks/<task_id>/manifest.json` for that captain's `produces` declarations. Any declared artifact missing from the bus → roadmap_complete is BLOCKED (no PR open, no close); captain stays in `producer_pending` state until the artifact is in the bus or Twin re-replans with the missing-artifact hint. This prevents "drained-close while consumer is still waiting" race.
+
+#### 6.5 — Replan failure backstop (anti-infinite-loop)
+
+Per-captain replan rate limit: max 5 replans in any 1-hour window. Hitting the limit:
+- Pause captain
+- Surface in AGGREGATE as "replan thrashing"
+- Twin escalates to Chad with the last 5 replan attempts + their sanity failures
+- Resume only on Chad's intervention OR after 1-hour cooldown (whichever first)
+
+This catches the case where the captain's replanner prompt is broken and produces invalid roadmaps faster than Twin can reject them.
+
+#### 6.6 — S6/S7 setup dependencies (R1#15 fix retained)
+
+Step 5 (specifically S5c) is the explicit owner of: workspace init, `feature_backlog.json` write, `captain_branch` setup, plist install. Step 6 only handles replan-and-inspect.
+
+#### 6.7 — Engine support needed (PR5 engine prep additions)
+
+| What | File | LOC |
+|------|------|-----|
+| `chad-captain backlog reprioritize` subcommand | `cli.py` | ~40 |
+| `chad-captain backlog add` subcommand (already exists; verify task_id field support) | `cli.py` | ~20 (audit) |
+| Replan rate-limit tracking in workspace state | `protocol.py` (new field on AppWorkspace) | ~30 |
+| `_slice_shape_signature` helper for drained-replan sanity | `replanner.py` | ~30 |
+
+Add to PR5 engine prep total: ~120 LOC + tests.
 
 ---
 
@@ -859,12 +1017,54 @@ If a captain or task fails the green predicate, it MUST appear inline. The roll-
 | Condition | When Twin pings Chad | Channel | Bundled? |
 |-----------|----------------------|---------|----------|
 | FIRST captain of a new task_class | Immediate | Zoom DM | NO |
-| Captain emitted `escalation_raised` Twin can't resolve | Within 15min | Zoom DM | NO |
-| Authority-boundary action needed (deploy, external comms, money, destructive) | Immediate | Zoom DM | NO |
-| Clarification needed (Step 4) | Immediate | Zoom DM | NO |
+| Captain emitted `escalation_raised` Twin can't resolve | Within 15min | Zoom DM (+ SMS if priority=high) | NO |
+| Authority-boundary action needed (deploy, external comms, money, destructive) | Immediate | Zoom DM (+ SMS if priority=high or production-touching) | NO |
+| Clarification needed (Step 4), priority=high | Immediate | Zoom DM **+ SMS** | NO |
+| Clarification needed (Step 4), priority=medium/low | Immediate | Zoom DM | NO |
 | TASK COMPLETE — final sign-off (all PRs bundled) | Daily AGGREGATE or immediate if priority=high | Zoom DM | YES |
-| Engine repair PR (behavior-changing) | Immediate | Zoom DM | NO |
+| Engine repair PR (behavior-changing, blocklist path) | Immediate | Zoom DM (+ SMS if all captains paused) | NO |
 | All captains green, nothing to decide | NEVER | n/a | n/a |
+
+**Twilio SMS channel** (NEW in v5; P0/P1 tiers + reply grammar fixed in v6 per R4):
+
+- Twilio creds via env: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `CHAD_PHONE_NUMBER`
+
+**Two priority tiers (R4 fix — guarantees on the high-stakes path):**
+
+| Tier | Triggers | Rate behavior |
+|------|----------|---------------|
+| **P0 — emergency** | Production deploy, destructive op, all-captains-paused, security incident, Twilio outage flagged | Reserve 1 SMS per hour for P0; bypass digest collapsing unless daily hard cap (8/day) is fully exhausted. P0 SMS body always includes `EMERGENCY:` prefix. |
+| **P1 — high** | High-priority clarifications, captain escalations Twin can't resolve, first-of-class captain | Subject to 3/hour, 8/day rate limit. Excess collapses into digest. |
+
+When the daily 8/day cap is exhausted: P0 still sends if any of the 1/hour P0 reserve remains; P1 stops sending SMS entirely until midnight ET, Zoom DMs continue immediately, AGGREGATE flags "SMS daily cap reached."
+
+**SMS body format** (160-char single-segment; reply grammar matches body — R4 fix):
+```
+CHAD-FLEET P1 q-2026-05-04-001
+T3 captain stuck on .chad-captain.t3.json
+Reply: Y q-2026-05-04-001 or N q-2026-05-04-001 (or Zoom Re: q-2026-05-04-001)
+```
+
+**Reply grammar (case-insensitive, exact regex):**
+```
+^(?P<answer>y|yes|n|no)\s+(?P<question_id>q-[\w-]+)$
+```
+Anything that doesn't match → Twin replies via Zoom asking for clarification, does NOT mutate the chad_action_queue.
+
+**Inbound polling (R4 fix — concrete cursor + dedupe):**
+- State at `~/.chad/fleet/sms_inbound_cursor.json` carries `{last_sid: str, last_date_sent_iso: str}`
+- Twin polls Twilio `Messages` resource every 5min: `GET /2010-04-01/Accounts/<sid>/Messages.json?To=<TWILIO_FROM_NUMBER>&From=<CHAD_PHONE_NUMBER>&DateSent>=<last_date_sent_iso>&PageSize=20`
+- For each new SID > last_sid: parse via reply grammar; on match → advance chad_action_queue with answer; persist raw inbound to twin journal with SID
+- After processing: update cursor under flock
+- **Dedupe by SID** (Twilio guarantees unique SIDs per message) — replays are no-ops
+- **Auth failure / network error**: log to twin journal; mark SMS reply ingestion `degraded` in AGGREGATE if polling fails for >15min; AGGREGATE shows "SMS replies degraded — answer via Zoom"
+
+**Suppressed escalation traceability (R4 fix):**
+- When digest collapses ≥1 P1 escalations, persist to `~/.chad/fleet/sms_suppressed_escalations.json` with the list of suppressed `question_id`s + suppression reason (rate_limit | daily_cap)
+- AGGREGATE drill: `twin status --sms-suppressed` shows suppressed items with their original Zoom DM links
+- Suppressed items are ALWAYS in their Zoom DM thread; SMS suppression never loses the actual question
+
+**FAIL-CLOSED**: SMS send failure → log to twin journal, fall back to Zoom DM, NEVER silently drop. Twilio unreachable for >15min during ANY P0 → emit P0 SMS retry every 60s until reachable OR escalate to fleet health alarm in AGGREGATE.
 
 **Hard NO list:**
 - Per-PR ready-for-review pings (bundled in task complete) (R1#17)
@@ -1019,7 +1219,7 @@ ONE Zoom DM batch when Twin reaches the implementation gate:
 
 1. **Inbox surface confirmed:** `~/.chad/fleet/inbox/` + chad-agent Zoom-to-md hook. ✅ default; reply "different" if not.
 2. **Aggregate schedule confirmed:** 06:00 ET daily + on-demand. Reply "different" if not.
-3. **Escalation channel:** Zoom DM only (default), OR add iMessage/SMS for priority=high?
+3. **Escalation channel:** Zoom DM + Twilio SMS for priority=high (locked in v5 per Chad's ask). Confirm Twilio creds available; SMS rate limit 3/hour + 8/day; reply ingestion via Zoom thread (Y/N via SMS supported but not required).
 4. **Twin daemon hosting:** noob-root systemd is the proposed default (MacBook launchd doesn't run while asleep). Confirm or pick MacBook with explicit understanding of sleep gaps.
 5. **Authority-boundary list:** confirm the 7-item list above is complete and correct.
 6. **First-of-class definition:** is "task_class" defined by classifier domain tags (e.g. "manuscript-publishing", "infrastructure", "marketing-content"), or by repo, or admiral-defined?
@@ -1057,6 +1257,173 @@ These failure modes break "Chad is LAST stop only":
 
 ---
 
+## Validation taxonomy (v5 — unified definition of "validated")
+
+The fleet has SIX distinct validation surfaces. Each gates a different transition. None is optional; none replaces another.
+
+### Layer 1 — Slice verify_cmd (per-slice repo gate)
+
+**What:** The captain's repo `verify_cmd` (e.g. `make check`, `npm test`, `uv run pytest`) runs after goose finishes editing.
+
+**Gates:** Slice acceptance. Non-zero exit → captain validator downgrades verdict to `reject_retry` or `reject_hard`.
+
+**Owner:** chad-captain engine (`apply_verify_gate` in validator.py — exists).
+
+**Required for every captain:** YES. Every RegisteredApp.verify_cmd must be set; SCAFFOLD refuses to register a captain with empty verify_cmd. (Engine prep PR5 needs to add this validation to apps_registry.)
+
+**Failure mode:** verify_cmd times out → reject_retry; non-zero exit → reject_retry first attempt, reject_hard on retry.
+
+### Layer 2 — Custom validators (per-app contract gate)
+
+**What:** Optional `validator_module` per RegisteredApp. Adds app-specific gates ON TOP OF Layer 1 (e.g. T3's Django fixture FK validator).
+
+**Gates:** Slice acceptance, AFTER Layer 1 verify_cmd passes. Custom validator can ADD failures; cannot SUPPRESS verify_cmd failure.
+
+**Engine enforcement (R4 fix — fixed in PR5):** the engine wraps custom validators so Layer 1 always runs first and its failure short-circuits before the custom hook fires. Order:
+
+```
+default structural validation (validate_slice)
+  → verify_cmd gate (apply_verify_gate, ENGINE-OWNED)
+  → custom validator hook (validator_module.validate_app_completion)
+  → scorecard rubric
+```
+
+The custom validator receives the verify-gate-passed result; it can downgrade verdict to reject_retry/reject_hard but cannot reverse a verify_cmd failure into accept. Engine prep PR5 refactors `validator.py::_resolve_validate_fn` so verify_cmd is enforced in the wrapper, NOT inside the custom validator.
+
+**Owner:** Per-app captain code. Default chain when `validator_module` is None.
+
+**Required for every captain:** NO. Default chain is sufficient unless the app has fragile contracts (fixtures, migrations, contract tests).
+
+**Catalog of validators we ship in v1:**
+- `default` — engine chain (validate_slice → reuse-regression → verify-gate)
+- `t3_marketing` — fixture FK gate (PR4, shipped)
+- (future) `migration_safety` — gates Django/Postgres migrations against `--check --dry-run`
+- (future) `contract_test` — gates API surface changes against pact/openapi diff
+- (future) `schema_lock` — rejects schema changes that break consumer fixtures across the fleet
+
+Adding a new validator = new file in `apps/chad-captain/src/chad_captain/validators/<name>.py` exposing `validate_app_completion(...)`. SCAFFOLD selects validator based on profile + research (e.g. django-app profile + research found Django migrations → wire `migration_safety`).
+
+### Layer 3 — Scoreboard rubric (per-captain trend gate)
+
+**What:** Per-app extras dimensions (Step 5.2 dynamic discovery) + baseline rubric. Runs on every accept verdict; produces `rubric_delta_pp`.
+
+**Gates:** Captain `auto_merge_min_delta` (default 0.0 = no regression allowed). Engine's existing `auto_merge` flow uses this. Twin's review uses it as input to the green predicate.
+
+**Owner:** chad-captain engine (`scorecard.py` + `extras/`).
+
+**Required for every captain:** YES (baseline always runs). Per-app extras are optional but strongly recommended (every captain we've shipped has them).
+
+### Layer 4 — Twin review (per-slice operator gate)
+
+**What:** Twin reads captain_log.jsonl entries and applies the review rubric (Step 8 table: accept silent / reject_retry silent / reject_hard inspect / escalate respond).
+
+**Gates:** Whether Twin acts on the captain's verdict (escalate to Chad, repair fleet, do nothing). Does NOT override captain's verdict — Twin is observer + responder, not the engine's validator.
+
+**Twin verdict authority (R4 fix):**
+- Twin **CANNOT** turn a captain reject into accept. Captain's reject is binding for the slice.
+- Twin **CAN** block close on observed risk after captain accept (e.g. accept verdict but Twin's review surfaced a security smell, performance regression on a tracked benchmark, or unconsumed admiral_note from another captain). When Twin blocks, it writes `~/.chad/fleet/apps/<app_id>/twin_holds/<slice_id>.json` with `reason`, `surfaces_in_aggregate=true`, `expires_at` (default: +24h auto-resolve unless renewed). Close logic (Step 11) reads twin_holds and refuses to close while any unexpired hold exists.
+- Twin **CAN** pause a captain on observed risk; pause is recorded under same `twin_hold` semantics so AGGREGATE shows it.
+
+**Owner:** Twin daemon (S6 review.py).
+
+### Layer 5 — Scaffold VERIFY phase (generated-captain gate)
+
+**What:** Phase 2 of the scaffold transaction. Runs the chad-captain test suite against a PYTHONPATH overlay containing the staging files.
+
+**Gates:** Whether the scaffold INSTALL phase fires. VERIFY fail → no install, no registry write.
+
+**Owner:** chad-captain-scaffold (S5b transaction.py).
+
+**What it actually validates:**
+- Generated `extras/<slug>.py` imports cleanly and `factory()` returns valid DimensionScores
+- Generated `validators/<slug>.py` (if any) imports cleanly and exposes `validate_app_completion`
+- The full chad-captain test suite still passes with the staging files in PYTHONPATH (catches break-by-overlay regressions)
+- py_compile succeeds on every generated .py
+- Backlog seed JSON validates against the schema
+
+### Layer 6 — Engine repair canary (engine-fix gate)
+
+**What:** Synthetic `_canary` captain runs one tick on the patched engine.
+
+**Gates:** Whether Twin auto-merges an engine repair PR + unpauses the real fleet.
+
+**Owner:** Twin daemon + new `chad-captain canary` CLI (PR5 engine prep).
+
+### Cross-task contract validation (NEW in v5)
+
+When `split_task` produces an artifact handoff (subtask A produces `fixture:marketing_posts_001.json`, subtask B consumes it), the artifact bus validates the contract:
+
+1. **At put time:** captain A calls `chad-captain artifact put --name <n> --schema <schema_id>`. Bus checks the file matches the registered schema (e.g. JSON validates against a stored Pydantic schema). Missing schema → put refused.
+2. **At get time:** captain B calls `chad-captain artifact get --name <n> --expected-schema <schema_id>`. Schema mismatch → get refused, B's slice fails verify, B replans with the contract error in retry_context.
+3. **Schemas live at** `~/.chad/fleet/tasks/<task_id>/schemas/<schema_id>.json` (Pydantic-emitted JSON Schema). SCAFFOLD generates a schema for every `produces` declaration that has a structured shape; freeform artifacts (markdown, text logs) skip schema validation.
+
+**Schemaless artifacts are allowed** but flagged in AGGREGATE under "fleet health" — too many schemaless cross-captain handoffs = future contract drift.
+
+### What "validated for close" means (Step 11 refined; R4 multi-captain fix)
+
+A task closes (Step 11) ONLY when ALL of:
+- Every backlog item with this task_id (across EVERY participating captain in a split_task DAG) is `status=shipped` or `status=deferred-with-justification`
+- Every PR labeled `Closes-Task: <task_id>` is merged
+- Every admiral_note referencing this task_id is consumed (across all participating captains)
+- **For every participating captain's repo HEAD:** `verify_cmd` exits 0 (Twin runs once per captain at close to confirm the merge of the last PR didn't break anything; uses `RegisteredApp.verify_host` for noob-root or remote captains, see below)
+- For each artifact in `~/.chad/fleet/tasks/<task_id>/artifacts/`: schema validation re-runs and passes (catches the case where a producer's schema was updated mid-flight, leaving a stale artifact)
+- **For every participating captain's scoreboard:** last validate entry shows `accept` (no `escalate`/`reject_hard` lingering)
+- **No unexpired `twin_hold` records** exist for any participating captain (Layer 4)
+
+### Remote-captain verify execution (R4 fix — `verify_host` field)
+
+Captains whose repos live on noob-root (T4 ES bots) or other remote hosts need explicit verify execution config on `RegisteredApp`:
+
+```python
+class VerifyHost(BaseModel):
+    kind: Literal["local", "ssh"]
+    host: str | None = None          # required when kind=ssh
+    cwd: str                          # path to repo root on the target host
+    command: str                      # the verify command (overrides verify_cmd if set)
+    timeout_seconds: int = 300
+
+class RegisteredApp(BaseModel):
+    ...
+    verify_host: VerifyHost | None = None  # None = use local verify_cmd
+```
+
+Engine helper (PR5) `run_verify(reg_app)`:
+- `kind=local` → existing `apply_verify_gate` against repo_path
+- `kind=ssh` → `ssh <host> "cd <cwd> && <command>"` with timeout, captured stdout/stderr, exit-code propagation
+- SSH failures (network, auth) → return as verify failure with stderr reason; AGGREGATE flags as fleet health (host unreachable)
+
+If any check fails → close blocks, surfaces in AGGREGATE as "task ready except <list>", Twin attempts auto-fix (re-run verify, re-validate schema, refresh from origin), escalates to Chad if auto-fix fails.
+
+### Test-coverage requirements (NEW in v5)
+
+The fleet does NOT enforce a numeric coverage threshold. It enforces:
+
+**Test count regression gate (R4 fix — deterministic enforcement at slice validation time, NOT commit-message parsing):**
+
+The captain validator inspects the slice's `git diff` directly:
+- Detects deleted test functions/files in the diff
+- Requires `slice_complete.removed_tests_reason: str | None` field (NEW field on `SliceComplete`, added in PR5 engine prep) when deletions are present
+- If diff has deletions AND `removed_tests_reason` is None/empty → `reject_retry` with retry_context = "test deletions require removed_tests_reason in slice_complete or PR-body trailer"
+- When the captain creates the PR, `Removed-tests: <reason>` is copied from `slice_complete.removed_tests_reason` into the PR body trailer (Twin verifies at close)
+- Twin's close handler parses PR body trailers; missing trailer when slice_complete recorded deletions → close blocks
+
+This is enforceable because (a) the diff is structured data the validator already reads, (b) `slice_complete` is the goose-runner's authoritative output, (c) PR body is generated from slice_complete by the engine — not free-form by goose.
+
+**Test count growth signal**: scoreboard's `captain_test_count_growing` extra (already exists for captain-self) is REUSED as the cross-captain pattern. Each captain gets a `<repo>_test_count_growing` extra at SCAFFOLD time, baseline = HEAD test count at registration, target = grow by ≥1 test per shipped backlog item.
+
+**No coverage tools required** (pytest-cov, jest --coverage, etc.) — the count signal is sufficient and avoids tool-specific config drift.
+
+Captains that genuinely need higher rigor (e.g. the future `federal-rfp` captain) opt into a stricter validator (Layer 2) with a coverage-threshold gate.
+
+### What the fleet does NOT validate (deliberate gaps)
+
+- **Performance / latency**: out of scope. If a captain ships a slow regression, scorecard shouldn't catch it; that's a per-app benchmark suite (admiral discipline).
+- **Security scanning**: out of scope for v1. If a captain ships secrets, gitleaks runs in CI on the PR (existing org-wide hook). Twin trusts CI.
+- **Cross-captain test pollution**: out of scope. Each captain runs its own verify_cmd in its own repo cwd; no shared test state.
+- **Documentation completeness**: out of scope. Captains may produce undocumented code; admiral catches in PR review.
+
+---
+
 ## What this DOESN'T solve
 
 - Multi-agent within a captain (one slice → multiple workers): existing captain behavior, not in scope here
@@ -1064,3 +1431,5 @@ These failure modes break "Chad is LAST stop only":
 - Distributed fleet across machines: single-machine MVP; multi-machine is future work
 - Cost tracking per captain: out of scope for v1; add as a captain extra later
 - Visual dashboards beyond aggregate DM: chad-dashboard already exists for visual; Twin's aggregate is the chat-surface roll-up
+- Performance/latency regressions: per-app benchmarks, not fleet-level
+- Security scanning: trusts org-wide CI hooks (gitleaks etc.)
