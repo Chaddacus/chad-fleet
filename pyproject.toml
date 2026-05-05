@@ -27,4 +27,5 @@ members = [
     "packages/captain-core",
     "packages/week-intake",
     "apps/chad-captain",
+    "apps/chad-captain-scaffold",
 ]
