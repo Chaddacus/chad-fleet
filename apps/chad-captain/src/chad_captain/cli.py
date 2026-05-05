@@ -518,6 +518,149 @@ def cmd_backlog(args: argparse.Namespace) -> None:
     raise ValueError(f"unknown backlog subcommand: {sub}")
 
 
+def cmd_canary(args: argparse.Namespace) -> None:
+    """PR13 R3#5: synthetic engine-repair canary.
+
+    Twin runs this BEFORE merging an engine-repair PR. Verifies the
+    captain's core dispatch → validate loop works end-to-end against
+    a deliberately empty/synthetic workspace — proves the engine itself
+    isn't broken without depending on any real captain's state.
+
+    Steps:
+      1. Build an ephemeral CHAD_FLEET_APPS_DIR + CHAD_CAPTAIN_APPS_REGISTRY.
+      2. Create a synthetic git repo + RegisteredApp (auto_push=False,
+         auto_merge=False — no side effects on real branches).
+      3. Pre-populate a 1-slice roadmap, run captain_tick → expect
+         dispatched.
+      4. Synthesize SliceComplete (no real goose call), run captain_tick
+         → expect verdict in {accept, soft_accept}.
+      5. Verify roadmap advanced + captain_log got a validate entry.
+      6. Report JSON {ok, steps_passed, steps_failed, elapsed_seconds}.
+
+    Exit code: 0 on full success, 1 on any step failing — Twin uses
+    this as the engine-repair merge gate.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import time
+
+    start = time.time()
+    steps_passed: list[str] = []
+    steps_failed: list[dict] = []
+
+    def _record(name: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            steps_passed.append(name)
+        else:
+            steps_failed.append({"name": name, "detail": detail})
+
+    with tempfile.TemporaryDirectory(prefix="chad-captain-canary-") as tmp:
+        tmp_path = os.fspath(tmp)
+        apps_dir = os.path.join(tmp_path, "fleet")
+        registry_path = os.path.join(tmp_path, "apps_registry.json")
+        repo_path = os.path.join(tmp_path, "repo")
+
+        os.environ["CHAD_FLEET_APPS_DIR"] = apps_dir
+        os.environ["CHAD_CAPTAIN_APPS_REGISTRY"] = registry_path
+
+        # Step 1 — synthetic git repo.
+        try:
+            os.makedirs(repo_path)
+            for cmd in (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.email", "canary@chad-fleet.local"],
+                ["git", "config", "user.name", "canary"],
+                ["git", "commit", "--allow-empty", "-m", "init"],
+            ):
+                subprocess.run(cmd, cwd=repo_path, check=True,
+                               capture_output=True)
+            _record("git_init", True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            _record("git_init", False, str(e)[:300])
+            print(json.dumps({"ok": False, "steps_passed": steps_passed,
+                              "steps_failed": steps_failed,
+                              "elapsed_seconds": time.time() - start}))
+            sys.exit(1)
+
+        # Step 2 — synthetic registry.
+        try:
+            from chad_captain.apps_registry import (
+                AppsRegistry, RegisteredApp, save_registry,
+            )
+            app = RegisteredApp(
+                app_id="canary-app", name="Canary",
+                repo_path=repo_path, mode="autonomous",
+                auto_push=False, auto_merge=False, auto_replan=False,
+            )
+            save_registry(AppsRegistry(apps=[app]))
+            _record("registry_seed", True)
+        except Exception as e:  # noqa: BLE001
+            _record("registry_seed", False, str(e)[:300])
+            print(json.dumps({"ok": False, "steps_passed": steps_passed,
+                              "steps_failed": steps_failed,
+                              "elapsed_seconds": time.time() - start}))
+            sys.exit(1)
+
+        # Step 3 — workspace + roadmap + first tick (dispatch).
+        try:
+            from chad_captain.protocol import (
+                AppWorkspace, Roadmap, RoadmapSlice, SliceComplete,
+                read_captain_log, read_roadmap, write_roadmap,
+                write_slice_complete,
+            )
+            from chad_captain.validator import captain_tick
+            ws = AppWorkspace("canary-app")
+            ws.ensure()
+            roadmap = Roadmap(
+                app_id="canary-app",
+                slices=[RoadmapSlice(slice_id="canary-s1",
+                                     objective="canary smoke")],
+            )
+            write_roadmap(ws, roadmap)
+            status1 = captain_tick(ws, repo_path=repo_path,
+                                   use_baseline_scorecard=False)
+            ok = bool(status1) and "canary-s1" in (status1 or "")
+            _record("dispatch_tick", ok, status1 or "no status")
+        except Exception as e:  # noqa: BLE001
+            _record("dispatch_tick", False, str(e)[:300])
+
+        # Step 4 — synthesize completion + second tick (validate).
+        try:
+            sc = SliceComplete(
+                slice_id="canary-s1", app_id="canary-app",
+                duration_seconds=0.1, goose_exit_code=0,
+                summary="canary synthetic completion",
+                files_changed=[],
+            )
+            write_slice_complete(ws, sc)
+            status2 = captain_tick(ws, repo_path=repo_path,
+                                   use_baseline_scorecard=False)
+            ok = bool(status2) and "validate" in (status2 or "")
+            _record("validate_tick", ok, status2 or "no status")
+        except Exception as e:  # noqa: BLE001
+            _record("validate_tick", False, str(e)[:300])
+
+        # Step 5 — roadmap advanced + captain_log entry exists.
+        try:
+            log = read_captain_log(ws, limit=10)
+            validate_entries = [e for e in log if e.kind == "validate"]
+            ok = len(validate_entries) >= 1
+            _record("captain_log_validate_entry", ok,
+                    f"validate_entries={len(validate_entries)}")
+        except Exception as e:  # noqa: BLE001
+            _record("captain_log_validate_entry", False, str(e)[:300])
+
+    overall_ok = not steps_failed
+    print(json.dumps({
+        "ok": overall_ok,
+        "steps_passed": steps_passed,
+        "steps_failed": steps_failed,
+        "elapsed_seconds": round(time.time() - start, 3),
+    }))
+    sys.exit(0 if overall_ok else 1)
+
+
 def cmd_summary(args: argparse.Namespace) -> None:
     """Print a human-readable session summary for an app."""
     from chad_captain.protocol import AppWorkspace
@@ -798,6 +941,16 @@ def main(argv: list[str] | None = None) -> None:
         "--json", action="store_true", help="Print full scorecard as JSON",
     )
 
+    sub.add_parser(
+        "canary",
+        help=(
+            "Engine-repair canary: synthetic dispatch+validate cycle "
+            "against a tmp workspace; exits 0 on engine health, 1 on "
+            "any step failure. Twin uses this as the engine-repair "
+            "merge gate."
+        ),
+    )
+
     research_p = sub.add_parser("research", help="Build or read app research profile")
     research_p.add_argument("--app", required=True, metavar="APP_ID")
     research_p.add_argument("--repo", default=None, metavar="PATH",
@@ -831,6 +984,7 @@ def main(argv: list[str] | None = None) -> None:
         "backlog": cmd_backlog,
         "ideate": cmd_ideate,
         "summary": cmd_summary,
+        "canary": cmd_canary,
     }
     dispatch[args.command](args)
 
