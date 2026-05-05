@@ -1,6 +1,6 @@
-# Fleet Process — End-to-End Spec (v6)
+# Fleet Process — End-to-End Spec (v8)
 
-> **Status:** v6 — codex R4 (13 findings on v5 additions) addressed. v5 = Chad-requested SMS + planning/validation expansion; v6 = sealed the gaps R4 caught (trigger collision, scope-change mid-flight, L1-vs-L2 ordering, scaffold preimage backup, noob-root verify, SMS P0/P1 tiers, reply grammar, backlog generation lock).
+> **Status:** v8 — codex R5 (6 findings on v7) addressed. R5 caught 4 HIGH issues: hosting topology gap (Twin on Linode can't tail MacBook logs), on-demand AGGREGATE blind to background spin-ups, safety rails miss shared-resource access, personal-vs-company Zoom fallback unsafe.
 
 ## Engine prep work (R3 found 5 HIGH engine bugs the spec assumed away)
 
@@ -24,8 +24,18 @@ Before any Twin daemon code can ship, the chad-captain engine needs these change
 | `slice_complete.removed_tests_reason` field + diff-deletion check (v6 test gate) | `protocol.py` + `validator.py` | New SliceComplete field; validator inspects diff for test-file/test-function deletions; PR body trailer copy | ~80 |
 | `twin_holds/` directory + close handler integration (v6 §validation L4) | `protocol.py` (paths) + close handler | New AppWorkspace.twin_holds_dir; close blocks if any unexpired hold | ~30 |
 | Producer-pending state for split_task (v6 §6.4) | `validator.py` (roadmap_complete flow) | Check task manifest produces against artifact bus before opening PR | ~50 |
+| Cost projection for new captains (v7 auth-boundary #3) | `apps/chad-twin-daemon/cost_projection.py` (NEW) | Estimate captain LLM spend from research output (token estimates × backlog item count); gate scaffold install at $20/day | ~80 |
+| Captain spin-up rate limit + concurrency ceiling (v7) | `apps/chad-twin-daemon/captain_throttle.py` (NEW) + state file | 5 new/24h + 12 concurrent caps; queue overflow; `twin captain unthrottle` admin override | ~120 |
+| Personal Zoom S2S client (v7) | `apps/chad-twin-daemon/zoom_personal.py` (NEW) | Reuses chad-agent's S2S OAuth flow but with `CHAD_PERSONAL_ZOOM_*` creds; routed to personal account JID | ~80 |
+| Approved-classes registry deprecated (v7 first-of-class removed) | DELETE: `~/.chad/captain/approved_classes.json` references | Per-captain approval gate gone; profile registry takes its place | -40 |
+| Hosting topology: WorkerBinding + log_sink_url + heartbeat (v8 R5#1) | `apps_registry.py` + `goose_runner.py` + new `apps/chad-twin-daemon/event_sink.py` | WorkerBinding model on RegisteredApp; HTTPS POST event sink on Twin; goose-runner streams events to sink instead of local file write; heartbeat poller + 5min watchdog | ~290 |
+| Activity cursor + delta DMs (v8 R5#2) | `apps/chad-twin-daemon/aggregate.py` + new `activity_cursor.py` | Persisted cursor; "Changed since last viewed" header; delta DM emission on task transitions; `--since` drill flag | ~150 |
+| Resource access manifest + capability registry (v8 R5#3) | `apps/chad-twin-daemon/research.py` (manifest field) + new `apps/chad-captain/src/chad_captain/capabilities.py` + scaffold integration | ResourceAccess model; capability registry with flock; default-deny credential provisioner; scaffold reject when manifest entry not approved | ~260 |
+| Personal-Zoom-only fail-closed (v8 R5#4) | `apps/chad-twin-daemon/zoom_personal.py` (refactor) + `main.py` startup self-check | Refuse `CHAD_ZOOM_*` fallback in TWIN_ENV=prod; identity match against users/me at startup; degraded-mode if mismatch | ~80 |
+| Cost projection + reconciliation (v8 R5#5) | `apps/chad-twin-daemon/cost_projection.py` (already counted) + new pricing table + reconciler | p50/p95 estimator with confidence; daily reconciliation against captain_log token usage; 2-day overrun auto-pause | ~120 (delta over earlier ~80) |
+| Captain task state machine + queue UX (v8 R5#6) | `apps/chad-twin-daemon/captain_throttle.py` (already counted) + new state.json schema | 12 explicit states; per-task state.json; queue position + earliest_start; `--captain-queue` drill | ~60 (delta over earlier ~120) |
 
-**Total engine prep:** ~1,340 LOC + tests. Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
+**Total engine prep:** ~2,540 LOC + tests. Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
 > **Goal:** Chad pushes a task; the fleet returns a finished task. Chad is the LAST stop, not stops 3, 5, 7, and 9.
 
 ---
@@ -61,19 +71,161 @@ Before any Twin daemon code can ship, the chad-captain engine needs these change
 
 ---
 
-## Authority boundary (definitive list)
+## Authority boundary (definitive list — v7 LOCKED)
 
 Twin escalates to Chad ONLY for:
 
 1. **Production deploys** to user-facing surfaces (Spark publish to KDP, chadacys.com push, customer-running services)
 2. **External communications** (any non-Chad recipient: customers, prospects, public posts, federal RFP responses)
-3. **Money** (any payment, subscription change, contractor invoice, AWS spend > $50/event)
+3. **Money** (any payment, subscription change, contractor invoice, AWS spend > $50/event, projected captain LLM cost > $20/day)
 4. **Destructive ops** that can't be reverted by `git revert` (DB drops, force-push to main, secret rotation)
-5. **New captain registration** ONLY the FIRST time a `task_class` is seen (definition below; subsequent tasks of same class auto-register without ping; see Step 5)
+5. **New scaffold profile needed** — when no existing scaffold profile fits the task's repo_shape (e.g. first encounter with `polyglot` shape, or a brand-new repo type). This is NOT first-of-class captain — it's first-of-INFRASTRUCTURE. (v7 change per Chad: per-captain approval removed; per-profile approval kept because it's actually building new tooling.)
 6. **Genuine direction ambiguity** (research + classifier confidence both < 0.7)
 7. **Final task completion sign-off** (bundled, not per-PR — R1#17 fix)
 
 Everything else: Twin acts on its own. PR review for non-authority-boundary work is BUNDLED into final task sign-off, not a per-PR ping.
+
+## Hosting topology (v8 — R5#1 fix: ONE canonical log/event plane)
+
+The fleet has TWO hosts and ONE log plane:
+
+| Host | Role | What lives here |
+|------|------|-----------------|
+| **Linode VPS (chad-personal)** | Twin daemon + canonical log plane | Twin daemon process; ALL captain workspaces (`~/.chad/fleet/apps/<app_id>/`); ALL captain_log.jsonl; admiral_notes/; chad_action_queue.json; task artifacts; apps_registry.json; approved profiles registry |
+| **Chad's MacBook** | goose-runner workers ONLY | Captain repos (where goose actually edits code); goose subprocesses; per-repo verify_cmd execution. NO captain state. |
+
+**Event flow:**
+1. Linode Twin determines a slice should dispatch.
+2. Linode writes `current_slice.json` to the canonical workspace (Linode disk).
+3. Twin sends a dispatch RPC to MacBook's goose-runner over SSH or HTTPS (mTLS via Tailscale).
+4. MacBook goose-runner clones/pulls the repo, runs goose, captures output.
+5. MacBook streams events back to Linode in real time: each captain_log entry is a single SSH/HTTPS POST that Linode appends to the canonical `captain_log.jsonl` (uses the JSONL append safety helper from PR5).
+6. MacBook writes `slice_complete.json` back to Linode via the same channel.
+7. Twin reads the canonical log and reviews.
+
+**Canonical log writes ALWAYS happen on Linode.** MacBook never holds authoritative state. If MacBook is offline, dispatched slices queue on Linode (`pending_dispatch_queue`); they execute when MacBook reconnects.
+
+**Heartbeat + log_sink_url contract:**
+
+Every `RegisteredApp` carries:
+```python
+class WorkerBinding(BaseModel):
+    worker_id: str           # e.g. "chad-macbook"
+    worker_host: str         # SSH hostname or HTTPS URL via Tailscale
+    log_sink_url: str        # Where worker POSTs events; always Linode-side
+    last_heartbeat_at: datetime | None  # Updated every 60s by worker
+```
+
+**FAIL-CLOSED:**
+- Captain cannot activate (`enabled=true`) unless `log_sink_url` is reachable from BOTH the captain's worker AND Twin.
+- Worker missing heartbeat for > 5min → captain auto-pauses; Twin surfaces in next AGGREGATE delta DM.
+- Log sink unreachable from worker → worker spools events to local `~/.chad/fleet/.pending-events/` and replays on reconnect; never drops.
+
+**Engine prep (PR5) additions:**
+- `WorkerBinding` model on `RegisteredApp` (~30 LOC)
+- HTTPS event sink endpoint on Twin daemon (~120 LOC) — receives JSONL POSTs, validates worker auth token, appends atomically
+- Goose-runner refactor: events stream to log_sink_url instead of local file write (~80 LOC change to existing goose_runner.py)
+- Heartbeat poller in worker + Twin watchdog (~60 LOC)
+
+Total hosting-topology engine prep: ~290 LOC (added to PR5 budget below).
+
+### Captain spin-up policy (v7 — parallel, no per-captain approval)
+
+Per Chad's directive: captains spin up in parallel as tasks arrive. NO approval gate per captain. Twin auto-scaffolds, auto-registers, captain manages the task, captain elevates updates to Twin (admiral), Twin only escalates to Chad on the 7 items above.
+
+Safety rails on parallel captain spin-up (5 layers — v8 added resource manifest per R5#3):
+
+- **Profile gate**: if scaffold profile doesn't fit (auth-boundary #5), Twin builds the profile first and asks Chad once. Future captains using that profile spin up freely.
+- **Cost gate**: research projects expected captain LLM cost. > $20/day projected → auth-boundary #3 ping. Below threshold → spin up freely. (See cost projection schema in §Step 3.)
+- **Resource access gate (R5#3 fix)**: research output MUST include a `resource_access_manifest`. Captain default-deny for shared-resource WRITE/ADMIN access; only the resources explicitly approved in the manifest get credentials provisioned. Detail below.
+- **Rate limit**: max 5 NEW captains spun up per 24h window. Hit the cap → queue with explicit state (see below).
+- **Resource ceiling**: max 12 concurrent active captains. Hit the cap → queue, do NOT spin up.
+
+#### Captain task states (R5#6 fix — explicit queue UX)
+
+Every task carries a `state` field at `~/.chad/fleet/tasks/<task_id>/state.json`:
+
+| State | Meaning |
+|-------|---------|
+| `intake_received` | Inbox watcher saw the file |
+| `classifying` | Step 2 in progress |
+| `researching` | Step 3 in progress |
+| `awaiting_chad` | Step 4 clarification queued |
+| `scaffold_pending` | Cleared all gates, waiting for next available scaffold lock |
+| `queued_rate_limit` | Hit 5/24h cap; will spin up at `earliest_start_at` (rolling window) |
+| `queued_concurrency` | Hit 12-concurrent ceiling; will spin up when an active captain completes |
+| `queued_capability` | Pending Chad's auth-boundary approval on resource_access_manifest |
+| `active` | Captain registered, dispatching slices |
+| `paused` | Captain paused (cost overrun, missing heartbeat, twin_hold, etc.) |
+| `completed` | All checks in §"validated for close" passed |
+| `failed` | Unrecoverable; manifest in `~/.chad/fleet/tasks/<task_id>/failure_reason.txt` |
+
+When a task transitions into `queued_*`, Twin emits a SMALL delta DM (NOT full aggregate):
+```
+TASK QUEUED t9-quux state=queued_rate_limit
+position=1, earliest_start=06:45 (window resets)
+override: twin captain unthrottle t9-quux
+```
+
+`twin status --captain-queue` (NEW drill, separate from `--queue` which is the chad action queue) shows the captain throttle queue with positions + earliest-start times.
+
+#### Resource access manifest (R5#3 fix — closes the shared-infra hole)
+
+A captain that fits an existing profile, costs <$20/day, and stays under caps can STILL be dangerous if it writes to a shared database, modifies a secret store, changes GitHub repo settings, or mutates remote infra without ever triggering a deploy/destructive boundary. v8 fix: research must enumerate every shared resource the captain plans to touch + access mode.
+
+```python
+class ResourceAccess(BaseModel):
+    resource_id: str          # e.g. "postgres://prod-db", "github:Chaddacus/chadacys.com",
+                              #      "1password:vault-shared", "ssh:noob-root", "saas:zoom-api"
+    kind: Literal["repo", "db", "secret_store", "cloud_account", "ssh_host", "saas_api"]
+    mode: Literal["read", "write", "admin", "destructive"]
+    rationale: str            # WHY captain needs this access
+```
+
+Research output (`research.json`) adds:
+```json
+{
+  "resource_access_manifest": [
+    {"resource_id": "github:Chaddacus/es-bots", "kind": "repo", "mode": "write", "rationale": "captain commits + opens PRs on its own repo"},
+    {"resource_id": "ssh:noob-root", "kind": "ssh_host", "mode": "read", "rationale": "verify_cmd runs `systemctl status` on existing services; no mutation"}
+  ]
+}
+```
+
+**Default-deny scaffold rules:**
+- Captain runtime gets credentials ONLY for resources in its manifest at the manifest's mode.
+- `mode=write` to a non-captain-owned repo → auth-boundary #1 (production deploy) OR #4 (destructive) depending on resource. Twin asks Chad to approve the manifest entry.
+- `mode=admin` or `mode=destructive` to ANY resource → always auth-boundary, always asks.
+- `mode=write` to a shared DB or secret_store → always auth-boundary #4.
+- `mode=read` to anything → no ping (but still recorded in manifest for audit).
+
+**Captain-owned resources** (no auth-boundary needed):
+- The captain's own repo (clone path matches `RegisteredApp.repo_path`)
+- The captain's workspace dir (`~/.chad/fleet/apps/<app_id>/`)
+- The captain's task artifact bus dir (`~/.chad/fleet/tasks/<task_id>/`)
+
+**Approved capabilities registry** at `~/.chad/captain/approved_capabilities.json`:
+```json
+{
+  "approved": [
+    {
+      "resource_id": "ssh:noob-root",
+      "modes_allowed": ["read"],
+      "approved_for_app_ids": ["t4-es-bots"],
+      "approved_at": "...",
+      "expires_at": null
+    }
+  ]
+}
+```
+
+If a future captain requests an already-approved resource+mode for an already-approved app_id → no ping. Different app_id requesting same resource+mode → fresh ping (per-captain authorization, even when shared).
+
+**Engine prep additions (PR5):**
+- `ResourceAccess` Pydantic model + `research.json` schema field (~40 LOC)
+- Capability registry load/save with flock (~60 LOC, mirrors apps_registry pattern)
+- Captain runtime credential provisioner (reads manifest + capability registry, sets up env/secret allowlist for goose subprocess) (~120 LOC)
+- Rejection logic in scaffold transaction (manifest entry not approved → block install, ping Chad) (~40 LOC)
 
 ### task_class definition (R2#5 + R3#7 fix — structured Pydantic enum, NOT freeform string)
 
@@ -108,24 +260,7 @@ class TaskClass(BaseModel):
 
 **Classifier emits structured TaskClass, not strings.** Unknown enum value → `clarify` outcome (or `profile_needed` if it's a repo_shape mismatch). Classifier CANNOT invent new domain_tag values; if the task doesn't fit, it asks Chad.
 
-**First-of-class trigger:** `canonical_key()` not in approved-classes registry, OR `risk_rank` for the canonical_key is higher than previously approved.
-
-**Approved-classes registry:** `~/.chad/captain/approved_classes.json` (same atomic+flock treatment as `apps_registry.json`):
-```json
-{
-  "schema_version": 1,
-  "approved": [
-    {
-      "canonical_key": "v1|manuscript-publishing|local-only|python-pkg|no-external",
-      "task_class": {...},
-      "approved_at": "...",
-      "example_task_id": "...",
-      "example_app_id": "spark-of-defiance",
-      "denied_boundaries": []  // e.g. ["no-money", "no-deploy"]
-    }
-  ]
-}
-```
+**No approval gate on TaskClass itself (v8 — R5#7 cleanup).** TaskClass is used ONLY for routing, risk_rank computation, and resource policy hints. Per-captain approval was removed in v7; the auth-boundary gates are: (1) profile-needed when `repo_shape` has no scaffold profile, (2) cost > $20/day, (3) resource_access_manifest entries needing approval. There is NO `approved_classes.json` — that file is removed from PR5 engine prep.
 
 | Component | Meaning |
 |-----------|---------|
@@ -138,7 +273,7 @@ Examples:
 - `manuscript-publishing/local-only/python-pkg/no-external` (Spark)
 - `marketing-content/prod-deploy-later/django-app/public-read` (T3 chadacys marketing)
 - `fleet-infrastructure/local-with-shared-infra/python-pkg/no-external` (T4 ES bots — DOES touch noob-root but read-only via cw-gateway)
-- `federal-rfp/regulated/polyglot/public-write` (future) — high-risk class, would always be first-of-class
+- `federal-rfp/regulated/polyglot/public-write` (future) — `polyglot` triggers profile-needed (auth-boundary #5); regulated + money/deploy actions trigger #1/#3 at action time
 
 ---
 
@@ -323,10 +458,29 @@ classification:
   "verify_cmd": "...",
   "related_memories": [{"id": "...", "title": "...", "excerpt": "..."}],
   "dependencies": [{"type": "captain|manual|external", "ref": "...", "blocks": true}],
+  "resource_access_manifest": [/* see Captain spin-up policy section */],
+  "cost_projection": {
+    "model_mix": {"haiku": 0.7, "opus": 0.3},
+    "estimated_slices": 24,
+    "estimated_tokens_per_slice": {"in": 8000, "out": 2000},
+    "retry_factor": 1.4,
+    "estimated_days_active": 30,
+    "p50_cost_per_day_usd": 4.20,
+    "p95_cost_per_day_usd": 11.50,
+    "confidence": 0.7
+  },
   "open_questions": ["..."],
   "minimal_research_complete": true
 }
 ```
+
+**Cost projection methodology (R5#5 fix):**
+- Token estimates per slice come from a simple historical model: read last 50 captain dispatches from the captain_log plane, average tokens per slice by model. New captain bootstraps with conservative defaults: haiku 8K in / 2K out, opus 12K in / 4K out.
+- Pricing table at `apps/chad-twin-daemon/llm_pricing.json` (versioned; updated when Anthropic pricing changes).
+- `p95_cost_per_day_usd` = `(p95_tokens_per_slice * pricing) * retry_factor * (estimated_slices / estimated_days_active)`.
+- Gate fires on **p95**, not p50. Conservative bias.
+- If `confidence < 0.7` AND p95 within 30% of $20/day → auth-boundary ping (uncertainty pushes us toward asking).
+- **Reconciliation**: every 24h Twin reads actual token usage from captain_log entries, recomputes daily run-rate. Actual rate > $20/day for 2 consecutive days → captain auto-pauses + auth-boundary ping (cost overrun).
 
 **Minimal research** (mandatory): items 1, 4, 5 always. Items 2, 3, 6 conditional on task type but recorded as `null + reason` if skipped.
 
@@ -406,9 +560,9 @@ Reply with answers or "go with your recommendation" to proceed.
 
 ---
 
-### Step 5 — SCAFFOLD (Twin auto-registers; R1#1, #3, #4, #5, #6, #20 + R2#1, #2, #3, #9 fixes)
+### Step 5 — SCAFFOLD (Twin auto-registers in parallel; v7 — first-of-class gate REMOVED)
 
-**Goal:** Generate a working captain from templates via a profile system. **Twin auto-registers without Chad approval** UNLESS this is the FIRST captain for a `task_class` Twin has never seen, OR the FIRST use of a new scaffold profile.
+**Goal:** Generate a working captain from templates via a profile system. **Twin auto-registers without Chad approval for EVERY captain** unless one of the auth-boundary triggers fires (new scaffold profile needed, projected cost > $20/day, or running into the 5/24h or 12-concurrent caps).
 
 #### 5.1 — Scaffold profiles (R2#1 fix — escape hatch)
 
@@ -443,8 +597,8 @@ class ScaffoldProfile:
 
 **Profile selection:**
 - Twin matches `task_class.repo_shape` to a profile's `supported_repo_shapes`.
-- No matching profile → emit `profile_needed` outcome (NOT a broken captain). Twin journals + AGGREGATE surfaces it. Chad gets first-of-class ping that includes "this requires a new scaffold profile; here's the research output, here's the missing shape."
-- First use of an existing profile = first-of-class trigger (counts as auth-boundary).
+- No matching profile → emit `profile_needed` outcome (NOT a broken captain). Twin journals + surfaces in next AGGREGATE. Chad gets a profile-needed ping (auth-boundary #5) including the research output and the missing shape.
+- First use of an existing profile = NO ping (v7 — captain spin-up is parallel; only NEW profiles need approval).
 
 **Initial profile catalog** (ship with v1):
 - `default-python-pkg` — generic Python package, pytest verify
@@ -536,7 +690,7 @@ TRANSACTION SCAFFOLD <app_id> <txn_id>:
 phase 0: PRE
   - Acquire flock at ~/.chad/fleet/.scaffold.lock (exclusive, 60s timeout)
   - Acquire flock at ~/.chad/captain/.engine.lock (shared with daemon — Twin is a writer)
-  - Validate research.json complete; profile selected; task_class approved (or first-of-class flag set)
+  - Validate research.json complete; profile selected; cost projection ≤ $20/day OR auth-boundary ping completed; rate-limit + concurrency gates not exceeded
   - Write manifest at ~/.chad/fleet/scaffolds/<txn_id>/manifest.json:
       {
         "txn_id": "...",
@@ -632,24 +786,36 @@ ROLLBACK (any phase failure):
 
 `apps/chad-captain` has no Makefile. Real verifier: `uv run python -m pytest apps/chad-captain/tests -q` from repo root.
 
-#### 5.7 — Scaffold output to Chad (only first-of-class)
+#### 5.7 — Scaffold output to Chad (auth-boundary only — profile-needed OR cost > $20/day)
 
+Captain spin-up is silent in the default path. Chad sees scaffolds in the next on-demand AGGREGATE roll-up (status command).
+
+Scaffold ping fires ONLY for these auth-boundary cases:
+
+**Case A — new scaffold profile needed:**
 ```
-Scaffolded NEW captain class: <app_id>
-Class: <task_class>     (e.g. marketing-content/prod-deploy-later/django-app/public-read)
-Profile: <profile_id>   (django-app, default-python-pkg, ts-app, static-site, NEW)
+PROFILE NEEDED for task <task_id>
+Class: <task_class.display()>
+Repo shape: <repo_shape> (no existing profile fits)
 
-Repo: <path>
-Mode: autonomous, auto_replan=False (Twin will flip after first replan inspection)
-Validator: default chain | custom (<reason>)
-Backlog: <N> items, top: <fb-001 title>
-Verify: <verify_cmd>
-
-This is the first captain in class "<task_class>"
-[and/or: This is the first use of profile "<profile_id>"].
-Approve to register? Reply "go" or list specific concerns.
-Future captains in this class+profile register without asking.
+Research summary: <2-3 sentence what-we-know>
+Twin recommendation: build <profile_id> profile (~<N> LOC, ~<H> hours);
+  OR rescope task to <existing_profile> with concrete tradeoff: <...>
+Reply "build profile" / "rescope to <profile_id>" / specifics
 ```
+
+**Case B — projected cost > $20/day:**
+```
+COST APPROVAL for new captain <app_id>
+Class: <task_class.display()>
+Projected LLM spend: ~$<N>/day (<token estimate breakdown>)
+Backlog scope: <N> items × ~<M> tokens/slice average
+
+Twin recommendation: approve / scope down to <subset> / defer
+Reply "approve" / "scope down" / "defer"
+```
+
+Default path (profile fits + cost OK + within rate/concurrency gates) writes scaffold record to twin journal; surfaces in next `twin status` aggregate.
 
 #### 5.8 — FAIL-CLOSED summary
 
@@ -697,7 +863,7 @@ Each trigger has its own sanity criteria and Twin response:
 
 | Trigger | Source | Sanity criteria | Twin failure handling |
 |---------|--------|-----------------|------------------------|
-| `initial` | After SCAFFOLD install | (A) slice count ≤ backlog item count × 2; (B) every slice has non-empty system_prompt + user_prompt; (C) every slice cites at least one backlog item by id; (D) total slice count ≥ 1 | Re-replan with hint up to 2x; if still failing, leave registry.enabled=false + escalate to Chad as first-of-class follow-up |
+| `initial` | After SCAFFOLD install | (A) slice count ≤ backlog item count × 2; (B) every slice has non-empty system_prompt + user_prompt; (C) every slice cites at least one backlog item by id; (D) total slice count ≥ 1 | Re-replan with hint up to 2x; if still failing, leave registry.enabled=false + escalate to Chad (auth-boundary fallback when scaffold can't produce a sane initial roadmap) |
 | `drained` | Engine, when current_slice empty AND auto_replan=True | (A) slice count > 0 (else `roadmap_complete` flow fires instead); (B) all sanity (A)-(D) above; (C) NEW: backlog has been re-prioritized vs last roadmap (no infinite-loop replans of the same shape) | Re-replan once with "produce a different shape" hint; if still same-shape, mark roadmap_complete + close task |
 | `kill_replan` | Validator verdict on goose timeout / structural slice failure | All sanity (A)-(D); plus retry_context from validator threaded into next slice's user_prompt | Re-replan once with the killed slice's failure as input; if still failing, escalate |
 | `low_yield_streak` | Engine circuit breaker on N soft-accept verdicts | (A)-(D); plus rubric_delta_pp distribution shows new dimensions being moved (not just the saturated ones) | Re-replan ONCE with "rubric saturated; expand backlog" hint; if rubric still saturated → escalate to Chad with explicit "extend rubric or close task" question |
@@ -915,16 +1081,51 @@ The canary is invoked via a new CLI: `chad-captain canary --one-tick --no-push -
 
 ---
 
-### Step 9 — AGGREGATE (R1#16 + R2#7 + R2#8 fixes — hierarchical, scales, quarantine SLOs)
+### Step 9 — AGGREGATE (v7 — on-demand only, NO daily ritual)
 
-**Goal:** ONE roll-up Twin produces, on a schedule. Format scales to 12+ captains, 30+ tasks.
+**Goal:** ONE roll-up Twin produces. Iterate-until-done model: AGGREGATE fires when Chad asks (`twin status`) OR when a task transitions (completed, blocked, escalation). NO scheduled 06:00 ritual.
 
-**Schedule:** Daily at 06:00 ET + on-demand via `twin status` and drill commands.
+**When AGGREGATE fires:**
+- **On Chad's command:** `twin status` (full roll-up) + drill subcommands. ALWAYS leads with "Changed since last viewed" delta so background activity is visible.
+- **On task transition:** task complete → bundle into one final Zoom DM (Chad's personal account); task hard-blocked → small delta DM (just the change, not full state); captain spin-up while Chad is offline → enqueued for next-status delta, NOT immediate ping; auth-boundary escalation → uses ESCALATE flow (Step 10).
+- **NEVER on a clock.** No daily, no hourly. Silence is the default.
 
-**Hierarchical format (R2#7 fix):** counts at top, only items needing action inline. Drill commands surface details on demand.
+**Activity cursor (R5#2 fix — Chad never loses background changes):**
+
+Twin maintains `~/.chad/fleet/activity_cursor.json`:
+```json
+{
+  "chad_last_viewed_at": "2026-05-04T22:14:11Z",   // bumped on every twin status
+  "chad_last_acked_at":  "2026-05-04T22:14:11Z",   // bumped on explicit "ack" reply
+  "events_since_view": [
+    {"ts":"...","kind":"captain_spinup","app_id":"...","summary":"..."},
+    {"ts":"...","kind":"captain_pause","app_id":"...","reason":"..."},
+    {"ts":"...","kind":"task_complete","task_id":"...","prs":[...]},
+    {"ts":"...","kind":"queue_state_change","task_id":"...","new_state":"queued_concurrency"}
+  ]
+}
+```
+
+`twin status` output FIRST shows:
+```
+📈 Changed since last viewed (2026-05-04 22:14 → 2026-05-05 06:30):
+  + 3 new captains spun up: t6-foo, t7-bar, t8-baz (no auth-boundary)
+  + 1 captain paused: t3-marketing (config error — already in needs-action)
+  + 2 tasks completed: t4-es-bots, t5-rfp-responder
+  + 1 captain queued: t9-quux (queued_rate_limit, earliest start 06:45)
+
+Then full state:
+  ...
+```
+
+Drill: `twin status --since last-seen` (default), `--since 24h`, `--since <iso-ts>`.
+
+Activity cursor advances ONLY on explicit `twin status` invocations or on Chad's `ack` reply. Auto-bumping it on aggregate ESCALATE pings would re-introduce the "background captain spin-up gets lost" failure.
+
+**Hierarchical format (R2#7 fix):** counts at top, only items needing action inline. Drill commands surface details on demand. Heading carries the trigger context (on-demand vs task-transition).
 
 ```
-Fleet status — 2026-05-04 06:00 ET
+Fleet status — 2026-05-04 14:32 ET (on-demand)
 
 📊 Counts
   Captains: 12 (10 green, 1 paused, 1 attention)
@@ -933,16 +1134,15 @@ Fleet status — 2026-05-04 06:00 ET
   Sign-offs needed: 3
 
 ⚠ Needs your action:
-  1. t5-rfp-responder NEW CAPTAIN CLASS [first-of-class]
+  1. t5-rfp-responder PROFILE NEEDED [auth-boundary #5]
      Class: federal-rfp/regulated/polyglot/public-write
-     Profile: NEW (no profile fits — `polyglot` shape)
-     Repo: ~/code/cw/rfp-responder (greenfield)
+     Repo shape: polyglot (no existing scaffold profile fits)
+     Repo: ~/code/cw/rfp-responder (greenfield, would be created by scaffold)
      Backlog: 6 items, top: "intake parser for SAM.gov RFP feed"
-     Risk: federal compliance scope; no money/auth-boundary in immediate slices
      Twin recommendation: build polyglot profile first (~200 LOC, 1 day);
-       OR scope captain to python-pkg subset for v1 and split out the
-       polyglot bits as a sibling captain.
-     Action: reply "go polyglot-profile" / "go python-pkg-only" / specifics
+       OR rescope task to python-pkg subset for v1 and split out the
+       polyglot bits as a sibling task.
+     Action: reply "build profile" / "rescope to python-pkg" / specifics
 
   2. t4-es-bots TASK COMPLETE — final sign-off
      Bundled PRs: #410 (fb-001), #412 (fb-002), #415 (fb-003)
@@ -1012,18 +1212,36 @@ If a captain or task fails the green predicate, it MUST appear inline. The roll-
 
 **Goal:** Twin pings Chad ONLY on real decisions. Bundling, not per-event.
 
-**Escalation matrix:**
+**Escalation matrix (v7):**
 
 | Condition | When Twin pings Chad | Channel | Bundled? |
 |-----------|----------------------|---------|----------|
-| FIRST captain of a new task_class | Immediate | Zoom DM | NO |
-| Captain emitted `escalation_raised` Twin can't resolve | Within 15min | Zoom DM (+ SMS if priority=high) | NO |
-| Authority-boundary action needed (deploy, external comms, money, destructive) | Immediate | Zoom DM (+ SMS if priority=high or production-touching) | NO |
-| Clarification needed (Step 4), priority=high | Immediate | Zoom DM **+ SMS** | NO |
-| Clarification needed (Step 4), priority=medium/low | Immediate | Zoom DM | NO |
-| TASK COMPLETE — final sign-off (all PRs bundled) | Daily AGGREGATE or immediate if priority=high | Zoom DM | YES |
-| Engine repair PR (behavior-changing, blocklist path) | Immediate | Zoom DM (+ SMS if all captains paused) | NO |
+| New scaffold profile needed (auth-boundary #5) | Immediate | Personal Zoom DM | NO |
+| Projected captain cost > $20/day (auth-boundary #3) | Immediate | Personal Zoom DM | NO |
+| Captain emitted `escalation_raised` Twin can't resolve | Within 15min | Personal Zoom DM (+ SMS if priority=high) | NO |
+| Authority-boundary action needed (deploy, external comms, money, destructive) | Immediate | Personal Zoom DM (+ SMS if priority=high or production-touching) | NO |
+| Clarification needed (Step 4), priority=high | Immediate | Personal Zoom DM **+ SMS** | NO |
+| Clarification needed (Step 4), priority=medium/low | Immediate | Personal Zoom DM | NO |
+| TASK COMPLETE — final sign-off (all PRs bundled) | Immediate when task transitions complete | Personal Zoom DM (+ SMS if priority=high) | YES |
+| Engine repair PR (behavior-changing, blocklist path) | Immediate | Personal Zoom DM (+ SMS if all captains paused) | NO |
+| Captain spin-up (default path, no auth-boundary) | NEVER (silent; surfaces in next on-demand AGGREGATE) | n/a | n/a |
 | All captains green, nothing to decide | NEVER | n/a | n/a |
+
+**Channel destinations (v8 — personal accounts ONLY, NO company-Zoom fallback in prod per R5#4):**
+
+- **Zoom DM target = Chad's personal Zoom account.** chad-twin daemon uses a SEPARATE set of S2S creds from chad-agent's company-tied creds:
+  - `CHAD_PERSONAL_ZOOM_S2S_CLIENT_ID`
+  - `CHAD_PERSONAL_ZOOM_S2S_CLIENT_SECRET`
+  - `CHAD_PERSONAL_ZOOM_S2S_ACCOUNT_ID`
+  - `CHAD_PERSONAL_ZOOM_BOT_JID` (the personal account user/bot identity)
+- Personal Zoom creds live in `~/.chad/fleet/.env` on the Linode VPS, NEVER in the company chad-agent env
+
+**Fail-closed isolation (R5#4 fix — no company-Zoom contamination):**
+- Twin production daemon NEVER reads `CHAD_ZOOM_*` env vars. Period.
+- Systemd unit sets `TWIN_ENV=prod`. In `prod`, the Zoom client constructor refuses to fall back to `CHAD_ZOOM_*` even if `CHAD_PERSONAL_ZOOM_*` is missing — daemon starts in **degraded mode with outbound Zoom DISABLED**, NOT silently routed to company.
+- Company-Zoom test path lives in `apps/chad-twin-daemon/tests/zoom_company_fixtures.py` only; can NEVER be reached from prod runtime.
+- Startup self-check: Twin calls `users/me` on the configured Zoom account, validates returned `account_id` matches `CHAD_PERSONAL_ZOOM_S2S_ACCOUNT_ID` AND returned bot JID matches `CHAD_PERSONAL_ZOOM_BOT_JID`. Mismatch → daemon refuses to start, logs identity mismatch as critical fleet health alarm, escalates via SMS (P0).
+- AGGREGATE health section ALWAYS shows Zoom identity match status.
 
 **Twilio SMS channel** (NEW in v5; P0/P1 tiers + reply grammar fixed in v6 per R4):
 
@@ -1034,7 +1252,7 @@ If a captain or task fails the green predicate, it MUST appear inline. The roll-
 | Tier | Triggers | Rate behavior |
 |------|----------|---------------|
 | **P0 — emergency** | Production deploy, destructive op, all-captains-paused, security incident, Twilio outage flagged | Reserve 1 SMS per hour for P0; bypass digest collapsing unless daily hard cap (8/day) is fully exhausted. P0 SMS body always includes `EMERGENCY:` prefix. |
-| **P1 — high** | High-priority clarifications, captain escalations Twin can't resolve, first-of-class captain | Subject to 3/hour, 8/day rate limit. Excess collapses into digest. |
+| **P1 — high** | High-priority clarifications, captain escalations Twin can't resolve, profile-needed scaffold, projected-cost > $20/day | Subject to 3/hour, 8/day rate limit. Excess collapses into digest. |
 
 When the daily 8/day cap is exhausted: P0 still sends if any of the 1/hour P0 reserve remains; P1 stops sending SMS entirely until midnight ET, Zoom DMs continue immediately, AGGREGATE flags "SMS daily cap reached."
 
@@ -1142,7 +1360,7 @@ Schema additions to existing chad-captain types:
 | Aggregator (hierarchical + drill commands + green predicate) | `apps/chad-twin-daemon/aggregate.py` | ~400 | S7 |
 | Escalation policy (auth-boundary gate) | `apps/chad-twin-daemon/escalate.py` | ~120 | S8 |
 | Close handler (task_id-scoped) | `apps/chad-twin-daemon/close.py` | ~80 | S9 |
-| Daemon launcher + systemd unit + watchdog | `apps/chad-twin-daemon/main.py` + `ops/twin-daemon.service` | ~200 | S10 |
+| Daemon launcher + systemd unit + watchdog (v7: targets personal Linode VPS) | `apps/chad-twin-daemon/main.py` + `ops/twin-daemon.service` | ~200 | S10 |
 | End-to-end tests | `apps/chad-twin-daemon/tests/` | ~700 | per-slice |
 
 **Total new code:** ~4,830 LOC prod + ~700 LOC test = ~5,530 LOC across 16 functional slices + 1 wiring slice.
@@ -1201,28 +1419,36 @@ Build-time and runtime are different. At runtime, deadlock-shaped failures CAN h
 ## Decisions baked in (Twin makes; Chad does NOT need to approve)
 
 1. **Inbox = `~/.chad/fleet/inbox/`** — file-based, watchfiles + 5min poll backstop.
-2. **Twin daemon hosting = noob-root systemd** (R3#9 fix — MacBook launchd doesn't run while asleep, breaks 24/7 fleet ops). MacBook launchd is fallback for local-only MVP/replay. Captains running goose-runner that need to interact with local files on Chad's machine still run on Chad's MacBook with `caffeinate` while active; the Twin daemon (orchestrator) lives on noob-root.
+2. **Twin daemon hosting = Chad's personal Linode VPS systemd** + **canonical log/event plane on Linode** (v8 R5#1 fix). See "Hosting topology" section below.
 3. **Scaffold templates = concrete `.j2` files**, NOT a DSL.
 4. **Classifier uses Claude haiku via cw-gateway** (cheap, fast, JSON-schema-constrained).
 5. **Twin reads captain_log on file events; tier 1 events handled in 60s, tier 2 batched 15min.**
-6. **Aggregate at 06:00 ET daily.**
-7. **Twin auto-registers captains** unless first-of-class.
+6. **Aggregate is on-demand only** (`twin status`) + on task transitions. NO daily/scheduled ritual.
+7. **Twin auto-registers EVERY captain** in parallel; only profile-needed (auth-boundary #5) and cost > $20/day (auth-boundary #3) gate Twin.
 8. **Twin auto-approves roadmaps** if sanity passes; retries 2x with hints; only escalates on persistent failure.
 9. **PRs bundled into task complete sign-off**, not per-PR pings.
-10. **Authority-boundary list is locked** (see top of doc): production deploys, external comms, money, destructive ops, first-of-class captains, genuine ambiguity, final task sign-off.
+10. **Authority-boundary list is locked** (see top of doc): production deploys, external comms, money, destructive ops, new scaffold profile needed, genuine ambiguity, final task sign-off.
+11. **Hosting**: Twin daemon on Chad's personal Linode VPS (systemd); Zoom DMs to personal Zoom account; SMS to personal phone.
+12. **Captain rate caps**: max 5 new captains spun up per 24h; max 12 concurrent active captains (Linode resource ceiling).
 
 ---
 
-## Decisions awaiting Chad (Step 4-bundled questions)
+## Decisions ANSWERED by Chad (v7 lock-in)
 
-ONE Zoom DM batch when Twin reaches the implementation gate:
+All 6 v4/v5 questions resolved:
 
-1. **Inbox surface confirmed:** `~/.chad/fleet/inbox/` + chad-agent Zoom-to-md hook. ✅ default; reply "different" if not.
-2. **Aggregate schedule confirmed:** 06:00 ET daily + on-demand. Reply "different" if not.
-3. **Escalation channel:** Zoom DM + Twilio SMS for priority=high (locked in v5 per Chad's ask). Confirm Twilio creds available; SMS rate limit 3/hour + 8/day; reply ingestion via Zoom thread (Y/N via SMS supported but not required).
-4. **Twin daemon hosting:** noob-root systemd is the proposed default (MacBook launchd doesn't run while asleep). Confirm or pick MacBook with explicit understanding of sleep gaps.
-5. **Authority-boundary list:** confirm the 7-item list above is complete and correct.
-6. **First-of-class definition:** is "task_class" defined by classifier domain tags (e.g. "manuscript-publishing", "infrastructure", "marketing-content"), or by repo, or admiral-defined?
+1. **Inbox surface:** ✅ `~/.chad/fleet/inbox/` + chad-agent Zoom-to-md hook (both ingress paths)
+2. **Aggregate schedule:** ✅ ON-DEMAND ONLY — `twin status` + task transitions. NO daily ritual. Iterate-until-done model.
+3. **Escalation channel:** ✅ Personal Zoom DM (separate creds from company chad-agent) + Twilio SMS for P0/P1. Reply via Zoom thread or SMS Y/N.
+4. **Twin daemon hosting:** ✅ Chad's personal Linode VPS systemd (NOT noob-root — that's company infra). MacBook still runs goose-runner workers for captains whose repos live there.
+5. **Authority-boundary list:** ✅ 7 items locked (with #5 redefined: "new scaffold profile needed" not "first-of-class captain").
+6. **First-of-class GATE:** ❌ REMOVED. Captains spin up in parallel automatically. Captain manages task → captain elevates updates to Twin (admiral) → Twin escalates to Chad ONLY on auth-boundary actions. Safety rails: profile-needed gate, $20/day cost gate, 5 new captains / 24h rate limit, 12 concurrent ceiling.
+
+### Open follow-ups (low-stakes, can answer when convenient)
+
+1. **Linode hostname / SSH config:** what's the personal Linode hostname? Twin daemon systemd unit needs to target it. Recommend: `chad-personal.linode` or actual FQDN; Twin reads from `~/.chad/fleet/.env` `LINODE_HOST=` so it's pluggable.
+2. **Twilio creds source:** in 1Password? if so, vault + item name so Twin's bootstrap doc points at it. Otherwise drop into `~/.chad/fleet/.env` directly.
+3. **Personal Zoom S2S app:** existing or needs to be created in your personal Zoom marketplace? (Required: server-to-server OAuth app with Team Chat scope on the personal account.)
 
 ---
 
@@ -1250,7 +1476,7 @@ These failure modes break "Chad is LAST stop only":
 
 1. **Per-PR ping = fail.** PRs bundle into task complete sign-off.
 2. **Roadmap approval ping = fail.** Twin auto-approves on sanity pass.
-3. **Scaffold approval ping per captain = fail.** Only first-of-class needs Chad approval.
+3. **Scaffold approval ping per captain = fail.** Captains spin up in parallel; only NEW scaffold profiles or cost > $20/day need Chad approval (v7).
 4. **Mid-flight clarification on resolvable items = fail.** Research must exhaust before asking.
 5. **Engine repair ping for additive fix = fail.** Twin owns non-breaking engine repair.
 6. **Daily aggregate "anything for me?" ping when nothing actionable = fail.** AGGREGATE is silent if no sign-offs.
