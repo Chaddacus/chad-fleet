@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 members = [
     "captain-core",
     "chad-captain",
+    "chad-captain-scaffold",
     "chad-fleet",
     "notifier-hub-core",
     "notifier-hub-dashboard-inbox",
@@ -274,6 +275,28 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "state-aggregator", editable = "packages/state-aggregator" },
     { name = "uvicorn", specifier = ">=0.27" },
+]
+provides-extras = ["dev"]
+
+[[package]]
+name = "chad-captain-scaffold"
+version = "0.0.0"
+source = { editable = "apps/chad-captain-scaffold" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "tracked-app-registry" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pydantic", specifier = ">=2.5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "tracked-app-registry", editable = "packages/tracked-app-registry" },
 ]
 provides-extras = ["dev"]
 
