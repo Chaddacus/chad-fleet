@@ -3456,3 +3456,93 @@ def test_daemon_passes_per_app_auto_replan(
     status = daemon._tick_one(app)
     assert status == "ok"
     assert captured["auto_replan"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cycle E — RoadmapSlice.custom_prompt passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_custom_system_prompt_replaces_default() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="YOU ARE A MANUSCRIPT EDITOR.",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.system_prompt == "YOU ARE A MANUSCRIPT EDITOR."
+    # User prompt path unchanged when only system was customized.
+    assert "OBJECTIVE: O" in cs.user_prompt
+
+
+def test_custom_user_prompt_replaces_default() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_user_prompt="REWRITE CHAPTER 3 IN A LOWER REGISTER.",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.user_prompt.startswith("REWRITE CHAPTER 3 IN A LOWER REGISTER.")
+    # No "OBJECTIVE: ..." prefix when user provides their own prompt.
+    assert "OBJECTIVE:" not in cs.user_prompt
+
+
+def test_custom_prompts_both_replaced() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="SYS",
+        custom_user_prompt="USR",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.system_prompt == "SYS"
+    assert cs.user_prompt.strip() == "USR"
+
+
+def test_custom_user_prompt_still_appends_extra_context() -> None:
+    """Cycle C retry plumbing must keep working with custom prompts."""
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_user_prompt="MY CUSTOM PROMPT",
+    )
+    cs = build_current_slice(
+        rs, app_id="t", repo_path="/tmp/r",
+        extra_context="PRIOR ATTEMPT FAILED: bad things",
+    )
+    assert "MY CUSTOM PROMPT" in cs.user_prompt
+    assert "PRIOR ATTEMPT FAILED: bad things" in cs.user_prompt
+
+
+def test_default_prompts_when_custom_unset() -> None:
+    """Back-compat: existing roadmaps without custom_* fields use defaults."""
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(slice_id="s1", objective="add a TODO")
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert "careful coding agent" in cs.system_prompt
+    assert "OBJECTIVE: add a TODO" in cs.user_prompt
+
+
+def test_roadmap_slice_custom_prompt_round_trips() -> None:
+    """Pydantic round-trip preserves custom_* fields."""
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="SYS",
+        custom_user_prompt="USR",
+    )
+    raw = rs.model_dump_json()
+    loaded = RoadmapSlice.model_validate_json(raw)
+    assert loaded.custom_system_prompt == "SYS"
+    assert loaded.custom_user_prompt == "USR"
+
+
+def test_roadmap_slice_back_compat_loads_without_custom_fields() -> None:
+    """JSON written before Cycle E lacks custom_* — must still load."""
+    legacy = (
+        '{"slice_id": "old", "objective": "O", "title": "", "phase": "", '
+        '"estimated_minutes": 30, "blocked_by": [], "status": "queued", '
+        '"notes": ""}'
+    )
+    rs = RoadmapSlice.model_validate_json(legacy)
+    assert rs.custom_system_prompt is None
+    assert rs.custom_user_prompt is None

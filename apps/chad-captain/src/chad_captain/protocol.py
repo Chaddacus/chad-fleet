@@ -284,6 +284,15 @@ class RoadmapSlice(BaseModel):
     status: Literal["queued", "in_flight", "done", "skipped", "blocked"] = "queued"
     notes: str = ""
 
+    # Cycle E: per-slice prompt overrides. When set, build_current_slice uses
+    # these in place of the default coding-agent system/user prompts. The
+    # replanner uses this to seed slices with task-specific instructions
+    # (manuscript voice, ES query template, deploy-script invocation, etc.)
+    # that the default prompts don't capture. Either field may be set
+    # independently — None = use default for that field.
+    custom_system_prompt: str | None = None
+    custom_user_prompt: str | None = None
+
 
 class Roadmap(BaseModel):
     """An ordered roadmap for one app. Captain manages this; dashboard reads."""

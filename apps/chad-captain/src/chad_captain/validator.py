@@ -325,22 +325,37 @@ def build_current_slice(
     System + user prompts are kept terse here — the replanner (S8) is the
     component that builds rich, research-grounded prompts from playbook +
     scorecard + research artifacts. For S3 we just route the objective.
-    """
-    system = (
-        "You are a careful coding agent working under a captain's direction. "
-        "Make the smallest correct change that satisfies the objective. "
-        "Run tests for the code you changed before declaring done. "
-        "Do not introduce abstractions that weren't asked for. "
-        "If the objective is ambiguous, do the obvious interpretation and "
-        "describe your reasoning briefly at the end."
-    )
 
-    user = f"OBJECTIVE: {rs.objective}\n"
-    if rs.phase:
-        user += f"PHASE: {rs.phase}\n"
-    if extra_context:
-        user += f"\nCONTEXT:\n{extra_context}\n"
-    user += "\nWhen done, summarize what you changed and why.\n"
+    Cycle E: when ``rs.custom_system_prompt`` / ``rs.custom_user_prompt`` are
+    set, they replace the defaults. ``extra_context`` (retry hints from
+    Cycle C) is still appended to the user prompt regardless.
+    """
+    if rs.custom_system_prompt is not None:
+        system = rs.custom_system_prompt
+    else:
+        system = (
+            "You are a careful coding agent working under a captain's direction. "
+            "Make the smallest correct change that satisfies the objective. "
+            "Run tests for the code you changed before declaring done. "
+            "Do not introduce abstractions that weren't asked for. "
+            "If the objective is ambiguous, do the obvious interpretation and "
+            "describe your reasoning briefly at the end."
+        )
+
+    if rs.custom_user_prompt is not None:
+        user = rs.custom_user_prompt
+        # Custom user prompts are responsible for embedding their own objective
+        # text — but we still append extra_context (retry hints) so per-slice
+        # custom prompts don't lose Cycle C retry plumbing.
+        if extra_context:
+            user += f"\n\nCONTEXT:\n{extra_context}\n"
+    else:
+        user = f"OBJECTIVE: {rs.objective}\n"
+        if rs.phase:
+            user += f"PHASE: {rs.phase}\n"
+        if extra_context:
+            user += f"\nCONTEXT:\n{extra_context}\n"
+        user += "\nWhen done, summarize what you changed and why.\n"
 
     return CurrentSlice(
         slice_id=rs.slice_id if not parent_slice_id else f"{rs.slice_id}-retry",
