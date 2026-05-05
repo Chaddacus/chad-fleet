@@ -24,11 +24,21 @@ ExtraDimension = Callable[[Path], DimensionScore]
 
 # Lazy imports keep the registry cheap when only one app is being scored.
 def _spark_extras() -> list[ExtraDimension]:
+    # Cycle F: drafts/ and bible/ added so the rubric sees actual manuscript
+    # work (exploratory drafting + worldbuilding canon), not just the
+    # finished-chapter dir.
     from chad_captain.extras.spark import (
+        bible_intact,
         chapters_word_count_target,
+        drafts_word_count_target,
         voice_guide_intact,
     )
-    return [voice_guide_intact, chapters_word_count_target]
+    return [
+        voice_guide_intact,
+        chapters_word_count_target,
+        drafts_word_count_target,
+        bible_intact,
+    ]
 
 
 def _author_toolkit_extras() -> list[ExtraDimension]:

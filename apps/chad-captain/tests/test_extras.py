@@ -10,7 +10,9 @@ from chad_captain.extras import EXTRAS_FACTORIES, get_extras
 from chad_captain.extras.author_toolkit import sentinel_present, typescript_typecheck_clean
 from chad_captain.extras.captain_self import captain_test_count_growing
 from chad_captain.extras.spark import (
+    bible_intact,
     chapters_word_count_target,
+    drafts_word_count_target,
     voice_guide_intact,
 )
 from chad_captain.scorecard import DimensionScore, score_repo
@@ -63,6 +65,89 @@ def test_chapters_word_count_target_some_out_of_band(tmp_path: Path) -> None:
     d = chapters_word_count_target(tmp_path)
     assert d.score == pytest.approx(1 / 3, rel=0.01)
     assert len(d.detail["out_of_band"]) == 2
+
+
+# Cycle F — drafts/ + bible/ extras
+
+
+def test_drafts_word_count_target_no_dir(tmp_path: Path) -> None:
+    d = drafts_word_count_target(tmp_path)
+    assert d.score == 0.5
+    assert "no drafts/" in d.rationale
+
+
+def test_drafts_word_count_target_finds_alternate_paths(tmp_path: Path) -> None:
+    (tmp_path / "manuscript" / "drafts").mkdir(parents=True)
+    (tmp_path / "manuscript" / "drafts" / "scene01.md").write_text(
+        " ".join(["w"] * 1000)
+    )
+    d = drafts_word_count_target(tmp_path)
+    assert d.score == 1.0  # 1000 is in [500, 8000]
+
+
+def test_drafts_word_count_target_perfect(tmp_path: Path) -> None:
+    drafts = tmp_path / "drafts"
+    drafts.mkdir()
+    (drafts / "d01.md").write_text(" ".join(["w"] * 1000))
+    (drafts / "d02.md").write_text(" ".join(["w"] * 4000))
+    d = drafts_word_count_target(tmp_path)
+    assert d.score == 1.0
+
+
+def test_drafts_word_count_target_partial(tmp_path: Path) -> None:
+    drafts = tmp_path / "drafts"
+    drafts.mkdir()
+    (drafts / "d01.md").write_text(" ".join(["w"] * 1000))   # in band
+    (drafts / "d02.md").write_text(" ".join(["w"] * 100))    # too short
+    d = drafts_word_count_target(tmp_path)
+    assert d.score == pytest.approx(0.5, rel=0.01)
+
+
+def test_drafts_word_count_target_empty_dir(tmp_path: Path) -> None:
+    (tmp_path / "drafts").mkdir()
+    d = drafts_word_count_target(tmp_path)
+    assert d.score == 0.5
+    assert "empty" in d.rationale
+
+
+def test_bible_intact_no_dir(tmp_path: Path) -> None:
+    d = bible_intact(tmp_path)
+    assert d.score == 0.0
+
+
+def test_bible_intact_dir_present_with_content(tmp_path: Path) -> None:
+    (tmp_path / "bible").mkdir()
+    (tmp_path / "bible" / "magic_system.md").write_text("ley lines pulse")
+    d = bible_intact(tmp_path)
+    assert d.score == 1.0
+
+
+def test_bible_intact_alternate_paths(tmp_path: Path) -> None:
+    (tmp_path / "worldbuilding").mkdir()
+    (tmp_path / "worldbuilding" / "factions.md").write_text("the Council")
+    d = bible_intact(tmp_path)
+    assert d.score == 1.0
+
+
+def test_bible_intact_dir_present_no_md(tmp_path: Path) -> None:
+    (tmp_path / "bible").mkdir()
+    (tmp_path / "bible" / "notes.txt").write_text("not markdown")
+    d = bible_intact(tmp_path)
+    assert d.score == 0.5
+
+
+def test_bible_intact_dir_present_empty_md(tmp_path: Path) -> None:
+    (tmp_path / "bible").mkdir()
+    (tmp_path / "bible" / "empty.md").write_text("")
+    d = bible_intact(tmp_path)
+    assert d.score == 0.5
+
+
+def test_bible_intact_recursive_search(tmp_path: Path) -> None:
+    (tmp_path / "bible" / "factions").mkdir(parents=True)
+    (tmp_path / "bible" / "factions" / "council.md").write_text("the Council")
+    d = bible_intact(tmp_path)
+    assert d.score == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +214,9 @@ def test_get_extras_returns_empty_for_unknown_app() -> None:
 
 
 def test_get_extras_returns_spark_dimensions() -> None:
+    # Cycle F: 4 spark dims — voice_guide, chapters, drafts, bible.
     extras = get_extras("spark-of-defiance")
-    assert len(extras) == 2
+    assert len(extras) == 4
     assert all(callable(fn) for fn in extras)
 
 
