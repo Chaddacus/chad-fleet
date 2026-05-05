@@ -538,3 +538,60 @@ def test_auto_merge_off_without_verify_cmd_accepted():
     )
     assert app.auto_merge is False
     assert app.verify_cmd is None
+
+
+# ---------------------------------------------------------------------------
+# PR12 R3#7 v6 §validation close: VerifyHost SSH model
+# ---------------------------------------------------------------------------
+
+
+def test_verify_host_default_constructs():
+    """Minimal VerifyHost only requires hostname; rest defaults sanely."""
+    from chad_captain.apps_registry import VerifyHost
+    vh = VerifyHost(hostname="ci.example.com")
+    assert vh.hostname == "ci.example.com"
+    assert vh.user == "root"
+    assert vh.port == 22
+    assert vh.identity_file is None
+    assert vh.remote_workdir == "."
+    assert vh.ssh_options == []
+
+
+def test_verify_host_full_construct():
+    from chad_captain.apps_registry import VerifyHost
+    vh = VerifyHost(
+        hostname="ci.example.com", user="builder", port=2222,
+        identity_file="/home/captain/.ssh/ci_key",
+        remote_workdir="/srv/build",
+        ssh_options=["ConnectTimeout=10", "StrictHostKeyChecking=accept-new"],
+    )
+    assert vh.user == "builder"
+    assert vh.port == 2222
+    assert vh.remote_workdir == "/srv/build"
+    assert "ConnectTimeout=10" in vh.ssh_options
+
+
+def test_registered_app_with_verify_host():
+    """RegisteredApp accepts a VerifyHost and roundtrips through model_dump."""
+    import json
+    from chad_captain.apps_registry import RegisteredApp, VerifyHost
+    app = RegisteredApp(
+        app_id="remote-app", name="R", repo_path="/tmp/r",
+        mode="autonomous",
+        verify_cmd="make check",
+        verify_host=VerifyHost(hostname="ci.example.com", user="builder"),
+    )
+    blob = app.model_dump_json()
+    parsed = RegisteredApp.model_validate_json(blob)
+    assert parsed.verify_host is not None
+    assert parsed.verify_host.hostname == "ci.example.com"
+    assert parsed.verify_host.user == "builder"
+
+
+def test_registered_app_verify_host_none_by_default():
+    """Back-compat: existing apps without verify_host keep working."""
+    from chad_captain.apps_registry import RegisteredApp
+    app = RegisteredApp(
+        app_id="x", name="X", repo_path="/tmp/x", mode="autonomous",
+    )
+    assert app.verify_host is None

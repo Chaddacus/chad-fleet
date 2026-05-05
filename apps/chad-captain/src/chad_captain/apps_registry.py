@@ -37,6 +37,34 @@ DEFAULT_REGISTRY_LOCK_PATH = Path.home() / ".chad" / "captain" / ".apps_registry
 AppMode = Literal["autonomous", "observe_only"]
 
 
+class VerifyHost(BaseModel):
+    """PR12 R3#7 v6 §validation close — SSH target for remote verify_cmd
+    execution. Captain runs verify_cmd on this host instead of locally.
+
+    The remote command is constructed as:
+        ssh [-i identity_file] [-p port] [-o opt1 -o opt2 ...] \\
+            user@hostname 'cd <remote_workdir> && <verify_cmd>'
+
+    SSH must be passwordless (key-based or agent-forwarded) — captain
+    won't prompt for a password. If host key fingerprint isn't already
+    in known_hosts, set strict_host_key_checking='accept-new' so the
+    first connection records it.
+    """
+
+    hostname: str
+    user: str = "root"
+    port: int = 22
+    # Path to SSH identity file. None lets ssh use the default (~/.ssh/id_*).
+    identity_file: str | None = None
+    # Working directory on the remote host where verify_cmd runs. Captain
+    # is responsible for ensuring code is synced there before triggering
+    # verify (typically a separate sync slice or a CI hook).
+    remote_workdir: str = "."
+    # Extra ssh -o options. Examples: "ConnectTimeout=10",
+    # "StrictHostKeyChecking=accept-new". Each entry passed as one -o flag.
+    ssh_options: list[str] = Field(default_factory=list)
+
+
 class RegisteredApp(BaseModel):
     app_id: str
     name: str
@@ -68,6 +96,13 @@ class RegisteredApp(BaseModel):
     # Wall-clock cap for verify_cmd (seconds). Slow CI shouldn't deadlock
     # the captain tick; if verify times out, treat as reject_retry.
     verify_timeout_seconds: int = 300
+
+    # PR12 R3#7 v6 §validation close: SSH host that runs verify_cmd remotely.
+    # When set, captain SSHes to verify_host and runs verify_cmd there
+    # (typically `cd <remote_workdir> && <verify_cmd>`). Useful when the
+    # build needs hardware/OS the captain box doesn't have. When None
+    # (default), verify_cmd runs locally in repo_path (existing behavior).
+    verify_host: "VerifyHost | None" = None
 
     # --- Integration model: captain branch + auto-PR (C2) ---
     # The branch goose-runner commits land on. Captain assumes this branch is
@@ -345,6 +380,7 @@ __all__ = [
     "DEFAULT_SEEDS",
     "RegisteredApp",
     "SPARK_DEFAULT",
+    "VerifyHost",
     "load_registry",
     "registry_lock_path",
     "registry_path",
