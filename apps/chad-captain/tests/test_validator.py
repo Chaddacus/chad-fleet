@@ -3688,3 +3688,233 @@ def test_post_merge_refresh_success_clears_roadmap_and_emits_cycle(
     assert any(e.kind == "post_merge_cycle" for e in log)
     # Roadmap WAS cleared.
     assert not ws.roadmap_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# PR10 R3#7 v6 §validation L2: verify_cmd wrapper enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_custom_validator_skipped_when_verify_cmd_fails(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Custom validator MUST NOT run when verify_cmd fails. Even if the
+    custom validator would have returned accept, the L1 build gate
+    short-circuits to reject_retry."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        # Custom validator would shamelessly accept everything.
+        return ValidationResult(verdict="accept", rationale="custom always accepts")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_permissive_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_permissive_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_permissive_validator",
+            verify_cmd="false",  # always exits non-zero
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert custom_called["n"] == 0, "custom validator was called despite failed verify_cmd"
+    log = read_captain_log(ws)
+    rejects = [e for e in log if e.kind == "validate" and e.verdict == "reject_retry"]
+    assert len(rejects) == 1
+    assert "verify_cmd failed BEFORE custom validator" in rejects[0].rationale
+
+
+def test_custom_validator_runs_when_verify_cmd_passes(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Happy path: verify_cmd passes, custom validator runs and its
+    verdict (accept) is honored."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_passing_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_passing_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_passing_validator",
+            verify_cmd="true",  # always exits 0
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert custom_called["n"] == 1
+    log = read_captain_log(ws)
+    accepts = [e for e in log if e.kind == "validate" and e.verdict == "accept"]
+    assert len(accepts) == 1
+    assert "custom ok" in accepts[0].rationale
+
+
+def test_custom_validator_with_no_verify_cmd_runs_normally(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When verify_cmd is unset, the pre-check is skipped (back-compat)
+    and the custom validator owns the verdict."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_no_verify_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_no_verify_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_no_verify_validator",
+            # verify_cmd intentionally unset
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    assert custom_called["n"] == 1
+
+
+def test_default_validator_is_unaffected_by_verify_pre_check(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Default chain already runs apply_verify_gate at the END; the new
+    pre-check is custom-validator-only. Confirm default chain still
+    runs verify_cmd via the existing post-process path."""
+    from chad_captain.apps_registry import RegisteredApp
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            verify_cmd="false",  # always fails
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    rejects = [e for e in log if e.kind == "validate"
+               and e.verdict in ("reject_retry", "reject_hard")]
+    assert len(rejects) == 1
+    # Default chain's verify_gate uses different rationale prefix —
+    # NOT the new "BEFORE custom validator" message.
+    assert "BEFORE custom validator" not in rejects[0].rationale
+    assert "verify_cmd" in rejects[0].rationale
