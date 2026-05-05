@@ -110,6 +110,28 @@ class AppWorkspace:
         return self.root / "branch_baseline.json"
 
     @property
+    def last_dispatched_slice_path(self) -> Path:
+        """Captain-owned snapshot of the most recently dispatched CurrentSlice.
+
+        Cycle C: goose-runner clears `current_slice.json` after writing
+        slice_complete, but the validator (especially custom validators) needs
+        the actual dispatched system_prompt + user_prompt to make prompt-aware
+        decisions. Captain writes this snapshot BEFORE current_slice.json at
+        dispatch time, reads it at validation, clears it after the validate
+        block completes.
+        """
+        return self.root / "last_dispatched_slice.json"
+
+    @property
+    def retry_context_path(self) -> Path:
+        """Per-slice retry context. Cycle C: captain writes after a
+        reject_retry / kill_replan verdict, dispatch path reads + clears
+        before issuing the retried slice. Threaded into goose's user_prompt
+        as 'PRIOR ATTEMPT FAILED: ...' so the retry isn't a blind redo.
+        """
+        return self.root / "retry_context.json"
+
+    @property
     def pause_until_path(self) -> Path:
         """Wall-clock pause marker. Written by C8 circuit breaker when
         consecutive failures exceed the threshold, read by captain_tick
@@ -327,6 +349,20 @@ class FeatureBacklog(BaseModel):
         return f"fb-{max_n + 1:03d}"
 
 
+class RetryContext(BaseModel):
+    """Cycle C: failure context threaded into a retried slice's prompt.
+
+    Captain writes this when the validator returns reject_retry/kill_replan,
+    dispatch reads + clears it right before issuing the retry. Lets the
+    next attempt see why the previous one failed instead of rerunning blind.
+    """
+
+    slice_id: str  # original slice_id (no -retry suffix)
+    failed_at: str = Field(default_factory=_now_iso)
+    rationale: str
+    retry_hint: str = ""
+
+
 class AdmiralNote(BaseModel):
     """One note from the admiral (Chad) targeted at one app's captain context."""
 
@@ -434,6 +470,49 @@ def write_feature_backlog(ws: AppWorkspace, backlog: FeatureBacklog) -> None:
     atomic_write(ws.feature_backlog_path, backlog.model_dump_json(indent=2))
 
 
+def write_last_dispatched_slice(ws: AppWorkspace, slice_: CurrentSlice) -> None:
+    """Cycle C: captain-owned snapshot of dispatched slice. Written BEFORE
+    current_slice.json so the validator can always see the real prompts."""
+    ws.ensure()
+    atomic_write(ws.last_dispatched_slice_path, slice_.model_dump_json(indent=2))
+
+
+def read_last_dispatched_slice(ws: AppWorkspace) -> CurrentSlice | None:
+    if not ws.last_dispatched_slice_path.exists():
+        return None
+    try:
+        return CurrentSlice.model_validate_json(
+            ws.last_dispatched_slice_path.read_text()
+        )
+    except Exception:  # noqa: BLE001 — corrupt snapshot → treat as missing
+        return None
+
+
+def clear_last_dispatched_slice(ws: AppWorkspace) -> None:
+    if ws.last_dispatched_slice_path.exists():
+        ws.last_dispatched_slice_path.unlink()
+
+
+def write_retry_context(ws: AppWorkspace, ctx: RetryContext) -> None:
+    """Cycle C: persist retry context for the next dispatch of this slice."""
+    ws.ensure()
+    atomic_write(ws.retry_context_path, ctx.model_dump_json(indent=2))
+
+
+def read_retry_context(ws: AppWorkspace) -> RetryContext | None:
+    if not ws.retry_context_path.exists():
+        return None
+    try:
+        return RetryContext.model_validate_json(ws.retry_context_path.read_text())
+    except Exception:  # noqa: BLE001 — corrupt sidecar → treat as missing
+        return None
+
+
+def clear_retry_context(ws: AppWorkspace) -> None:
+    if ws.retry_context_path.exists():
+        ws.retry_context_path.unlink()
+
+
 def write_admiral_note(ws: AppWorkspace, note: AdmiralNote) -> Path:
     ws.ensure()
     path = ws.admiral_notes_dir / f"{note.note_id}.json"
@@ -471,6 +550,7 @@ __all__ = [
     "FeatureBacklogItem",
     "FeatureBacklog",
     "FeatureStatus",
+    "RetryContext",
     "AdmiralNote",
     "write_current_slice",
     "read_current_slice",
@@ -485,6 +565,12 @@ __all__ = [
     "read_roadmap",
     "read_feature_backlog",
     "write_feature_backlog",
+    "write_last_dispatched_slice",
+    "read_last_dispatched_slice",
+    "clear_last_dispatched_slice",
+    "write_retry_context",
+    "read_retry_context",
+    "clear_retry_context",
     "write_admiral_note",
     "list_unread_admiral_notes",
     "consume_admiral_note",

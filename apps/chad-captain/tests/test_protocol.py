@@ -247,3 +247,84 @@ def test_workspace_ensure_creates_tree(tmp_path: Path) -> None:
     assert ws.admiral_notes_dir.is_dir()
     assert ws.admiral_notes_consumed_dir.is_dir()
     assert ws.research_path.parent.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Cycle C — last_dispatched_slice snapshot + retry_context sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_last_dispatched_slice_roundtrip(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import (
+        clear_last_dispatched_slice,
+        read_last_dispatched_slice,
+        write_last_dispatched_slice,
+    )
+    s = CurrentSlice(
+        slice_id="cyc-c-01",
+        app_id="test-app",
+        objective="cycle c roundtrip",
+        title="cycle c",
+        system_prompt="SYS PROMPT WITH SUBSTANCE",
+        user_prompt="USER PROMPT WITH SUBSTANCE",
+        repo_path="/tmp/r",
+    )
+    write_last_dispatched_slice(ws, s)
+    assert ws.last_dispatched_slice_path.exists()
+    loaded = read_last_dispatched_slice(ws)
+    assert loaded is not None
+    assert loaded.slice_id == "cyc-c-01"
+    assert loaded.system_prompt == "SYS PROMPT WITH SUBSTANCE"
+    assert loaded.user_prompt == "USER PROMPT WITH SUBSTANCE"
+
+    clear_last_dispatched_slice(ws)
+    assert not ws.last_dispatched_slice_path.exists()
+    assert read_last_dispatched_slice(ws) is None
+
+
+def test_last_dispatched_slice_returns_none_when_corrupt(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import read_last_dispatched_slice
+    ws.last_dispatched_slice_path.write_text("not-json")
+    assert read_last_dispatched_slice(ws) is None
+
+
+def test_clear_last_dispatched_slice_no_op_when_absent(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import clear_last_dispatched_slice
+    # Should not raise even if file never existed.
+    clear_last_dispatched_slice(ws)
+    assert not ws.last_dispatched_slice_path.exists()
+
+
+def test_retry_context_roundtrip(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import (
+        RetryContext,
+        clear_retry_context,
+        read_retry_context,
+        write_retry_context,
+    )
+    ctx = RetryContext(
+        slice_id="cyc-c-01",
+        rationale="pytest exit 1: assert 0 == 1",
+        retry_hint="adjust the assertion threshold",
+    )
+    write_retry_context(ws, ctx)
+    loaded = read_retry_context(ws)
+    assert loaded is not None
+    assert loaded.slice_id == "cyc-c-01"
+    assert loaded.rationale == "pytest exit 1: assert 0 == 1"
+    assert loaded.retry_hint == "adjust the assertion threshold"
+
+    clear_retry_context(ws)
+    assert read_retry_context(ws) is None
+
+
+def test_retry_context_returns_none_when_corrupt(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import read_retry_context
+    ws.retry_context_path.write_text("not-json")
+    assert read_retry_context(ws) is None
+
+
+def test_workspace_cycle_c_paths(tmp_path: Path) -> None:
+    w = AppWorkspace("baz", base=tmp_path)
+    assert w.last_dispatched_slice_path == tmp_path / "baz" / "last_dispatched_slice.json"
+    assert w.retry_context_path == tmp_path / "baz" / "retry_context.json"
