@@ -641,41 +641,73 @@ def captain_tick(
                     ),
                 )
             else:
-                try:
-                    result = validate_fn(
-                        ws=ws,
-                        complete=completion,
-                        dispatched_slice=dispatched_slice,
+                # PR10 R3#7 v6 §validation L2 — verify_cmd wrapper enforcement.
+                # When a custom validator is configured, run verify_cmd FIRST
+                # so a buggy/permissive custom validator can't suppress an L1
+                # build failure by returning accept. The default chain already
+                # runs verify_gate at the END (apply_verify_gate), but only
+                # post-processes accept/soft_accept results — a custom
+                # validator that bypasses verify_cmd entirely could ship
+                # broken code if we trusted its accept verdict blindly.
+                # Default validators skip this pre-check (they call
+                # apply_verify_gate themselves).
+                pre_check_short_circuit = False
+                if has_custom_validator and reg_app.verify_cmd:
+                    pre_passed, pre_summary = run_verify_gate(
                         repo_path=repo_path,
-                        reg_app=reg_app,
-                        score_delta=score_delta,
-                        was_retry=was_retry,
-                        use_baseline_scorecard=use_baseline_scorecard,
+                        verify_cmd=reg_app.verify_cmd,
+                        timeout_seconds=reg_app.verify_timeout_seconds,
                     )
-                except Exception as e:  # noqa: BLE001
-                    append_captain_log(
-                        ws,
-                        CaptainLogEntry(
-                            app_id=ws.app_id, slice_id=completion.slice_id,
-                            kind="escalation_raised",
+                    if not pre_passed:
+                        verdict_kind: CaptainVerdict = (
+                            "reject_hard" if was_retry else "reject_retry"
+                        )
+                        result = ValidationResult(
+                            verdict=verdict_kind,
                             rationale=(
-                                f"validator_module raised: "
+                                f"verify_cmd failed BEFORE custom validator "
+                                f"({reg_app.validator_module!r}); custom "
+                                f"validator skipped to prevent override of "
+                                f"L1 build gate. {pre_summary}"
+                            ),
+                        )
+                        pre_check_short_circuit = True
+                if not pre_check_short_circuit:
+                    try:
+                        result = validate_fn(
+                            ws=ws,
+                            complete=completion,
+                            dispatched_slice=dispatched_slice,
+                            repo_path=repo_path,
+                            reg_app=reg_app,
+                            score_delta=score_delta,
+                            was_retry=was_retry,
+                            use_baseline_scorecard=use_baseline_scorecard,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        append_captain_log(
+                            ws,
+                            CaptainLogEntry(
+                                app_id=ws.app_id, slice_id=completion.slice_id,
+                                kind="escalation_raised",
+                                rationale=(
+                                    f"validator_module raised: "
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                references={
+                                    "event": "validator_module_runtime_error",
+                                    "module": reg_app.validator_module if reg_app else "",
+                                    "error": str(e),
+                                },
+                            ),
+                        )
+                        result = ValidationResult(
+                            verdict="escalate",
+                            rationale=(
+                                f"custom validator crashed: "
                                 f"{type(e).__name__}: {e}"
                             ),
-                            references={
-                                "event": "validator_module_runtime_error",
-                                "module": reg_app.validator_module if reg_app else "",
-                                "error": str(e),
-                            },
-                        ),
-                    )
-                    result = ValidationResult(
-                        verdict="escalate",
-                        rationale=(
-                            f"custom validator crashed: "
-                            f"{type(e).__name__}: {e}"
-                        ),
-                    )
+                        )
 
         rs_id_in_roadmap = completion.slice_id.removesuffix("-retry")
         advance_roadmap(roadmap, rs_id_in_roadmap, result.verdict)
