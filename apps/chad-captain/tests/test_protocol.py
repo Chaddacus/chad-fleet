@@ -442,3 +442,103 @@ def test_update_feature_backlog_serializes_concurrent_writers(
     assert final.generation == 4
     ids = {it.id for it in final.items}
     assert ids == {"fb-000", "fb-001", "fb-002", "fb-003"}
+
+
+# ---------------------------------------------------------------------------
+# PR9 v6 §6.1 + §6.3.1: trigger queue + goose PID + scope-change abort
+# ---------------------------------------------------------------------------
+
+
+def test_pending_replan_reasons_path_under_root(tmp_path: Path) -> None:
+    w = AppWorkspace("pq-test", base=tmp_path)
+    assert w.pending_replan_reasons_path == w.root / "pending_replan_reasons.jsonl"
+
+
+def test_enqueue_then_drain_replan_reasons(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import drain_replan_reasons, enqueue_replan_reason
+    enqueue_replan_reason(ws, reason="manual", detail="d1")
+    enqueue_replan_reason(ws, reason="scope_change", detail="d2")
+    enqueue_replan_reason(ws, reason="cost_breach", detail="d3")
+    drained = drain_replan_reasons(ws)
+    # Sorted by priority (scope_change=0, cost_breach=2, manual=4).
+    assert [d["reason"] for d in drained] == ["scope_change", "cost_breach", "manual"]
+    # Queue is empty after drain.
+    assert drain_replan_reasons(ws) == []
+
+
+def test_drain_replan_reasons_when_empty(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import drain_replan_reasons
+    assert drain_replan_reasons(ws) == []
+
+
+def test_unknown_reason_gets_lowest_priority(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import drain_replan_reasons, enqueue_replan_reason
+    enqueue_replan_reason(ws, reason="totally_made_up")
+    enqueue_replan_reason(ws, reason="scope_change")
+    drained = drain_replan_reasons(ws)
+    assert drained[0]["reason"] == "scope_change"
+    assert drained[1]["reason"] == "totally_made_up"
+    assert drained[1]["priority"] == 99
+
+
+def test_goose_pid_path_under_root(tmp_path: Path) -> None:
+    w = AppWorkspace("pid-test", base=tmp_path)
+    assert w.goose_pid_path == w.root / "goose.pid"
+
+
+def test_write_read_clear_goose_pid(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import (
+        clear_goose_pid, read_goose_pid, write_goose_pid,
+    )
+    assert read_goose_pid(ws) is None
+    write_goose_pid(ws, 12345)
+    assert read_goose_pid(ws) == 12345
+    clear_goose_pid(ws)
+    assert read_goose_pid(ws) is None
+    # Clear when already gone is a no-op (no error).
+    clear_goose_pid(ws)
+
+
+def test_send_goose_abort_signal_no_pid_returns_false(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import send_goose_abort_signal
+    assert send_goose_abort_signal(ws) is False
+
+
+def test_send_goose_abort_signal_dead_pid_returns_false(ws: AppWorkspace) -> None:
+    """Stale PID file (process already exited) => False, no exception."""
+    from chad_captain.protocol import send_goose_abort_signal, write_goose_pid
+    # PID 1 is init/launchd; we can't kill it, but ProcessLookupError comes
+    # from a non-existent PID. Use an obviously-impossible PID.
+    write_goose_pid(ws, 999_999_999)
+    assert send_goose_abort_signal(ws) is False
+
+
+def test_send_goose_abort_signal_real_subprocess(ws: AppWorkspace) -> None:
+    """Spawn a real long-running subprocess, write its PID, abort.
+    The subprocess must exit due to SIGTERM."""
+    import subprocess
+    import time
+    from chad_captain.protocol import send_goose_abort_signal, write_goose_pid
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        write_goose_pid(ws, proc.pid)
+        assert send_goose_abort_signal(ws) is True
+        # Wait briefly for SIGTERM delivery.
+        for _ in range(20):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert proc.poll() is not None, "subprocess did not exit after SIGTERM"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_roadmapslice_status_accepts_superseded_by_scope_change() -> None:
+    """New status literal must be accepted by Pydantic validation."""
+    s = RoadmapSlice(
+        slice_id="s1", objective="x",
+        status="superseded_by_scope_change",
+    )
+    assert s.status == "superseded_by_scope_change"
