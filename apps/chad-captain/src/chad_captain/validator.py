@@ -67,6 +67,10 @@ class ValidationResult:
     verdict: CaptainVerdict
     rationale: str
     rubric_delta_pp: float | None = None
+    # Cycle C: optional retry guidance threaded into the next dispatch's
+    # user_prompt when the verdict is reject_retry/kill_replan. Empty by
+    # default — the rationale alone is enough for most retries.
+    retry_context: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +355,156 @@ def build_current_slice(
 
 
 # ---------------------------------------------------------------------------
+# Cycle C — pluggable validator chain
+# ---------------------------------------------------------------------------
+
+
+def validate_app_completion(
+    *,
+    ws: AppWorkspace,
+    complete: SliceComplete,
+    dispatched_slice: CurrentSlice,
+    repo_path: str,
+    reg_app,  # RegisteredApp | None
+    score_delta: Callable[[CurrentSlice, SliceComplete], float | None] | None,
+    was_retry: bool,
+    use_baseline_scorecard: bool,
+) -> ValidationResult:
+    """Default validation chain: validate_slice → reuse-regression override →
+    verify-gate downgrade.
+
+    Custom validators (set via ``RegisteredApp.validator_module``) implement
+    this same signature. They own the entire chain — captain does NOT post-
+    process their verdict with reuse_regression or verify_gate.
+
+    Returns a fully-resolved ``ValidationResult``. Caller (captain_tick) is
+    responsible for advancing the roadmap, writing the captain log entry, and
+    clearing slice_complete + the dispatched-slice snapshot.
+    """
+    if score_delta is None:
+        score_delta = _no_score_delta
+
+    result = validate_slice(
+        complete=complete, slice_=dispatched_slice, score_delta=score_delta,
+    )
+
+    # C14 — reuse-regression guard. Override generic "rubric regression"
+    # rationale with explicit "EXTEND existing package" message when a new
+    # parallel package was introduced.
+    if use_baseline_scorecard:
+        reuse_drop = _detect_reuse_regression(ws, repo_path)
+        if reuse_drop is not None:
+            verdict = "reject_hard" if was_retry else "reject_retry"
+            suffix = "after retry; reject hard" if was_retry else (
+                "retry — EXTEND existing package instead of parallel"
+            )
+            result = ValidationResult(
+                verdict=verdict,
+                rationale=(
+                    f"reuse_consistency regressed {reuse_drop} — "
+                    f"slice introduced parallel package; {suffix}"
+                ),
+                rubric_delta_pp=result.rubric_delta_pp,
+            )
+
+    # C1 verify gate: per-app `verify_cmd` must pass for the slice to ship.
+    if reg_app is not None:
+        result = apply_verify_gate(
+            result,
+            is_retry=was_retry,
+            repo_path=repo_path,
+            verify_cmd=reg_app.verify_cmd,
+            timeout_seconds=reg_app.verify_timeout_seconds,
+        )
+
+    return result
+
+
+def _resolve_validate_fn(
+    reg_app, ws: AppWorkspace,
+) -> Callable[..., ValidationResult] | None:
+    """Resolve the per-app validator function.
+
+    Returns the default ``validate_app_completion`` when no custom module is
+    configured. Returns the custom module's ``validate_app_completion`` when
+    one is. Returns None on import/attribute failure (caller emits ``escalate``
+    — fail-CLOSED, never silently fall back to default).
+    """
+    if not (reg_app and reg_app.validator_module):
+        return validate_app_completion
+
+    import importlib
+    try:
+        mod = importlib.import_module(reg_app.validator_module)
+    except ImportError as e:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=(
+                    f"validator_module {reg_app.validator_module!r} import "
+                    f"failed: {e}; emitting escalate verdict (fail-closed)"
+                ),
+                references={
+                    "event": "validator_module_load_failed",
+                    "module": reg_app.validator_module,
+                    "error": str(e),
+                },
+            ),
+        )
+        return None
+
+    fn = getattr(mod, "validate_app_completion", None)
+    if fn is None:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=(
+                    f"validator_module {reg_app.validator_module!r} loaded "
+                    f"but lacks validate_app_completion; emitting escalate "
+                    f"verdict (fail-closed)"
+                ),
+                references={
+                    "event": "validator_module_load_failed",
+                    "module": reg_app.validator_module,
+                    "error": "missing validate_app_completion",
+                },
+            ),
+        )
+        return None
+    return fn
+
+
+def _build_proxy_dispatched_slice(
+    completion: SliceComplete,
+    roadmap: Roadmap | None,
+    repo_path: str,
+    app_id: str,
+) -> CurrentSlice:
+    """Back-compat fallback when no last_dispatched_slice snapshot exists.
+
+    Uses the existing pre-Cycle-C reconstruction: blank prompts, objective +
+    title pulled from the roadmap. Safe ONLY for the default validator chain
+    (which doesn't read prompts). Custom validators get an ``escalate`` verdict
+    instead — see captain_tick's snapshot-resolution branch.
+    """
+    rs_id = completion.slice_id.removesuffix("-retry")
+    rs = next((s for s in (roadmap.slices if roadmap else []) if s.slice_id == rs_id), None)
+    was_retry = completion.slice_id.endswith("-retry")
+    return CurrentSlice(
+        slice_id=completion.slice_id,
+        app_id=app_id,
+        objective=rs.objective if rs else "",
+        title=rs.title if rs else "",
+        system_prompt="",
+        user_prompt="",
+        repo_path=repo_path,
+        parent_slice_id="parent" if was_retry else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-app tick (the captain's main loop calls this for each app)
 # ---------------------------------------------------------------------------
 
@@ -411,68 +565,99 @@ def captain_tick(
                 ),
             )
             clear_slice_complete(ws)
+            # Defensive: drop snapshot/retry-context too — they're orphaned
+            # without a roadmap to advance.
+            from chad_captain.protocol import (
+                clear_last_dispatched_slice as _clear_snap,
+                clear_retry_context as _clear_rc,
+            )
+            _clear_snap(ws)
+            _clear_rc(ws)
             return f"completion {completion.slice_id} consumed; no roadmap → escalate"
 
-        # We need the original slice context to know if it was a retry. The
-        # protocol doesn't currently persist the issued CurrentSlice once
-        # consumed; we reconstruct minimal context from the roadmap.
-        rs = next((s for s in roadmap.slices if s.slice_id == completion.slice_id or s.slice_id == completion.slice_id.removesuffix("-retry")), None)
         was_retry = completion.slice_id.endswith("-retry")
-        proxy_slice = CurrentSlice(
-            slice_id=completion.slice_id,
-            app_id=ws.app_id,
-            objective=rs.objective if rs else "",
-            title=rs.title if rs else "",
-            system_prompt="",
-            user_prompt="",
-            repo_path=repo_path,
-            parent_slice_id="parent" if was_retry else None,
+
+        # Cycle C — resolve the dispatched slice. Prefer the captain-owned
+        # snapshot (real prompts) so custom validators can match on prompt
+        # state. Fall back to the proxy reconstruction ONLY for the default
+        # validator (it doesn't read prompts). Custom validator + missing
+        # snapshot → escalate (fail-closed).
+        from chad_captain.protocol import read_last_dispatched_slice
+        snap = read_last_dispatched_slice(ws)
+        snap_ok = bool(
+            snap
+            and snap.slice_id.removesuffix("-retry")
+            == completion.slice_id.removesuffix("-retry")
         )
-        result = validate_slice(complete=completion, slice_=proxy_slice, score_delta=score_delta)
+        has_custom_validator = bool(reg_app and reg_app.validator_module)
 
-        # C14 — reuse-regression guard. If the slice introduced a NEW
-        # parallel package (reuse_consistency dropped from before to
-        # after), override the verdict / rationale with a specific
-        # parallel-package message. Live failure: PR #145 shipped two
-        # parallel `entitlements.py` modules — one in top-level
-        # `billing/` with TIER_RANK and one in `apps/billing/services/`
-        # with TIER_FEATURE_MATRIX. reuse_consistency dropped, but the
-        # generic "rubric regression" message gave the captain no
-        # actionable signal. The override turns it into an explicit
-        # "EXTEND existing package instead" instruction.
-        if use_baseline_scorecard:
-            reuse_drop = _detect_reuse_regression(ws, repo_path)
-            if reuse_drop is not None:
-                was_retry = completion.slice_id.endswith("-retry")
-                # Always reject when a parallel package is introduced.
-                # On retry, reject_hard so we don't loop on the same
-                # mistake. First time, reject_retry with explicit
-                # guidance.
-                verdict = "reject_hard" if was_retry else "reject_retry"
-                suffix = "after retry; reject hard" if was_retry else (
-                    "retry — EXTEND existing package instead of parallel"
-                )
-                result = ValidationResult(
-                    verdict=verdict,
-                    rationale=(
-                        f"reuse_consistency regressed {reuse_drop} — "
-                        f"slice introduced parallel package; {suffix}"
-                    ),
-                    rubric_delta_pp=result.rubric_delta_pp,
-                )
-
-        # C1 verify gate: if the registered app has a verify_cmd, run it
-        # against the repo. Goose's exit-code is local to the slice; the
-        # verify gate is global ("does the project still build/test?").
-        # Failure downgrades accept/soft_accept → reject_retry/reject_hard.
-        if reg_app is not None:
-            result = apply_verify_gate(
-                result,
-                is_retry=was_retry,
-                repo_path=repo_path,
-                verify_cmd=reg_app.verify_cmd,
-                timeout_seconds=reg_app.verify_timeout_seconds,
+        if snap_ok:
+            dispatched_slice = snap
+        elif has_custom_validator:
+            # Fail-closed for custom validators. The default chain is safe
+            # with blank prompts, but custom validators may match on
+            # prompts and we don't ship under wrong policy.
+            result = ValidationResult(
+                verdict="escalate",
+                rationale=(
+                    "dispatched-slice snapshot missing/mismatch; custom "
+                    "validator requires real prompts"
+                ),
             )
+            dispatched_slice = None  # not used past this point
+        else:
+            dispatched_slice = _build_proxy_dispatched_slice(
+                completion, roadmap, repo_path, ws.app_id,
+            )
+
+        # Resolve + run the validator chain (default OR per-app custom).
+        if not has_custom_validator or snap_ok:
+            validate_fn = _resolve_validate_fn(reg_app, ws)
+            if validate_fn is None:
+                # Module load failed — fail-closed.
+                result = ValidationResult(
+                    verdict="escalate",
+                    rationale=(
+                        f"validator_module {reg_app.validator_module!r} "
+                        f"unavailable; admiral fix required"
+                    ),
+                )
+            else:
+                try:
+                    result = validate_fn(
+                        ws=ws,
+                        complete=completion,
+                        dispatched_slice=dispatched_slice,
+                        repo_path=repo_path,
+                        reg_app=reg_app,
+                        score_delta=score_delta,
+                        was_retry=was_retry,
+                        use_baseline_scorecard=use_baseline_scorecard,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    append_captain_log(
+                        ws,
+                        CaptainLogEntry(
+                            app_id=ws.app_id, slice_id=completion.slice_id,
+                            kind="escalation_raised",
+                            rationale=(
+                                f"validator_module raised: "
+                                f"{type(e).__name__}: {e}"
+                            ),
+                            references={
+                                "event": "validator_module_runtime_error",
+                                "module": reg_app.validator_module if reg_app else "",
+                                "error": str(e),
+                            },
+                        ),
+                    )
+                    result = ValidationResult(
+                        verdict="escalate",
+                        rationale=(
+                            f"custom validator crashed: "
+                            f"{type(e).__name__}: {e}"
+                        ),
+                    )
 
         rs_id_in_roadmap = completion.slice_id.removesuffix("-retry")
         advance_roadmap(roadmap, rs_id_in_roadmap, result.verdict)
@@ -491,6 +676,24 @@ def captain_tick(
             ),
         )
         clear_slice_complete(ws)
+        # Cycle C — the snapshot served its purpose; clear it now so prompts
+        # don't linger on disk across a pause / crash / escalation.
+        from chad_captain.protocol import clear_last_dispatched_slice as _clear_snap
+        _clear_snap(ws)
+
+        # Cycle C — retry context plumbing. On reject_retry/kill_replan,
+        # persist the rationale so the next dispatch of this slice can
+        # surface "PRIOR ATTEMPT FAILED: ..." in the user prompt.
+        if result.verdict in ("reject_retry", "kill_replan"):
+            from chad_captain.protocol import RetryContext, write_retry_context
+            write_retry_context(
+                ws,
+                RetryContext(
+                    slice_id=completion.slice_id.removesuffix("-retry"),
+                    rationale=result.rationale,
+                    retry_hint=result.retry_context,
+                ),
+            )
         # Baseline snapshot was specific to this completed slice — drop it.
         from chad_captain.scorecard import clear_baseline
         clear_baseline(ws.slice_baseline_path)
@@ -629,16 +832,38 @@ def captain_tick(
         is_retry = any(e.verdict in ("reject_retry", "kill_replan") for e in log_tail)
         parent_id = rs.slice_id if is_retry else None
 
+        # Cycle C — thread retry context into the prompt when this is a
+        # retry of a slice we just rejected. Cleared after read so the next
+        # fresh dispatch isn't polluted.
+        extra_context = ""
+        if is_retry:
+            from chad_captain.protocol import (
+                clear_retry_context, read_retry_context,
+            )
+            rc = read_retry_context(ws)
+            if rc and rc.slice_id == rs.slice_id:
+                extra_context = f"PRIOR ATTEMPT FAILED: {rc.rationale}\n"
+                if rc.retry_hint:
+                    extra_context += f"\nGUIDANCE: {rc.retry_hint}\n"
+                clear_retry_context(ws)
+            elif rc:
+                # Stale context from a different slice — defensively clear.
+                clear_retry_context(ws)
+
         new_slice = build_current_slice(
             rs,
             app_id=ws.app_id,
             repo_path=repo_path,
             parent_slice_id=parent_id,
+            extra_context=extra_context,
         )
-        write_current_slice(ws, new_slice)
 
-        # Snapshot pre-slice scorecard so we can compute a real delta when
-        # the slice completes. Best-effort — failures shouldn't block dispatch.
+        # Cycle C — write order: scorecard baseline FIRST, dispatched-slice
+        # snapshot SECOND, current_slice.json LAST. The runner's "go" signal
+        # is current_slice.json existing; everything captain-side that
+        # validation depends on must be on disk before that file appears.
+        # Any failure aborts dispatch (no current_slice written → runner
+        # waits; admiral fixes the issue and the next tick retries).
         if use_baseline_scorecard:
             try:
                 from chad_captain.extras import get_extras
@@ -647,8 +872,41 @@ def captain_tick(
                     ws.slice_baseline_path,
                     score_repo(repo_path, extras=get_extras(ws.app_id)),
                 )
-            except Exception as e:
-                logger.warning("baseline scorecard write failed for %s: %s", ws.app_id, e)
+            except Exception as e:  # noqa: BLE001
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id, slice_id=rs.slice_id,
+                        kind="escalation_raised",
+                        rationale=f"baseline write failed pre-dispatch: {e}",
+                        references={"event": "baseline_write_failed"},
+                    ),
+                )
+                return (
+                    (status + "; " if status else "")
+                    + f"baseline write failed for {rs.slice_id}; not dispatching"
+                )
+
+        try:
+            from chad_captain.protocol import write_last_dispatched_slice
+            write_last_dispatched_slice(ws, new_slice)
+        except OSError as e:
+            append_captain_log(
+                ws,
+                CaptainLogEntry(
+                    app_id=ws.app_id, slice_id=rs.slice_id,
+                    kind="escalation_raised",
+                    rationale=f"snapshot write failed pre-dispatch: {e}",
+                    references={"event": "snapshot_write_failed"},
+                ),
+            )
+            return (
+                (status + "; " if status else "")
+                + f"snapshot write failed for {rs.slice_id}; not dispatching"
+            )
+
+        # Commit point — runner can pick up after this line.
+        write_current_slice(ws, new_slice)
 
         # Mark in-flight in roadmap.
         rs.status = "in_flight"
@@ -728,7 +986,10 @@ def _recent_auto_merge_failure(ws: AppWorkspace, *, minutes: int) -> bool:
 # --- C8 circuit breaker helpers ---
 
 
-_BAD_VERDICTS = {"reject_hard", "revert", "escalate"}
+# Cycle C HIGH-3 R2 fix: kill_replan was previously excluded, so repeated
+# goose timeouts were unbounded — captain looped forever. Including it means
+# 3 consecutive timeouts now trip the circuit breaker (60min default pause).
+_BAD_VERDICTS = {"reject_hard", "revert", "escalate", "kill_replan"}
 
 
 def _is_paused(ws: AppWorkspace) -> bool:

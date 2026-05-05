@@ -2946,3 +2946,404 @@ def test_pull_request_opened_suppressed_when_already_exists(
     assert len(pr_opened) == 0
     # roadmap_complete still fires (first time).
     assert any(e.kind == "roadmap_complete" for e in log)
+
+
+# ---------------------------------------------------------------------------
+# Cycle C — pluggable validator + dispatched-slice snapshot + retry context
+# ---------------------------------------------------------------------------
+
+
+def _stub_registry(monkeypatch: pytest.MonkeyPatch, *apps) -> None:
+    """Helper: replace load_registry() with a stub returning the given apps."""
+    from chad_captain.apps_registry import AppsRegistry
+    fake = AppsRegistry(apps=list(apps))
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake,
+    )
+
+
+def test_dispatch_writes_snapshot_before_current_slice(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Cycle C HIGH-3 R2 fix: snapshot must exist on disk before
+    current_slice.json (the runner's go-signal). At end of dispatch tick,
+    both files exist and contain the same slice."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="O")])
+    write_roadmap(ws, rm)
+
+    status = captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+    assert "dispatched s1" in status
+    assert ws.last_dispatched_slice_path.exists()
+    assert ws.current_slice_path.exists()
+
+    from chad_captain.protocol import read_last_dispatched_slice
+    snap = read_last_dispatched_slice(ws)
+    assert snap is not None
+    assert snap.slice_id == "s1"
+    assert "O" in snap.user_prompt  # real prompt, not blank
+
+
+def test_validation_clears_snapshot_after_consuming(ws: AppWorkspace) -> None:
+    """Cycle C HIGH-2 R1 fix: prompts don't linger on disk."""
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="SYS", user_prompt="USR", repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # Snapshot was for s1; it's been consumed → should be gone.
+    assert not ws.last_dispatched_slice_path.exists()
+
+
+def test_validation_uses_snapshot_prompts_when_present(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom validator receives real prompts from the snapshot, not blanks."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    captured: dict = {}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        captured["system_prompt"] = dispatched_slice.system_prompt
+        captured["user_prompt"] = dispatched_slice.user_prompt
+        captured["slice_id"] = dispatched_slice.slice_id
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_cycle_c_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_cycle_c_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="MY SYSTEM PROMPT", user_prompt="MY USER PROMPT",
+        repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    assert captured["slice_id"] == "s1"
+    assert captured["system_prompt"] == "MY SYSTEM PROMPT"
+    assert captured["user_prompt"] == "MY USER PROMPT"
+
+    log = read_captain_log(ws)
+    accepts = [e for e in log if e.kind == "validate" and e.verdict == "accept"]
+    assert len(accepts) == 1
+    assert "custom ok" in accepts[0].rationale
+
+
+def test_custom_validator_missing_module_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-1 R1 fix: fail-CLOSED on missing module (not silent
+    fallback to default chain — default may accept silently)."""
+    from chad_captain.apps_registry import RegisteredApp
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="nonexistent.module.path",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    # Exactly one validate entry, and it must be escalate (not accept).
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+
+    # Roadmap slice must NOT be marked done — escalate is a blocked status.
+    rm2 = read_roadmap(ws)
+    assert rm2.slices[0].status == "blocked"
+
+
+def test_custom_validator_missing_attribute_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Module loads but lacks validate_app_completion → escalate."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+
+    mod = types.ModuleType("test_cycle_c_empty_validator")
+    sys.modules["test_cycle_c_empty_validator"] = mod  # no validate_app_completion
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_empty_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+
+
+def test_custom_validator_runtime_error_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom validator raises → captain catches, escalates, doesn't crash."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    mod = types.ModuleType("test_cycle_c_crash_validator")
+
+    def crash(**_kwargs):
+        raise RuntimeError("validator boom")
+
+    mod.validate_app_completion = crash
+    sys.modules["test_cycle_c_crash_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_crash_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="SYS", user_prompt="USR", repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+    assert "validator boom" in validates[0].rationale
+
+
+def test_custom_validator_with_missing_snapshot_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-1 R2 fix: when validator_module is set and the snapshot
+    is missing, captain escalates (does NOT call custom validator with blank
+    proxy prompts)."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+
+    called = {"n": 0}
+
+    def should_not_run(**_kwargs):
+        called["n"] += 1
+        from chad_captain.validator import ValidationResult
+        return ValidationResult(verdict="accept", rationale="should not run")
+
+    mod = types.ModuleType("test_cycle_c_unused_validator")
+    mod.validate_app_completion = should_not_run
+    sys.modules["test_cycle_c_unused_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_unused_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    # NO snapshot written — simulates upgrade or lost file.
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    assert called["n"] == 0  # custom validator must NOT have been called
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+    assert "snapshot" in validates[0].rationale.lower()
+
+
+def test_default_validator_uses_proxy_when_snapshot_missing(
+    ws: AppWorkspace,
+) -> None:
+    """Back-compat: no validator_module + no snapshot = default chain runs
+    against a proxy slice (blank prompts). Existing behavior preserved."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    # No snapshot, no registered app at all.
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    # Default chain: clean exit + files_changed → accept.
+    assert validates[0].verdict == "accept"
+
+
+def test_retry_context_threaded_into_next_dispatch_prompt(
+    ws: AppWorkspace,
+) -> None:
+    """Cycle C MED-5 R1 fix: rejected slice's rationale shows up in the
+    retry's user_prompt as 'PRIOR ATTEMPT FAILED: ...'."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    # Trigger reject_retry: clean exit but no files changed.
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="zero changes",
+                      files_changed=[]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # First tick: validate reject_retry + retry_context written + slice
+    # re-queued + retry dispatched (the captain dispatches in same tick).
+    assert ws.current_slice_path.exists()
+    cs = read_current_slice(ws)
+    assert cs.slice_id == "s1-retry"
+    assert "PRIOR ATTEMPT FAILED" in cs.user_prompt
+    assert "no files changed" in cs.user_prompt.lower()
+    # Sidecar cleared after consumption.
+    assert not ws.retry_context_path.exists()
+
+
+def test_retry_context_cleared_when_stale_slice_id(ws: AppWorkspace) -> None:
+    """Defensive clear: a sidecar pointing at a different slice id must not
+    bleed into an unrelated retry."""
+    from chad_captain.protocol import RetryContext, write_retry_context
+    write_retry_context(
+        ws,
+        RetryContext(slice_id="ghost-slice", rationale="not-this-slice"),
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A")])
+    write_roadmap(ws, rm)
+
+    # Manually trigger a "retry" detection by seeding a recent reject_retry
+    # validate entry for s1 (so is_retry path is taken), but no real prior
+    # rejection of s1 specifically — sidecar is for ghost-slice, must clear.
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id="s1", kind="validate",
+        verdict="reject_retry", rationale="prior",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # Stale sidecar for "ghost-slice" must be gone (defensive clear),
+    # and retry prompt must NOT contain "not-this-slice".
+    assert not ws.retry_context_path.exists()
+    cs = read_current_slice(ws)
+    assert cs is not None
+    assert "not-this-slice" not in cs.user_prompt
+
+
+def test_kill_replan_in_bad_verdicts_trips_circuit_breaker(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-3 R2 fix: kill_replan now counts toward the circuit
+    breaker so unbounded timeout loops are bounded."""
+    from chad_captain.validator import _BAD_VERDICTS
+    assert "kill_replan" in _BAD_VERDICTS, (
+        "kill_replan must be in _BAD_VERDICTS so circuit breaker counts "
+        "repeated timeouts (Cycle C HIGH-3 R2 fix)"
+    )
