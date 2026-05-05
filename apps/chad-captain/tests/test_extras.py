@@ -513,3 +513,111 @@ def test_t3_posts_queue_depth_malformed_listed_in_detail(tmp_path: Path) -> None
     assert score.detail and any(
         "marketing_posts_bad.json" in p for p in score.detail.get("malformed", [])
     )
+
+
+# ---------------------------------------------------------------------------
+# PR11 R3#8 + R2#2: dynamic extras discovery
+# ---------------------------------------------------------------------------
+
+
+def test_app_id_to_module_slug_normalizes_hyphens() -> None:
+    from chad_captain.extras import _app_id_to_module_slug
+    assert _app_id_to_module_slug("t3-chadacys-marketing") == "t3_chadacys_marketing"
+    assert _app_id_to_module_slug("Already_Underscored") == "already_underscored"
+    assert _app_id_to_module_slug("plain") == "plain"
+
+
+def test_get_extras_static_factory_still_wins() -> None:
+    """Static factories take precedence over dynamic discovery."""
+    extras = get_extras("spark-of-defiance")
+    assert len(extras) > 0
+
+
+def test_get_extras_unknown_app_returns_empty(monkeypatch) -> None:
+    """No static factory + no dynamic module => []."""
+    extras = get_extras("totally-nonexistent-app-xyz")
+    assert extras == []
+
+
+def test_get_extras_dynamic_discovery(tmp_path: Path, monkeypatch) -> None:
+    """Module installed at chad_captain.extras.<slug> is auto-discovered."""
+    import sys
+    import types
+    from chad_captain.scorecard import DimensionScore
+
+    def my_dim(repo: Path) -> DimensionScore:
+        return DimensionScore(
+            name="dynamic_dim", score=0.42,
+            rationale="from dynamic module",
+        )
+
+    # Install fake module under chad_captain.extras namespace.
+    mod = types.ModuleType("chad_captain.extras.dynamic_test_app")
+    mod.EXTRAS = [my_dim]
+    sys.modules["chad_captain.extras.dynamic_test_app"] = mod
+    try:
+        extras = get_extras("dynamic-test-app")
+        assert len(extras) == 1
+        score = extras[0](tmp_path)
+        assert score.name == "dynamic_dim"
+        assert score.score == 0.42
+    finally:
+        del sys.modules["chad_captain.extras.dynamic_test_app"]
+
+
+def test_get_extras_dynamic_module_without_extras_returns_empty() -> None:
+    """Module exists but doesn't export EXTRAS => []."""
+    import sys
+    import types
+    mod = types.ModuleType("chad_captain.extras.dynamic_no_extras")
+    sys.modules["chad_captain.extras.dynamic_no_extras"] = mod
+    try:
+        assert get_extras("dynamic-no-extras") == []
+    finally:
+        del sys.modules["chad_captain.extras.dynamic_no_extras"]
+
+
+def test_get_extras_dynamic_module_with_wrong_extras_type_raises() -> None:
+    """EXTRAS must be a list — wrong type is a configuration bug,
+    not a silent fallback."""
+    import sys
+    import types
+    mod = types.ModuleType("chad_captain.extras.dynamic_bad_extras")
+    mod.EXTRAS = "not a list"
+    sys.modules["chad_captain.extras.dynamic_bad_extras"] = mod
+    try:
+        with pytest.raises(TypeError, match="must be list"):
+            get_extras("dynamic-bad-extras")
+    finally:
+        del sys.modules["chad_captain.extras.dynamic_bad_extras"]
+
+
+def test_get_extras_propagates_inner_import_error() -> None:
+    """If the extras module ITSELF imports something missing, the error
+    must propagate — silent swallow would mask scaffold bugs.
+
+    Achieved by stubbing import_module to raise ModuleNotFoundError with
+    a different name than the expected outer module."""
+    import sys
+    import types
+    import importlib
+
+    # Create a real module that, when import_module is called, raises
+    # ModuleNotFoundError naming a NESTED dependency.
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name, package=None):
+        if name == "chad_captain.extras.broken_inner":
+            err = ModuleNotFoundError("No module named 'totally_missing_dep'")
+            err.name = "totally_missing_dep"
+            raise err
+        return real_import_module(name, package)
+
+    monkeypatch_unused = None  # silence linter
+    orig = importlib.import_module
+    importlib.import_module = fake_import_module
+    try:
+        with pytest.raises(ModuleNotFoundError, match="totally_missing_dep"):
+            get_extras("broken-inner")
+    finally:
+        importlib.import_module = orig
