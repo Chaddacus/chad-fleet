@@ -23,7 +23,7 @@ Boundaries (review-locked through 3 codex rounds):
 from __future__ import annotations
 
 from week_intake.protocol import WeekFolder
-from week_intake.types import LifecycleEvent, WeekItem, WeekItemState
+from week_intake.types import LifecycleEvent, Note, WeekItem, WeekItemState
 
 # Allowed source states per transition.
 COMPLETE_FROM: frozenset[str] = frozenset({"routed", "in_progress", "blocked"})
@@ -145,6 +145,33 @@ def reopen_item(week: str, item_id: str) -> WeekItem:
     )
 
 
+def record_note(week: str, item_id: str, text: str) -> WeekItem:
+    """Append an ad-hoc note to an item without mutating state or revision.
+
+    Cycle 7. Useful when execution surfaces information you want attached
+    to the item but no open clarify question exists and no lifecycle
+    transition is warranted (e.g. a discovery correction during dogfood).
+
+    Allowed from any state, including terminal — notes are observations,
+    not state changes. Held under WeekFolder.lock() so concurrent notes
+    don't race; revision is intentionally NOT bumped (notes don't change
+    semantic state).
+    """
+    if not text or not text.strip():
+        raise ValueError("note text must be non-empty")
+    folder = WeekFolder(week=week)
+    with folder.lock():
+        item = folder.get_item(item_id)
+        if item is None:
+            raise TransitionError(
+                f"item {item_id!r} not found in week {week!r}"
+            )
+        item.notes.append(Note(text=text.strip()))
+        item.touch()  # advance updated_at; revision intentionally unchanged
+        folder.upsert_item(item)
+        return item
+
+
 __all__ = [
     "ABANDON_FROM",
     "COMPLETE_FROM",
@@ -152,5 +179,6 @@ __all__ = [
     "TransitionError",
     "abandon_item",
     "complete_item",
+    "record_note",
     "reopen_item",
 ]
