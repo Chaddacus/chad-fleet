@@ -132,6 +132,25 @@ class AppWorkspace:
         return self.root / "retry_context.json"
 
     @property
+    def pending_replan_reasons_path(self) -> Path:
+        """PR9 v6 §6.1 trigger queue: JSONL of pending replan reasons
+        (Twin enqueues 'scope change', 'admiral note batch', 'cost
+        breach', etc.). Replanner drains on next tick before deciding
+        what to generate. Atomic append via append_jsonl; consumer
+        rotates by truncating the file under exclusive flock.
+        """
+        return self.root / "pending_replan_reasons.jsonl"
+
+    @property
+    def goose_pid_path(self) -> Path:
+        """PR9 v6 §6.3.1 scope-change abort: PID of the running goose
+        subprocess for the current slice. goose-runner writes at spawn,
+        clears at exit. Twin reads to send SIGTERM when scope changes
+        invalidate an in-flight slice.
+        """
+        return self.root / "goose.pid"
+
+    @property
     def twin_holds_dir(self) -> Path:
         """PR8 v6 §validation L4: per-task hold markers written by Twin.
 
@@ -321,7 +340,15 @@ class RoadmapSlice(BaseModel):
     phase: str = ""  # e.g. "T-32", "fundations", "compliance"
     estimated_minutes: int = 30
     blocked_by: list[str] = Field(default_factory=list)
-    status: Literal["queued", "in_flight", "done", "skipped", "blocked"] = "queued"
+    status: Literal[
+        "queued", "in_flight", "done", "skipped", "blocked",
+        # PR9 v6 §6.3.1: slice was superseded by a mid-flight scope change
+        # (Twin received a clarification or new task that invalidates the
+        # current slice). goose-runner is SIGTERM'd; the slice is marked
+        # superseded_by_scope_change instead of done/blocked so the
+        # replanner can decide whether to regenerate or move on.
+        "superseded_by_scope_change",
+    ] = "queued"
     notes: str = ""
 
     # Cycle E: per-slice prompt overrides. When set, build_current_slice uses
@@ -608,6 +635,144 @@ def update_feature_backlog(
         os.close(fd)
 
 
+# ---------------------------------------------------------------------------
+# PR9 v6 §6.1 — pending replan reasons queue
+# ---------------------------------------------------------------------------
+
+
+_REPLAN_REASON_PRIORITIES = {
+    "scope_change": 0,        # highest — Twin saw a clarification mid-flight
+    "admiral_note_batch": 1,
+    "cost_breach": 2,
+    "stalled": 3,
+    "manual": 4,
+    "exhausted": 5,           # lowest — natural drain
+}
+
+
+def enqueue_replan_reason(
+    ws: AppWorkspace,
+    *,
+    reason: str,
+    detail: str = "",
+    source: str = "twin",
+) -> None:
+    """Append one pending-replan reason to the queue. Caller passes a
+    ``reason`` from the well-known set above (unknown reasons are
+    accepted but get the lowest priority). Replanner drains via
+    ``drain_replan_reasons`` on the next tick.
+    """
+    ws.ensure()
+    append_jsonl(
+        ws.pending_replan_reasons_path,
+        {
+            "ts": _now_iso(),
+            "reason": reason,
+            "detail": detail,
+            "source": source,
+            "priority": _REPLAN_REASON_PRIORITIES.get(reason, 99),
+        },
+    )
+
+
+def drain_replan_reasons(ws: AppWorkspace) -> list[dict]:
+    """Atomically read+truncate the queue. Returns entries sorted by
+    priority (lowest int = most urgent), then by ts.
+
+    Uses an exclusive flock on a sibling .lock file so concurrent
+    enqueues during a drain never lose entries (the truncate-after-read
+    pattern is safe because enqueue_replan_reason takes the same lock
+    via append_jsonl's PIPE_BUF guarantee + the file's append mode).
+    """
+    import fcntl
+    if not ws.pending_replan_reasons_path.exists():
+        return []
+    lock_path = ws.pending_replan_reasons_path.parent / (
+        f".{ws.pending_replan_reasons_path.name}.lock"
+    )
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            entries: list[dict] = []
+            with open(ws.pending_replan_reasons_path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            # Truncate the queue. Done under the lock so a parallel
+            # enqueue cannot land an entry that we then drop.
+            ws.pending_replan_reasons_path.write_text("")
+            entries.sort(key=lambda e: (e.get("priority", 99), e.get("ts", "")))
+            return entries
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# PR9 v6 §6.3.1 — goose PID tracking + scope-change abort
+# ---------------------------------------------------------------------------
+
+
+def write_goose_pid(ws: AppWorkspace, pid: int) -> None:
+    """Record the running goose subprocess PID so Twin can SIGTERM it
+    when a scope change invalidates the in-flight slice. Called by
+    goose-runner immediately after Popen succeeds."""
+    ws.ensure()
+    atomic_write(ws.goose_pid_path, str(pid))
+
+
+def read_goose_pid(ws: AppWorkspace) -> int | None:
+    """Return the recorded goose PID, or None if no slice is in flight."""
+    if not ws.goose_pid_path.exists():
+        return None
+    try:
+        return int(ws.goose_pid_path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def clear_goose_pid(ws: AppWorkspace) -> None:
+    """Remove the PID marker. Called by goose-runner on normal exit."""
+    try:
+        ws.goose_pid_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def send_goose_abort_signal(ws: AppWorkspace) -> bool:
+    """Send SIGTERM to the recorded goose PID. Returns True if a signal
+    was delivered, False if no PID was tracked or the process was gone.
+
+    Caller (Twin scope-change handler) should follow up by marking the
+    in-flight slice as ``superseded_by_scope_change`` in the roadmap.
+    Does NOT clear the PID file — goose-runner will do that on its own
+    exit path so we don't race the cleanup.
+    """
+    import errno
+    import signal
+    pid = read_goose_pid(ws)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        # Already exited — nothing to abort.
+        return False
+    except OSError as exc:
+        if exc.errno == errno.EPERM:
+            # Different user owns the PID; treat as not-aborted, log upstream.
+            return False
+        raise
+
+
 def write_last_dispatched_slice(ws: AppWorkspace, slice_: CurrentSlice) -> None:
     """Cycle C: captain-owned snapshot of dispatched slice. Written BEFORE
     current_slice.json so the validator can always see the real prompts."""
@@ -705,6 +870,12 @@ __all__ = [
     "write_feature_backlog",
     "update_feature_backlog",
     "BacklogGenerationConflict",
+    "enqueue_replan_reason",
+    "drain_replan_reasons",
+    "write_goose_pid",
+    "read_goose_pid",
+    "clear_goose_pid",
+    "send_goose_abort_signal",
     "write_last_dispatched_slice",
     "read_last_dispatched_slice",
     "clear_last_dispatched_slice",

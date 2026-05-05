@@ -35,7 +35,9 @@ from chad_captain.protocol import (
     SliceComplete,
     append_progress,
     clear_current_slice,
+    clear_goose_pid,
     read_current_slice,
+    write_goose_pid,
     write_slice_complete,
 )
 
@@ -296,6 +298,15 @@ class GooseRunner:
                 lf.write(f"GOOSE BIN NOT FOUND: {exc}\n")
                 return 127, str(exc)[-2048:]
 
+            # PR9 v6 §6.3.1: record goose PID so Twin scope-change handler
+            # can SIGTERM us if the in-flight slice gets invalidated.
+            try:
+                write_goose_pid(self.ws, proc.pid)
+            except OSError as exc:
+                # PID file is best-effort; missing it just means scope-change
+                # abort can't reach this process. Log and continue.
+                lf.write(f"warning: could not write goose.pid: {exc}\n")
+
             # Stream stdout lines → log + progress.jsonl heartbeats.
             stream_thread = threading.Thread(
                 target=self._tail_subprocess,
@@ -311,6 +322,13 @@ class GooseRunner:
                 proc.wait()
                 exit_code = -9
                 lf.write(f"\nTIMEOUT after {timeout}s — process killed.\n")
+            finally:
+                # Always clear PID — whether we exited normally, timed out,
+                # or were SIGTERM'd by Twin's scope-change abort.
+                try:
+                    clear_goose_pid(self.ws)
+                except OSError:
+                    pass
 
             stream_thread.join(timeout=5)
 
