@@ -74,6 +74,12 @@ def tick_autonomous_apps() -> dict[str, str]:
     for app in registry.apps:
         if app.mode != "autonomous":
             continue
+        # PR6: respect enabled=False (scaffold staging gate). A captain
+        # whose scaffold transaction failed phase 5 ACTIVATE stays
+        # enabled=false; daemon must NOT tick it.
+        if not getattr(app, "enabled", True):
+            results[app.app_id] = "skipped (enabled=false)"
+            continue
         results[app.app_id] = _tick_one(app)
     return results
 

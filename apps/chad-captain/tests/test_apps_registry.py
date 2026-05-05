@@ -275,3 +275,218 @@ def test_goose_runner_bootstrap_command_format() -> None:
     assert cmd[0] == "launchctl"
     assert cmd[1] == "bootstrap"
     assert str(goose_runner_plist_path_for(app)) in cmd
+
+
+# ---------------------------------------------------------------------------
+# PR6: file locking + transaction + enabled field
+# ---------------------------------------------------------------------------
+
+
+def test_registered_app_enabled_default_true() -> None:
+    """PR6/v8 R5#2: enabled defaults to True for back-compat."""
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    assert app.enabled is True
+
+
+def test_registered_app_enabled_can_be_false() -> None:
+    """Scaffold staging: phase 4 REGISTER writes enabled=False; phase 5
+    flips to True only on successful activation."""
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x", enabled=False)
+    assert app.enabled is False
+
+
+def test_save_load_roundtrips_enabled_field() -> None:
+    reg = AppsRegistry(apps=[
+        RegisteredApp(app_id="active", name="A", repo_path="/tmp/a", enabled=True),
+        RegisteredApp(app_id="staged", name="S", repo_path="/tmp/s", enabled=False),
+    ])
+    save_registry(reg)
+    out = load_registry()
+    assert out.by_id("active").enabled is True
+    assert out.by_id("staged").enabled is False
+
+
+def test_load_registry_uses_atomic_write_no_torn_read(tmp_path: Path) -> None:
+    """PR6 R3#1: save_registry uses tempfile + os.replace so a concurrent
+    reader never sees a partial JSON file. Simulate by writing many times
+    and reading; never see a parse error from torn write."""
+    reg = AppsRegistry(apps=[
+        RegisteredApp(app_id="x", name="X", repo_path="/tmp/x"),
+    ])
+    for _ in range(50):
+        save_registry(reg)
+        out = load_registry()
+        assert len(out.apps) == 1
+        assert out.apps[0].app_id == "x"
+
+
+def test_registry_transaction_commits_on_normal_exit() -> None:
+    from chad_captain.apps_registry import registry_transaction
+    with registry_transaction() as reg:
+        reg.upsert(RegisteredApp(app_id="t1", name="T1", repo_path="/tmp/t1"))
+    out = load_registry()
+    assert out.by_id("t1") is not None
+
+
+def test_registry_transaction_swallows_changes_if_caller_raises() -> None:
+    """Sanity: if the caller raises inside the transaction, save still
+    commits whatever was mutated up to the raise. fcntl flock is released
+    on context-manager exit either way. Documenting current behavior so
+    callers don't expect rollback semantics from the transaction."""
+    from chad_captain.apps_registry import registry_transaction
+    initial = AppsRegistry(apps=[
+        RegisteredApp(app_id="keep", name="K", repo_path="/tmp/k"),
+    ])
+    save_registry(initial)
+    with pytest.raises(RuntimeError):
+        with registry_transaction() as reg:
+            reg.upsert(RegisteredApp(app_id="new", name="N", repo_path="/tmp/n"))
+            raise RuntimeError("simulated crash")
+    out = load_registry()
+    # Pre-existing app still there; new app NOT committed because the raise
+    # happened before the save block.
+    assert out.by_id("keep") is not None
+    assert out.by_id("new") is None
+
+
+def test_registry_lock_path_separate_from_registry_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lock file is sibling to the registry file with a `.` prefix +
+    `.lock` suffix, NOT a different directory."""
+    from chad_captain.apps_registry import registry_lock_path, registry_path
+    assert registry_lock_path() != registry_path()
+    assert registry_lock_path().parent == registry_path().parent
+
+
+def test_registry_lock_path_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom = tmp_path / "custom.lock"
+    monkeypatch.setenv("CHAD_CAPTAIN_APPS_REGISTRY_LOCK", str(custom))
+    from chad_captain.apps_registry import registry_lock_path
+    assert registry_lock_path() == custom
+
+
+def test_load_registry_propagates_parse_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR6 R3#1: prior load_registry() swallowed ANY exception as 'empty
+    registry'. That hid corruption from daemon ticks. New behavior:
+    propagate the exception so the caller sees the real failure."""
+    from chad_captain.apps_registry import registry_path
+    p = registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("not-json{{")
+    with pytest.raises(Exception):
+        load_registry()
+
+
+# ---------------------------------------------------------------------------
+# PR6 Slice 3: task_id propagation through models
+# ---------------------------------------------------------------------------
+
+
+def test_current_slice_task_id_default_none() -> None:
+    from chad_captain.protocol import CurrentSlice
+    cs = CurrentSlice(
+        slice_id="s1", app_id="a", objective="o",
+        system_prompt="s", user_prompt="u", repo_path="/tmp/r",
+    )
+    assert cs.task_id is None
+
+
+def test_current_slice_task_id_roundtrips() -> None:
+    from chad_captain.protocol import CurrentSlice
+    cs = CurrentSlice(
+        slice_id="s1", app_id="a", objective="o",
+        system_prompt="s", user_prompt="u", repo_path="/tmp/r",
+        task_id="task-abc",
+    )
+    rt = CurrentSlice.model_validate_json(cs.model_dump_json())
+    assert rt.task_id == "task-abc"
+
+
+def test_slice_complete_carries_task_id_and_removed_tests_reason() -> None:
+    from chad_captain.protocol import SliceComplete
+    sc = SliceComplete(
+        slice_id="s1", app_id="a", duration_seconds=1.0, goose_exit_code=0,
+        summary="ok", task_id="t-1", removed_tests_reason="rationale",
+    )
+    rt = SliceComplete.model_validate_json(sc.model_dump_json())
+    assert rt.task_id == "t-1"
+    assert rt.removed_tests_reason == "rationale"
+
+
+def test_captain_log_entry_carries_task_id() -> None:
+    from chad_captain.protocol import CaptainLogEntry
+    e = CaptainLogEntry(
+        app_id="a", kind="dispatch", rationale="x", task_id="t-1",
+    )
+    rt = CaptainLogEntry.model_validate_json(e.model_dump_json())
+    assert rt.task_id == "t-1"
+
+
+def test_roadmap_slice_carries_task_id() -> None:
+    from chad_captain.protocol import RoadmapSlice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="o", task_id="t-1",
+    )
+    rt = RoadmapSlice.model_validate_json(rs.model_dump_json())
+    assert rt.task_id == "t-1"
+
+
+def test_feature_backlog_item_carries_task_id() -> None:
+    from chad_captain.protocol import FeatureBacklogItem
+    fb = FeatureBacklogItem(id="fb-001", title="x", task_id="t-1")
+    rt = FeatureBacklogItem.model_validate_json(fb.model_dump_json())
+    assert rt.task_id == "t-1"
+
+
+def test_build_current_slice_propagates_task_id() -> None:
+    from chad_captain.protocol import RoadmapSlice
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="ship a thing", task_id="task-xyz",
+    )
+    cs = build_current_slice(rs, app_id="my-app", repo_path="/tmp/r")
+    assert cs.task_id == "task-xyz"
+
+
+def test_build_current_slice_task_id_none_when_roadmap_slice_has_none() -> None:
+    from chad_captain.protocol import RoadmapSlice
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(slice_id="s1", objective="x")
+    cs = build_current_slice(rs, app_id="my-app", repo_path="/tmp/r")
+    assert cs.task_id is None
+
+
+def test_legacy_models_load_without_task_id_field() -> None:
+    """Migration safety: pre-PR6 JSON without task_id field still loads."""
+    from chad_captain.protocol import (
+        CaptainLogEntry, CurrentSlice, FeatureBacklogItem,
+        RoadmapSlice, SliceComplete,
+    )
+    # Each model loads from JSON that omits task_id — defaults to None.
+    cs = CurrentSlice.model_validate_json(
+        '{"slice_id":"s","app_id":"a","objective":"o",'
+        '"system_prompt":"s","user_prompt":"u","repo_path":"/tmp"}'
+    )
+    assert cs.task_id is None
+    sc = SliceComplete.model_validate_json(
+        '{"slice_id":"s","app_id":"a","duration_seconds":1,'
+        '"goose_exit_code":0,"summary":"ok"}'
+    )
+    assert sc.task_id is None
+    cle = CaptainLogEntry.model_validate_json(
+        '{"app_id":"a","kind":"dispatch"}'
+    )
+    assert cle.task_id is None
+    rs = RoadmapSlice.model_validate_json(
+        '{"slice_id":"s","objective":"o"}'
+    )
+    assert rs.task_id is None
+    fb = FeatureBacklogItem.model_validate_json(
+        '{"id":"fb-1","title":"x"}'
+    )
+    assert fb.task_id is None

@@ -366,6 +366,9 @@ def build_current_slice(
         user_prompt=user,
         repo_path=repo_path,
         parent_slice_id=parent_slice_id,
+        # PR6/v8: propagate task_id from RoadmapSlice → CurrentSlice so the
+        # eventual SliceComplete + CaptainLogEntry can carry it forward.
+        task_id=rs.task_id,
     )
 
 
@@ -688,6 +691,9 @@ def captain_tick(
                 rubric_delta_pp=result.rubric_delta_pp,
                 rationale=result.rationale,
                 references={"diff_path": completion.diff_path or "", "log_path": completion.log_path or ""},
+                # PR6/v8: propagate task_id from the dispatched slice so
+                # Twin's close-handler can filter validate entries by task.
+                task_id=getattr(dispatched_slice, "task_id", None) if dispatched_slice else None,
             ),
         )
         clear_slice_complete(ws)

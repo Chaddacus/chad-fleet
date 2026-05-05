@@ -181,6 +181,12 @@ class CurrentSlice(BaseModel):
     expected_rubric_categories: list[str] = Field(default_factory=list)
     parent_slice_id: str | None = None  # set on retry/replan derivatives
 
+    # PR6/v8: task_id propagation. None for legacy slices that pre-date
+    # the Twin daemon's task-scoped scaffolding. Twin's close handler
+    # filters by task_id; legacy None slices are excluded from any
+    # task close check (never block).
+    task_id: str | None = None
+
 
 class ProgressEvent(BaseModel):
     """One event in progress.jsonl. Append-only stream from goose-runner."""
@@ -218,6 +224,15 @@ class SliceComplete(BaseModel):
     log_path: str | None = None
     failure_tail: str | None = None  # last 2KB of stderr if exit != 0
     cheat_flags: list[str] = Field(default_factory=list)
+
+    # PR6/v8: task_id copied from CurrentSlice so close-handler queries can
+    # filter by task. None for legacy completes.
+    task_id: str | None = None
+    # PR6/v8 R4#10: when goose deletes test files/functions, the runner
+    # MUST set this field with a human-readable rationale. Captain
+    # validator inspects diff for deletions and rejects (reject_retry/
+    # reject_hard) if deletions present without this rationale.
+    removed_tests_reason: str | None = None
 
 
 CaptainVerdict = Literal[
@@ -270,6 +285,9 @@ class CaptainLogEntry(BaseModel):
     rubric_delta_pp: float | None = None
     rationale: str = ""
     references: dict = Field(default_factory=dict)  # admiral_note_id, slice_id, etc.
+    # PR6/v8: copied from the dispatched CurrentSlice so Twin's close-handler
+    # can filter captain_log by task_id. None for legacy entries.
+    task_id: str | None = None
 
 
 class RoadmapSlice(BaseModel):
@@ -292,6 +310,11 @@ class RoadmapSlice(BaseModel):
     # independently — None = use default for that field.
     custom_system_prompt: str | None = None
     custom_user_prompt: str | None = None
+
+    # PR6/v8: task_id copied from the FeatureBacklogItem this slice was
+    # generated from. Threaded into CurrentSlice when build_current_slice
+    # constructs the dispatched slice. None for legacy slices.
+    task_id: str | None = None
 
 
 class Roadmap(BaseModel):
@@ -327,6 +350,10 @@ class FeatureBacklogItem(BaseModel):
     shipped_in: str | None = None  # e.g. "PR#147"
     shipped_at: str | None = None
     created_at: str = Field(default_factory=_now_iso)
+    # PR6/v8: task_id this backlog item belongs to. Set by SCAFFOLD when
+    # the backlog is seeded from a Twin task. None for hand-seeded
+    # backlog items predating the Twin daemon.
+    task_id: str | None = None
 
 
 class FeatureBacklog(BaseModel):
