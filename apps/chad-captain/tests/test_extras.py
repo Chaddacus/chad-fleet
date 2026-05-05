@@ -214,9 +214,10 @@ def test_get_extras_returns_empty_for_unknown_app() -> None:
 
 
 def test_get_extras_returns_spark_dimensions() -> None:
-    # Cycle F: 4 spark dims — voice_guide, chapters, drafts, bible.
+    # Cycle F + PR2/T1: 5 spark dims — voice_guide, chapters, drafts,
+    # bible, chapter_audit_progress.
     extras = get_extras("spark-of-defiance")
-    assert len(extras) == 4
+    assert len(extras) == 5
     assert all(callable(fn) for fn in extras)
 
 
@@ -258,3 +259,130 @@ def test_score_repo_handles_extra_raising(tmp_path: Path) -> None:
     assert boom_dim is not None
     assert boom_dim.score == 0.0
     assert "kaboom" in boom_dim.rationale
+
+
+# ---------------------------------------------------------------------------
+# PR2 / T1 — chapter_audit_progress + ChapterGrade artifact
+# ---------------------------------------------------------------------------
+
+
+def test_chapter_grade_round_trip() -> None:
+    from chad_captain.extras.spark_grades import (
+        ChapterGrade, ChapterGradesFile,
+    )
+    g = ChapterGrade(
+        chapter_id="ch01",
+        last_graded_at="2026-05-04T12:00:00Z",
+        overall_score=0.7,
+        blockers=["pacing"],
+        next_action="tighten",
+    )
+    f = ChapterGradesFile(last_updated="2026-05-04T12:00:00Z", grades=[g])
+    raw = f.model_dump_json()
+    loaded = ChapterGradesFile.model_validate_json(raw)
+    assert loaded.grades[0].chapter_id == "ch01"
+    assert loaded.grades[0].overall_score == 0.7
+    assert loaded.by_id("ch01").blockers == ["pacing"]
+    assert loaded.by_id("missing") is None
+
+
+def test_chapter_audit_progress_no_grades_file_no_chapters(tmp_path: Path) -> None:
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    d = chapter_audit_progress(tmp_path)
+    assert d.score == 0.5
+    assert "audit not started" in d.rationale
+
+
+def test_chapter_audit_progress_no_grades_with_chapters(tmp_path: Path) -> None:
+    """No grades + chapters present = 0/N covered = 0.0 score."""
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    chapters = tmp_path / "chapters"
+    chapters.mkdir()
+    (chapters / "ch01.md").write_text("content")
+    (chapters / "ch02.md").write_text("content")
+    d = chapter_audit_progress(tmp_path)
+    # No grades file → 0.5 floor (audit not started signal).
+    assert d.score == 0.5
+
+
+def test_chapter_audit_progress_full_coverage(tmp_path: Path) -> None:
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    chapters = tmp_path / "chapters"
+    chapters.mkdir()
+    (chapters / "ch01.md").write_text("c")
+    (chapters / "ch02.md").write_text("c")
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "chapter_grades.json").write_text(
+        '{"last_updated": "2026-05-04T12:00:00Z", "grades": ['
+        '{"chapter_id": "ch01", "last_graded_at": "...", "overall_score": 0.8},'
+        '{"chapter_id": "ch02", "last_graded_at": "...", "overall_score": 0.9}'
+        ']}'
+    )
+    d = chapter_audit_progress(tmp_path)
+    assert d.score == 1.0
+    assert "2/2 chapters graded" in d.rationale
+
+
+def test_chapter_audit_progress_partial(tmp_path: Path) -> None:
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    chapters = tmp_path / "chapters"
+    chapters.mkdir()
+    for i in range(1, 5):
+        (chapters / f"ch{i:02d}.md").write_text("c")
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "chapter_grades.json").write_text(
+        '{"last_updated": "x", "grades": ['
+        '{"chapter_id": "ch01", "last_graded_at": "x", "overall_score": 0.8}'
+        ']}'
+    )
+    d = chapter_audit_progress(tmp_path)
+    assert d.score == 0.25  # 1 of 4
+    assert "1/4 chapters graded" in d.rationale
+
+
+def test_chapter_audit_progress_drafts_dir_counts(tmp_path: Path) -> None:
+    """drafts/ files also count as chapter content per the path candidates."""
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    drafts = tmp_path / "drafts"
+    drafts.mkdir()
+    (drafts / "prologue.md").write_text("c")
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "chapter_grades.json").write_text(
+        '{"last_updated": "x", "grades": ['
+        '{"chapter_id": "prologue", "last_graded_at": "x", "overall_score": 0.6}'
+        ']}'
+    )
+    d = chapter_audit_progress(tmp_path)
+    assert d.score == 1.0
+
+
+def test_chapter_audit_progress_malformed_grades_file(tmp_path: Path) -> None:
+    from chad_captain.extras.spark_grades import chapter_audit_progress
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "chapter_grades.json").write_text("not-json")
+    d = chapter_audit_progress(tmp_path)
+    assert d.score == 0.0
+    assert "malformed" in d.rationale
+
+
+def test_find_grades_file_checks_all_candidates(tmp_path: Path) -> None:
+    from chad_captain.extras.spark_grades import (
+        GRADES_PATH_CANDIDATES, find_grades_file,
+    )
+    assert find_grades_file(tmp_path) is None
+    # Use last candidate (root-level).
+    (tmp_path / "chapter_grades.json").write_text("{}")
+    found = find_grades_file(tmp_path)
+    assert found is not None
+    assert found.name == "chapter_grades.json"
+
+
+def test_spark_default_has_auto_replan_false() -> None:
+    """T1/PR2: SPARK_DEFAULT must opt out of auto_replan so the captain
+    never auto-mutates manuscript work."""
+    from chad_captain.apps_registry import SPARK_DEFAULT
+    assert SPARK_DEFAULT.auto_replan is False

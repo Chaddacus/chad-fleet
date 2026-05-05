@@ -3546,3 +3546,137 @@ def test_roadmap_slice_back_compat_loads_without_custom_fields() -> None:
     rs = RoadmapSlice.model_validate_json(legacy)
     assert rs.custom_system_prompt is None
     assert rs.custom_user_prompt is None
+
+
+# ---------------------------------------------------------------------------
+# PR2 R3-HIGH-2 — post-merge refresh failure fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_post_merge_refresh_failure_pauses_dispatch_and_keeps_roadmap(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Codex R3 finding: when refresh_base_branch fails, captain previously
+    cleared roadmap + emitted post_merge_cycle. Next tick could re-dispatch
+    new work on the stale captain branch. Fix: pause dispatch, KEEP roadmap,
+    don't emit post_merge_cycle."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain import merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/test-branch",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Seed a pull_request_opened entry so _maybe_handle_pr_merge has work.
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id=None, kind="pull_request_opened",
+        rationale="seed",
+        references={"pr_url": "https://github.com/o/r/pull/1"},
+    ))
+
+    # Stub gh: PR is MERGED so post-merge handler runs.
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc123"},
+                                   "mergedAt": "2026-05-05T00:00:00Z"}),
+    )
+    # Refresh fails:
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **_kw: mf.CmdResult(ok=False, summary="fetch failed: timeout"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # Pause file MUST be set (dispatch blocked).
+    assert ws.pause_until_path.exists()
+    pause_data = __import__("json").loads(ws.pause_until_path.read_text())
+    assert pause_data.get("reason") == "post_merge_refresh_failed"
+
+    # Roadmap MUST still exist (don't clear when refresh failed).
+    assert ws.roadmap_path.exists()
+
+    # post_merge_cycle MUST NOT have been emitted.
+    log = read_captain_log(ws)
+    assert not any(e.kind == "post_merge_cycle" for e in log)
+    # Escalation WAS emitted with the right event tag.
+    escalations = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "post_merge_refresh_failed"
+    ]
+    assert len(escalations) == 1
+    assert "stale-branch" in escalations[0].rationale.lower()
+
+
+def test_post_merge_refresh_success_clears_roadmap_and_emits_cycle(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Back-compat: when refresh succeeds, the original behavior holds —
+    roadmap cleared, post_merge_cycle emitted."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain import merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/test-branch",
+        pr_base_branch="main",
+        auto_open_pr=True,
+        verify_cmd=None,  # skip post-merge verify
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id=None, kind="pull_request_opened",
+        rationale="seed",
+        references={"pr_url": "https://github.com/o/r/pull/1"},
+    ))
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc123"},
+                                   "mergedAt": "2026-05-05T00:00:00Z"}),
+    )
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ff: at abc123"),
+    )
+    monkeypatch.setattr(
+        mf, "delete_local_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="deleted"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    assert any(e.kind == "post_merge_cycle" for e in log)
+    # Roadmap WAS cleared.
+    assert not ws.roadmap_path.exists()

@@ -155,7 +155,14 @@ def cmd_tick(args: argparse.Namespace) -> None:
         # Validation only: process completion if present, no dispatch and no replan.
         from chad_captain.protocol import read_slice_complete
         if read_slice_complete(ws) is None:
-            # Cheapest signal of life: refresh scorecard + ensure roadmap exists.
+            # T1/Cycle D fix: registered apps with auto_replan=False
+            # (manuscript captains, T1 Spark publish) MUST NOT auto-replan.
+            # The admiral controls every replan via `chad-captain replan`.
+            if app and not app.auto_replan:
+                print(f"[{args.app}] observe_only: idle (auto_replan=False)")
+                return
+            # Legacy observe_only with auto_replan default-True: refresh
+            # scorecard + ensure roadmap exists.
             from chad_captain.replanner import replan_if_needed
             new_rm = replan_if_needed(ws, repo)
             print(f"[{args.app}] observe_only: " + (
@@ -210,7 +217,14 @@ def cmd_install_plists(args: argparse.Namespace) -> None:
     from pathlib import Path as _Path
 
     from chad_captain.apps_registry import load_registry
-    from chad_captain.launchd import bootstrap_command, render_plist, write_plist
+    from chad_captain.launchd import (
+        bootstrap_command,
+        goose_runner_bootstrap_command,
+        render_goose_runner_plist,
+        render_plist,
+        write_goose_runner_plist,
+        write_plist,
+    )
 
     reg = load_registry()
     if not reg.apps:
@@ -219,13 +233,24 @@ def cmd_install_plists(args: argparse.Namespace) -> None:
     target = _Path(args.target_dir).expanduser() if args.target_dir else None
     for app in reg.apps:
         if args.dry_run:
-            print(f"=== {app.app_id} ===")
+            print(f"=== {app.app_id} (tick) ===")
             print(render_plist(app))
+            if app.mode == "autonomous":
+                print(f"=== {app.app_id} (goose-runner) ===")
+                print(render_goose_runner_plist(app))
             continue
         path = write_plist(app, target_dir=target)
         print(f"Wrote {path}")
         print("  Bootstrap with:")
         print("    " + " ".join(bootstrap_command(app)))
+        # PR2 R3-HIGH-1: autonomous apps need a long-running goose-runner
+        # alongside the periodic tick. observe_only apps don't dispatch
+        # slices so they don't need it.
+        if app.mode == "autonomous":
+            gr_path = write_goose_runner_plist(app, target_dir=target)
+            print(f"Wrote {gr_path}")
+            print("  Bootstrap with:")
+            print("    " + " ".join(goose_runner_bootstrap_command(app)))
 
 
 def cmd_init_workspace(args: argparse.Namespace) -> None:
@@ -251,13 +276,27 @@ def cmd_init_workspace(args: argparse.Namespace) -> None:
 
 
 def cmd_replan(args: argparse.Namespace) -> None:
+    from chad_captain.apps_registry import load_registry
     from chad_captain.protocol import AppWorkspace
     from chad_captain.replanner import replan
+
+    # PR2 fix: resolve repo from registry when --repo not provided. Lets
+    # admiral run `chad-captain replan --app <id>` without remembering
+    # the repo path for every captain.
+    repo = args.repo
+    if not repo:
+        reg_app = load_registry().by_id(args.app)
+        repo = reg_app.repo_path if reg_app else None
+    if not repo:
+        print(
+            f"Unknown app {args.app!r} and no --repo provided", file=sys.stderr,
+        )
+        sys.exit(2)
 
     ws = AppWorkspace(args.app)
     roadmap = replan(
         ws,
-        args.repo,
+        repo,
         trigger=args.trigger,
         refresh_research=args.refresh_research,
         use_llm=not args.no_llm,
@@ -308,6 +347,42 @@ def cmd_research(args: argparse.Namespace) -> None:
         print(profile.web.landscape_md)
     elif profile.web.reason:
         print(f"  reason: {profile.web.reason}")
+
+
+def cmd_scorecard(args: argparse.Namespace) -> None:
+    """Print one app's fresh scorecard (baseline dims + extras).
+
+    PR2 R3-MED-3 fix: T1 manuscript captain runbook needs a way for the
+    admiral to see "how is this app doing" without triggering replan or
+    dispatch. `chad-captain tick` is too side-effecty for the daily
+    glance; `chad-captain status` is global JSON. This is the missing
+    per-app inspection command.
+    """
+    from chad_captain.apps_registry import load_registry
+    from chad_captain.extras import get_extras
+    from chad_captain.scorecard import score_repo
+
+    reg_app = load_registry().by_id(args.app)
+    repo = args.repo or (reg_app.repo_path if reg_app else None)
+    if not repo:
+        print(
+            f"Unknown app {args.app!r} and no --repo provided", file=sys.stderr,
+        )
+        sys.exit(2)
+
+    sc = score_repo(repo, extras=get_extras(args.app))
+    if args.json:
+        print(sc.model_dump_json(indent=2))
+        return
+
+    print(f"App: {args.app}")
+    print(f"Repo: {repo}")
+    print(f"Aggregate: {sc.aggregate:.4f}")
+    print()
+    print(f"{'Dimension':<36} {'Score':>8}  Rationale")
+    print(f"{'-' * 36} {'-' * 8}  {'-' * 40}")
+    for d in sc.dimensions:
+        print(f"{d.name:<36} {d.score:>8.4f}  {d.rationale[:60]}")
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -622,10 +697,12 @@ def main(argv: list[str] | None = None) -> None:
 
     replan_p = sub.add_parser("replan", help="Run the replanner and write a fresh roadmap")
     replan_p.add_argument("--app", required=True, metavar="APP_ID")
-    replan_p.add_argument("--repo", required=True, metavar="PATH")
+    # PR2 fix: --repo is now optional; resolved from registry when registered.
+    replan_p.add_argument("--repo", default=None, metavar="PATH",
+                          help="Override repo_path (default: registry lookup)")
     replan_p.add_argument("--trigger", default="manual",
                           choices=("initial", "exhausted", "soft_accept_streak",
-                                    "admiral_note", "manual"))
+                                    "admiral_note", "manual", "publish"))
     replan_p.add_argument("--refresh-research", action="store_true")
     replan_p.add_argument("--no-llm", action="store_true",
                           help="Skip the LLM call; use the deterministic fallback")
@@ -702,6 +779,19 @@ def main(argv: list[str] | None = None) -> None:
     ideate_p.add_argument("--model", default="opus",
                            choices=("opus", "haiku", "sonnet"))
 
+    scorecard_p = sub.add_parser(
+        "scorecard",
+        help="Print one app's fresh scorecard (baseline dims + extras)",
+    )
+    scorecard_p.add_argument("--app", required=True, metavar="APP_ID")
+    scorecard_p.add_argument(
+        "--repo", default=None, metavar="PATH",
+        help="Override repo_path (default: registry lookup)",
+    )
+    scorecard_p.add_argument(
+        "--json", action="store_true", help="Print full scorecard as JSON",
+    )
+
     research_p = sub.add_parser("research", help="Build or read app research profile")
     research_p.add_argument("--app", required=True, metavar="APP_ID")
     research_p.add_argument("--repo", default=None, metavar="PATH",
@@ -723,6 +813,7 @@ def main(argv: list[str] | None = None) -> None:
         "alerts": cmd_alerts,
         "actions": cmd_actions,
         "status": cmd_status,
+        "scorecard": cmd_scorecard,
         "research": cmd_research,
         "replan": cmd_replan,
         "tick": cmd_tick,

@@ -126,13 +126,146 @@ def bootout_command(app: RegisteredApp) -> list[str]:
     return ["launchctl", "bootout", "gui/$(id -u)", str(plist_path_for(app))]
 
 
+# ---------------------------------------------------------------------------
+# PR2 R3-HIGH-1: goose-runner long-running plist
+# ---------------------------------------------------------------------------
+#
+# captain_tick writes current_slice.json and waits for slice_complete.json.
+# That gap is filled by chad-captain-goose-runner, which polls the workspace
+# and shells out to goose. Without a runner process, autonomous captains
+# stall forever.
+#
+# Each autonomous app gets a SECOND plist with KeepAlive=True so the runner
+# is always available to pick up the next dispatched slice.
+
+GOOSE_RUNNER_LABEL_SUFFIX = "goose-runner"
+
+
+def goose_runner_label_for(app: RegisteredApp) -> str:
+    return f"{LABEL_PREFIX}.{app.app_id}.{GOOSE_RUNNER_LABEL_SUFFIX}"
+
+
+def goose_runner_plist_path_for(app: RegisteredApp) -> Path:
+    return LAUNCH_AGENTS_DIR / f"{goose_runner_label_for(app)}.plist"
+
+
+def _resolve_goose_runner_bin() -> str:
+    candidates = [
+        Path(sys.prefix) / "bin" / "chad-captain-goose-runner",
+        Path(sys.executable).parent / "chad-captain-goose-runner",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    found = shutil.which("chad-captain-goose-runner")
+    if found:
+        return found
+    return "/usr/local/bin/chad-captain-goose-runner"
+
+
+GOOSE_RUNNER_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{runner_bin}</string>
+        <string>--app</string>
+        <string>{app_id}</string>
+        <string>--repo</string>
+        <string>{repo_path}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:{user_local_bin}</string>
+        <key>HOME</key>
+        <string>{home}</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{stdout_path}</string>
+
+    <key>StandardErrorPath</key>
+    <string>{stderr_path}</string>
+</dict>
+</plist>
+"""
+
+
+def render_goose_runner_plist(
+    app: RegisteredApp, *, runner_bin: str | None = None,
+) -> str:
+    """Render a launchd plist that runs the goose-runner as a long-lived
+    KeepAlive=true service. Only meaningful for autonomous-mode apps —
+    observe_only captains never dispatch slices."""
+    home = str(Path.home())
+    bin_path = runner_bin or _resolve_goose_runner_bin()
+    log_dir = Path(home) / ".chad" / "captain" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return GOOSE_RUNNER_PLIST_TEMPLATE.format(
+        label=goose_runner_label_for(app),
+        runner_bin=bin_path,
+        app_id=app.app_id,
+        repo_path=app.repo_path,
+        user_local_bin=str(Path(home) / ".local" / "bin"),
+        home=home,
+        stdout_path=str(log_dir / f"{app.app_id}.goose-runner.stdout.log"),
+        stderr_path=str(log_dir / f"{app.app_id}.goose-runner.stderr.log"),
+    )
+
+
+def write_goose_runner_plist(
+    app: RegisteredApp, *, runner_bin: str | None = None,
+    target_dir: Path | None = None,
+) -> Path:
+    target = (
+        (target_dir or LAUNCH_AGENTS_DIR)
+        / f"{goose_runner_label_for(app)}.plist"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_goose_runner_plist(app, runner_bin=runner_bin))
+    return target
+
+
+def goose_runner_bootstrap_command(app: RegisteredApp) -> list[str]:
+    return [
+        "launchctl", "bootstrap", "gui/$(id -u)",
+        str(goose_runner_plist_path_for(app)),
+    ]
+
+
+def goose_runner_bootout_command(app: RegisteredApp) -> list[str]:
+    return [
+        "launchctl", "bootout", "gui/$(id -u)",
+        str(goose_runner_plist_path_for(app)),
+    ]
+
+
 __all__ = [
     "LABEL_PREFIX",
     "LAUNCH_AGENTS_DIR",
+    "GOOSE_RUNNER_LABEL_SUFFIX",
     "bootstrap_command",
     "bootout_command",
+    "goose_runner_bootstrap_command",
+    "goose_runner_bootout_command",
+    "goose_runner_label_for",
+    "goose_runner_plist_path_for",
     "label_for",
     "plist_path_for",
     "render_plist",
+    "render_goose_runner_plist",
     "write_plist",
+    "write_goose_runner_plist",
 ]
