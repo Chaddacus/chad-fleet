@@ -490,3 +490,51 @@ def test_legacy_models_load_without_task_id_field() -> None:
         '{"id":"fb-1","title":"x"}'
     )
     assert fb.task_id is None
+
+
+# ---------------------------------------------------------------------------
+# PR7 R3#7: verify_cmd required when auto_merge=True
+# ---------------------------------------------------------------------------
+
+
+def test_auto_merge_without_verify_cmd_rejected():
+    """Auto-merging without a build gate is unsafe — reject at construction."""
+    import pytest
+    from chad_captain.apps_registry import RegisteredApp
+    with pytest.raises(ValueError, match="verify_cmd is unset"):
+        RegisteredApp(
+            app_id="x", name="X", repo_path="/tmp/x",
+            mode="autonomous", auto_merge=True,
+        )
+
+
+def test_auto_merge_with_empty_verify_cmd_rejected():
+    """Whitespace-only verify_cmd is treated as unset."""
+    import pytest
+    from chad_captain.apps_registry import RegisteredApp
+    with pytest.raises(ValueError, match="verify_cmd is unset"):
+        RegisteredApp(
+            app_id="x", name="X", repo_path="/tmp/x",
+            mode="autonomous", auto_merge=True, verify_cmd="   ",
+        )
+
+
+def test_auto_merge_with_verify_cmd_accepted():
+    """Auto-merge + non-empty verify_cmd constructs cleanly."""
+    from chad_captain.apps_registry import RegisteredApp
+    app = RegisteredApp(
+        app_id="x", name="X", repo_path="/tmp/x",
+        mode="autonomous", auto_merge=True, verify_cmd="make check",
+    )
+    assert app.auto_merge is True
+    assert app.verify_cmd == "make check"
+
+
+def test_auto_merge_off_without_verify_cmd_accepted():
+    """Default (auto_merge=False) does NOT require verify_cmd — back-compat."""
+    from chad_captain.apps_registry import RegisteredApp
+    app = RegisteredApp(
+        app_id="x", name="X", repo_path="/tmp/x", mode="autonomous",
+    )
+    assert app.auto_merge is False
+    assert app.verify_cmd is None

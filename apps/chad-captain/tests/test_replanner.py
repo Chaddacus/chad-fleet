@@ -701,3 +701,141 @@ def test_replan_emits_note_response_log_per_consumed_note(
     ]
     assert len(note_responses) == 1
     assert "consumed by replan" in note_responses[0].rationale
+
+
+# ---------------------------------------------------------------------------
+# PR7 R3#7: replan rate limit + slice-shape sanity
+# ---------------------------------------------------------------------------
+
+
+def test_slice_shape_signature_is_deterministic_and_normalizes_verbs() -> None:
+    """Same shape -> same signature; cosmetic verb/article differences
+    must collapse so 'add the foo endpoint' == 'foo endpoint'."""
+    from chad_captain.replanner import _slice_shape_signature
+    a = RoadmapSlice(slice_id="s1", objective="Add the foo endpoint", phase="api")
+    b = RoadmapSlice(slice_id="s2", objective="foo endpoint", phase="api")
+    c = RoadmapSlice(slice_id="s3", objective="Add the foo endpoint", phase="db")
+    assert _slice_shape_signature(a) == _slice_shape_signature(b)
+    # Different phase => different signature.
+    assert _slice_shape_signature(a) != _slice_shape_signature(c)
+
+
+def test_check_replan_rate_limit_allows_initial_when_no_history(
+    ws: AppWorkspace,
+) -> None:
+    """No history file => no rate limit triggered."""
+    from chad_captain.replanner import _check_replan_rate_limit
+    _check_replan_rate_limit(ws)  # no raise
+
+
+def test_check_replan_rate_limit_raises_when_over_cap(ws: AppWorkspace) -> None:
+    """5 entries in last hour => 6th attempt raises ReplanRateLimited."""
+    from datetime import datetime, timezone
+    from chad_captain.replanner import (
+        REPLAN_RATE_LIMIT_PER_HOUR,
+        ReplanRateLimited,
+        _check_replan_rate_limit,
+        _record_replan,
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s", objective="x")])
+    for _ in range(REPLAN_RATE_LIMIT_PER_HOUR):
+        _record_replan(ws, trigger="manual", roadmap=rm)
+    with pytest.raises(ReplanRateLimited, match="5 replans"):
+        _check_replan_rate_limit(ws, now=datetime.now(timezone.utc))
+
+
+def test_check_replan_rate_limit_ignores_old_entries(ws: AppWorkspace) -> None:
+    """Entries older than 1h are not counted."""
+    from datetime import datetime, timedelta, timezone
+    from chad_captain.replanner import _check_replan_rate_limit
+    from tracked_app_registry.storage import append_jsonl
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for _ in range(20):
+        append_jsonl(ws.replan_history_path,
+                     {"ts": old_ts, "trigger": "manual",
+                      "slice_count": 1, "shape_signatures": ["abc"]})
+    _check_replan_rate_limit(ws)  # no raise — all stale
+
+
+def test_drained_replan_sanity_passes_when_prior_is_none() -> None:
+    """Initial bootstrap: no prior roadmap => no duplicate check fires."""
+    from chad_captain.replanner import _drained_replan_sanity
+    fresh = Roadmap(app_id="a",
+                    slices=[RoadmapSlice(slice_id="s1", objective="foo")])
+    _drained_replan_sanity(None, fresh)  # no raise
+
+
+def test_drained_replan_sanity_raises_when_shapes_match() -> None:
+    """Identical shape sets => 100% Jaccard => raises."""
+    from chad_captain.replanner import ReplanDuplicate, _drained_replan_sanity
+    slc = lambda i: RoadmapSlice(slice_id=f"s{i}", objective=f"add foo {i}", phase="api")
+    prior = Roadmap(app_id="a", slices=[slc(1), slc(2), slc(3)])
+    fresh = Roadmap(app_id="a", slices=[slc(1), slc(2), slc(3)])
+    with pytest.raises(ReplanDuplicate, match="overlap"):
+        _drained_replan_sanity(prior, fresh)
+
+
+def test_drained_replan_sanity_passes_with_partial_overlap() -> None:
+    """Below-threshold Jaccard (33%) => no raise."""
+    from chad_captain.replanner import _drained_replan_sanity
+    slc = lambda obj: RoadmapSlice(slice_id=obj, objective=obj, phase="api")
+    prior = Roadmap(app_id="a", slices=[slc("alpha"), slc("beta"), slc("gamma")])
+    fresh = Roadmap(app_id="a", slices=[slc("alpha"), slc("delta"), slc("epsilon")])
+    _drained_replan_sanity(prior, fresh)  # no raise
+
+
+def test_replan_records_to_history_jsonl(ws: AppWorkspace, repo: Path) -> None:
+    """Successful replan must append exactly one entry to history."""
+    from tracked_app_registry.storage import read_jsonl
+    replan(ws, repo, trigger="initial", use_llm=False,
+           enforce_duplicate_check=False)
+    entries = read_jsonl(ws.replan_history_path)
+    assert len(entries) == 1
+    assert entries[0]["trigger"] == "initial"
+    assert "shape_signatures" in entries[0]
+
+
+def test_replan_force_bypasses_rate_limit(ws: AppWorkspace, repo: Path) -> None:
+    """`force=True` skips the rate-limit check even when over cap."""
+    from chad_captain.replanner import REPLAN_RATE_LIMIT_PER_HOUR, _record_replan
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s", objective="x")])
+    for _ in range(REPLAN_RATE_LIMIT_PER_HOUR):
+        _record_replan(ws, trigger="manual", roadmap=rm)
+    # Without force this would raise; with force it proceeds.
+    replan(ws, repo, trigger="manual", use_llm=False, force=True,
+           enforce_duplicate_check=False)
+
+
+def test_replan_initial_trigger_skips_rate_limit(
+    ws: AppWorkspace, repo: Path,
+) -> None:
+    """initial trigger always proceeds (never rate-limited)."""
+    from chad_captain.replanner import REPLAN_RATE_LIMIT_PER_HOUR, _record_replan
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s", objective="x")])
+    for _ in range(REPLAN_RATE_LIMIT_PER_HOUR):
+        _record_replan(ws, trigger="exhausted", roadmap=rm)
+    replan(ws, repo, trigger="initial", use_llm=False,
+           enforce_duplicate_check=False)
+
+
+def test_replan_records_duplicate_attempt_then_raises(
+    ws: AppWorkspace, repo: Path,
+) -> None:
+    """When the fresh roadmap duplicates the prior, history captures the
+    failed iteration with trigger suffixed `:duplicate` AND raises so the
+    caller can escalate."""
+    from chad_captain.replanner import ReplanDuplicate
+    from tracked_app_registry.storage import read_jsonl
+    # Seed prior roadmap with the exact slices the deterministic
+    # _fallback_roadmap will produce. We achieve this by running once,
+    # then running again against the same context.
+    replan(ws, repo, trigger="initial", use_llm=False,
+           enforce_duplicate_check=False)
+    with pytest.raises(ReplanDuplicate):
+        replan(ws, repo, trigger="manual", use_llm=False, force=True)
+    entries = read_jsonl(ws.replan_history_path)
+    triggers = [e["trigger"] for e in entries]
+    assert any(":duplicate" in t for t in triggers)

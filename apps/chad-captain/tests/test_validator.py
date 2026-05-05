@@ -1788,6 +1788,8 @@ def _common_auto_merge_setup(
         captain_branch="codex/captain-test-app",
         pr_base_branch="main",
         auto_push=True, auto_open_pr=True, auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2304,6 +2306,8 @@ def test_auto_merge_invokes_gh_pr_merge_when_enabled(
         auto_open_pr=True,
         auto_merge=True,
         auto_merge_method="squash",
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2441,6 +2445,8 @@ def test_auto_merge_blocked_when_scorecard_regression(
         auto_push=True,
         auto_open_pr=True,
         auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2517,6 +2523,8 @@ def test_auto_merge_failure_escalates_and_leaves_pr_open(
         auto_push=True,
         auto_open_pr=True,
         auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
