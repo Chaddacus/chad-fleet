@@ -4051,3 +4051,129 @@ def test_run_verify_gate_user_batchmode_not_double_added(
     )
     batch_modes = [a for a in captured["argv"] if a.startswith("BatchMode=")]
     assert batch_modes == ["BatchMode=no"]
+
+
+# ---------------------------------------------------------------------------
+# PR15 R3#7 v6 §6.4: producer-pending check on roadmap_complete
+# ---------------------------------------------------------------------------
+
+
+def test_pending_produces_empty_when_no_manifest(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """No task_manifest declared => no gate fires (back-compat)."""
+    from chad_captain.validator import _pending_produces
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+    assert _pending_produces(ws) == set()
+
+
+def test_pending_produces_returns_all_when_bus_empty(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Manifest declares produces but bus has no manifest yet => all pending."""
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1", "fixtures.v1"],
+    ))
+    assert _pending_produces(ws) == {"spec.v1", "fixtures.v1"}
+
+
+def test_pending_produces_subtracts_published(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Bus manifest contains some declared artifacts => only the rest pending."""
+    import json
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    art_root = tmp_path / "art"
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(art_root))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1", "fixtures.v1", "report.v1"],
+    ))
+    bus_manifest_dir = art_root / "t-1"
+    bus_manifest_dir.mkdir(parents=True)
+    (bus_manifest_dir / "manifest.json").write_text(json.dumps({
+        "task_id": "t-1",
+        "artifacts": {
+            "spec.v1": {"name": "spec.v1", "schema_id": "s",
+                        "produced_at": "now",
+                        "produced_by_app_id": "p"},
+            "fixtures.v1": {"name": "fixtures.v1", "schema_id": "s",
+                            "produced_at": "now",
+                            "produced_by_app_id": "p"},
+        },
+    }))
+    assert _pending_produces(ws) == {"report.v1"}
+
+
+def test_pending_produces_empty_when_all_published(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import json
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    art_root = tmp_path / "art"
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(art_root))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1"],
+    ))
+    bus_manifest_dir = art_root / "t-1"
+    bus_manifest_dir.mkdir(parents=True)
+    (bus_manifest_dir / "manifest.json").write_text(json.dumps({
+        "task_id": "t-1",
+        "artifacts": {
+            "spec.v1": {"name": "spec.v1", "schema_id": "s",
+                        "produced_at": "now",
+                        "produced_by_app_id": "p"},
+        },
+    }))
+    assert _pending_produces(ws) == set()
+
+
+def test_handle_roadmap_complete_blocks_pr_when_producer_pending(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Roadmap structurally complete + manifest.produces missing from bus
+    => log roadmap_complete_pending_producer + DO NOT call PR open path."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _handle_roadmap_complete
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-7", produces=["spec.v1"],
+    ))
+
+    push_calls = {"n": 0}
+
+    def boom_push(*a, **kw):
+        push_calls["n"] += 1
+        raise AssertionError("push_captain_branch must NOT be called")
+
+    monkeypatch.setattr(
+        "chad_captain.merge_facilitator.push_captain_branch", boom_push,
+    )
+
+    reg_app = RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test",
+        auto_push=True, auto_open_pr=True,
+        verify_cmd="true",
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="O",
+                                      status="done")])
+
+    _handle_roadmap_complete(ws, str(repo), rm, reg_app)
+
+    assert push_calls["n"] == 0
+    log = read_captain_log(ws, limit=10)
+    pending = [e for e in log if e.kind == "roadmap_complete_pending_producer"]
+    assert len(pending) == 1
+    assert "spec.v1" in pending[0].rationale

@@ -132,6 +132,17 @@ class AppWorkspace:
         return self.root / "retry_context.json"
 
     @property
+    def task_manifest_path(self) -> Path:
+        """PR15 v6 §6.4: per-app declaration of what this captain
+        produces/consumes on the cross-task artifact bus. Captain checks
+        this at roadmap_complete to refuse opening a PR if a declared
+        produces entry hasn't been written to the bus by this captain
+        yet (split_task safety: producer captain shouldn't ship before
+        consumer can observe its outputs).
+        """
+        return self.root / "task_manifest.json"
+
+    @property
     def pending_replan_reasons_path(self) -> Path:
         """PR9 v6 §6.1 trigger queue: JSONL of pending replan reasons
         (Twin enqueues 'scope change', 'admiral note batch', 'cost
@@ -311,6 +322,12 @@ class CaptainLogEntry(BaseModel):
         # local main + clears roadmap to begin a new cycle.
         "pull_request_merged",
         "post_merge_cycle",
+        # PR15 v6 §6.4: roadmap is structurally complete but the task
+        # manifest declares produces[] artifacts that haven't been
+        # published to the cross-task artifact bus yet. Captain holds
+        # the PR until those artifacts land — a downstream consumer
+        # captain may be waiting on them.
+        "roadmap_complete_pending_producer",
         # Cycle B: captain detected its open PR is in a non-mergeable state
         # (DIRTY/BLOCKED — typically merge conflicts or failing required
         # checks). Emitted ONCE per pending PR; admiral resolves manually.
@@ -456,6 +473,43 @@ class RetryContext(BaseModel):
     failed_at: str = Field(default_factory=_now_iso)
     rationale: str
     retry_hint: str = ""
+
+
+class TaskManifest(BaseModel):
+    """PR15 v6 §6.4: declaration of cross-task artifact contracts for
+    one captain. Lives at AppWorkspace.task_manifest_path.
+
+    ``task_id`` ties to the Twin task this captain belongs to.
+    ``produces`` lists artifact names this captain MUST publish to the
+    bus before its roadmap_complete handler is allowed to open a PR.
+    ``consumes`` lists artifact names this captain reads at slice
+    start (informational; future slices will gate dispatch on
+    presence/freshness).
+    """
+
+    task_id: str
+    produces: list[str] = Field(default_factory=list)
+    consumes: list[str] = Field(default_factory=list)
+
+
+def read_task_manifest(ws: AppWorkspace) -> TaskManifest | None:
+    """Return the TaskManifest for ``ws`` or None if no manifest is
+    declared (back-compat for captains that pre-date the artifact bus).
+    """
+    if not ws.task_manifest_path.exists():
+        return None
+    try:
+        return TaskManifest.model_validate_json(
+            ws.task_manifest_path.read_text()
+        )
+    except (ValueError, OSError):
+        return None
+
+
+def write_task_manifest(ws: AppWorkspace, manifest: TaskManifest) -> None:
+    """Persist a TaskManifest to disk (atomic write)."""
+    ws.ensure()
+    atomic_write(ws.task_manifest_path, manifest.model_dump_json(indent=2))
 
 
 class AdmiralNote(BaseModel):
@@ -872,6 +926,9 @@ __all__ = [
     "BacklogGenerationConflict",
     "enqueue_replan_reason",
     "drain_replan_reasons",
+    "TaskManifest",
+    "read_task_manifest",
+    "write_task_manifest",
     "write_goose_pid",
     "read_goose_pid",
     "clear_goose_pid",

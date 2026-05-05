@@ -542,3 +542,41 @@ def test_roadmapslice_status_accepts_superseded_by_scope_change() -> None:
         status="superseded_by_scope_change",
     )
     assert s.status == "superseded_by_scope_change"
+
+
+# ---------------------------------------------------------------------------
+# PR15 v6 §6.4: TaskManifest read/write
+# ---------------------------------------------------------------------------
+
+
+def test_task_manifest_path_under_root(tmp_path: Path) -> None:
+    w = AppWorkspace("tm-test", base=tmp_path)
+    assert w.task_manifest_path == w.root / "task_manifest.json"
+
+
+def test_read_task_manifest_returns_none_when_missing(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import read_task_manifest
+    assert read_task_manifest(ws) is None
+
+
+def test_write_then_read_task_manifest(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import (
+        TaskManifest, read_task_manifest, write_task_manifest,
+    )
+    tm = TaskManifest(task_id="t-42",
+                      produces=["spec.v1", "fixtures.v1"],
+                      consumes=["upstream.v1"])
+    write_task_manifest(ws, tm)
+    fetched = read_task_manifest(ws)
+    assert fetched is not None
+    assert fetched.task_id == "t-42"
+    assert fetched.produces == ["spec.v1", "fixtures.v1"]
+    assert fetched.consumes == ["upstream.v1"]
+
+
+def test_read_task_manifest_returns_none_on_corruption(ws: AppWorkspace) -> None:
+    """Corrupt JSON → None, not crash."""
+    from chad_captain.protocol import read_task_manifest
+    ws.task_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.task_manifest_path.write_text("{not valid json")
+    assert read_task_manifest(ws) is None

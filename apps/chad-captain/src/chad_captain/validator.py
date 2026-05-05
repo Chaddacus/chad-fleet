@@ -27,6 +27,7 @@ Replan triggers (caller — the daemon — handles these):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -1862,6 +1863,41 @@ def _post_merge_verify(
     )
 
 
+def _pending_produces(ws: AppWorkspace) -> set[str]:
+    """PR15 R3#7 v6 §6.4: return artifact names this captain declared
+    in its task_manifest.produces[] but hasn't yet written to the
+    cross-task artifact bus manifest.
+
+    Reads ~/.chad/fleet/artifacts/<task_id>/manifest.json directly to
+    avoid pulling chad-captain-scaffold as a runtime dep — captain only
+    needs the presence check, not the full bus client.
+
+    Returns empty set when no task_manifest is declared (back-compat:
+    pre-bus captains never block on this gate).
+    """
+    import os
+    from chad_captain.protocol import read_task_manifest
+    tm = read_task_manifest(ws)
+    if tm is None or not tm.produces:
+        return set()
+    raw = os.environ.get("CHAD_FLEET_ARTIFACTS_DIR")
+    base = (
+        Path(raw).expanduser() if raw
+        else Path.home() / ".chad" / "fleet" / "artifacts"
+    )
+    bus_manifest = base / tm.task_id / "manifest.json"
+    if not bus_manifest.exists():
+        return set(tm.produces)  # nothing on the bus yet
+    try:
+        data = json.loads(bus_manifest.read_text())
+    except (ValueError, OSError):
+        # Corrupt bus manifest — treat as missing everything; safer
+        # than auto-merging on degraded state.
+        return set(tm.produces)
+    published = set((data.get("artifacts") or {}).keys())
+    return set(tm.produces) - published
+
+
 def _handle_roadmap_complete(
     ws: AppWorkspace,
     repo_path: str,
@@ -1921,6 +1957,32 @@ def _handle_roadmap_complete(
                 app_id=ws.app_id, slice_id=None, kind="escalation_raised",
                 rationale="auto_open_pr=true but captain_branch is unset; cannot open PR",
                 references={"event": "roadmap_complete"},
+            ),
+        )
+        return
+
+    # PR15 R3#7 v6 §6.4: producer-pending check. If this captain has a
+    # task_manifest declaring produces[] artifacts, they MUST be on the
+    # bus before we ship a PR. Otherwise a downstream consumer captain
+    # blocks waiting on artifacts the producer "completed" without
+    # publishing.
+    pending = _pending_produces(ws)
+    if pending:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id,
+                slice_id=None,
+                kind="roadmap_complete_pending_producer",
+                rationale=(
+                    f"roadmap structurally complete but task_manifest.produces "
+                    f"missing from artifact bus: {sorted(pending)}; holding PR "
+                    f"until producer publishes"
+                ),
+                references={
+                    "event": "roadmap_complete_pending_producer",
+                    "missing_artifacts": ",".join(sorted(pending)),
+                },
             ),
         )
         return
