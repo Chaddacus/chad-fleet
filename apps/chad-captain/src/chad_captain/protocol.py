@@ -132,6 +132,18 @@ class AppWorkspace:
         return self.root / "retry_context.json"
 
     @property
+    def twin_holds_dir(self) -> Path:
+        """PR8 v6 §validation L4: per-task hold markers written by Twin.
+
+        Each file is one hold (typically `<task_id>-<reason>.json`) with
+        a payload of {reason, created_at, expires_at, raised_by}. Captain
+        close handler refuses to mark a task complete while ANY unexpired
+        hold is present in this directory. Cleared by Twin via
+        `twin captain release-hold --app <id> --hold <name>`.
+        """
+        return self.root / "twin_holds"
+
+    @property
     def replan_history_path(self) -> Path:
         """JSONL of recent replan attempts. Each line: {ts, trigger,
         slice_count, shape_signature}. Replanner reads to enforce the
@@ -155,6 +167,7 @@ class AppWorkspace:
             self.admiral_notes_dir,
             self.admiral_notes_consumed_dir,
             self.research_path.parent,
+            self.twin_holds_dir,
         ):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -371,6 +384,11 @@ class FeatureBacklog(BaseModel):
     app_id: str
     generated_at: str = Field(default_factory=_now_iso)
     items: list[FeatureBacklogItem] = Field(default_factory=list)
+    # PR8 R3#7 §6.3: monotonic generation counter. Incremented on every
+    # write so concurrent writers (replanner draining + scaffold seeding
+    # a new task) can detect lost-update via compare-and-swap.
+    # update_feature_backlog() handles the increment + flock atomically.
+    generation: int = 0
 
     def queued(self, *, top: int | None = None) -> list[FeatureBacklogItem]:
         ranked = sorted(
@@ -514,10 +532,80 @@ def read_feature_backlog(ws: AppWorkspace) -> FeatureBacklog:
 
 
 def write_feature_backlog(ws: AppWorkspace, backlog: FeatureBacklog) -> None:
+    """Direct write — does NOT take a lock. Prefer update_feature_backlog
+    for read-modify-write semantics; this is the legacy path for callers
+    that have full ownership of the file (initial seed, tests).
+    """
     ws.ensure()
     ws.feature_backlog_path.parent.mkdir(parents=True, exist_ok=True)
     backlog.generated_at = _now_iso()
     atomic_write(ws.feature_backlog_path, backlog.model_dump_json(indent=2))
+
+
+class BacklogGenerationConflict(RuntimeError):
+    """PR8 R3#7 §6.3: raised when a compare-and-swap update detects that
+    the backlog was modified by another writer between read and write.
+    Caller should re-read and retry the mutation."""
+
+
+def _backlog_lock_path(ws: AppWorkspace) -> Path:
+    """Sibling lock file for the feature backlog. Lives next to the JSON
+    so locking semantics never interact with the data file's existence
+    or parsing. Created on first lock acquisition.
+    """
+    p = ws.feature_backlog_path
+    return p.parent / f".{p.name}.lock"
+
+
+def update_feature_backlog(
+    ws: AppWorkspace,
+    mutate: "callable[[FeatureBacklog], None]",
+    *,
+    expected_generation: int | None = None,
+) -> FeatureBacklog:
+    """Read-modify-write the backlog under an exclusive flock with
+    monotonic generation increment.
+
+    Pattern:
+        update_feature_backlog(ws, lambda b: b.items.append(item))
+
+    If ``expected_generation`` is given AND does not match the on-disk
+    generation, raises ``BacklogGenerationConflict`` so the caller can
+    re-read and retry instead of silently overwriting another writer's
+    update. When None, the call always wins (last-writer-wins semantics
+    plus an incremented generation so subsequent CAS callers can detect
+    the change).
+    """
+    import fcntl
+    ws.ensure()
+    ws.feature_backlog_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _backlog_lock_path(ws)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            backlog = read_feature_backlog(ws)
+            if (
+                expected_generation is not None
+                and backlog.generation != expected_generation
+            ):
+                raise BacklogGenerationConflict(
+                    f"app={ws.app_id}: backlog generation mismatch "
+                    f"(on-disk={backlog.generation}, "
+                    f"expected={expected_generation}); re-read and retry"
+                )
+            mutate(backlog)
+            backlog.generation += 1
+            backlog.generated_at = _now_iso()
+            atomic_write(
+                ws.feature_backlog_path,
+                backlog.model_dump_json(indent=2),
+            )
+            return backlog
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def write_last_dispatched_slice(ws: AppWorkspace, slice_: CurrentSlice) -> None:
@@ -615,6 +703,8 @@ __all__ = [
     "read_roadmap",
     "read_feature_backlog",
     "write_feature_backlog",
+    "update_feature_backlog",
+    "BacklogGenerationConflict",
     "write_last_dispatched_slice",
     "read_last_dispatched_slice",
     "clear_last_dispatched_slice",
