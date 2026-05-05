@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,19 @@ class RegisteredApp(BaseModel):
     name: str
     repo_path: str
     mode: AppMode = "observe_only"
+
+    # Cycle G: normalize repo_path on construction. Registries written by
+    # admiral via CLI often contain `~/code/...` which the API's bare
+    # `Path(entry.repo_path).exists()` checks (api.py:236, 306) treat as
+    # a literal `~` directory and fail. Goose-runner only does `.resolve()`,
+    # not `.expanduser()`, so symbolic home references resolved to the wrong
+    # place. Normalize once here so every consumer sees an absolute path.
+    @field_validator("repo_path")
+    @classmethod
+    def _normalize_repo_path(cls, v: str) -> str:
+        if not v:
+            return v
+        return str(Path(v).expanduser())
     schedule_hour: int = 9
     schedule_tz: str = "America/New_York"
     notes: str = ""

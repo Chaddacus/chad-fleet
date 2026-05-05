@@ -183,3 +183,39 @@ def test_bootstrap_command_format() -> None:
     assert cmd[0] == "launchctl"
     assert cmd[1] == "bootstrap"
     assert str(plist_path_for(app)) in cmd
+
+
+# ---------------------------------------------------------------------------
+# Cycle G — repo_path normalization
+# ---------------------------------------------------------------------------
+
+
+def test_repo_path_expands_tilde() -> None:
+    """Registry storage of `~/code/spark` was breaking API existence checks
+    that did `Path(entry.repo_path).exists()` without expanduser."""
+    import os
+    app = RegisteredApp(app_id="x", name="X", repo_path="~/code/foo")
+    assert "~" not in app.repo_path
+    assert app.repo_path.startswith(os.path.expanduser("~"))
+
+
+def test_repo_path_absolute_unchanged() -> None:
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/abs")
+    assert app.repo_path == "/tmp/abs"
+
+
+def test_repo_path_round_trip_with_tilde(_isolate_registry: Path) -> None:
+    import os
+    reg = AppsRegistry(apps=[
+        RegisteredApp(app_id="x", name="X", repo_path="~/foo/bar"),
+    ])
+    save_registry(reg)
+    loaded = load_registry()
+    assert "~" not in loaded.apps[0].repo_path
+    assert loaded.apps[0].repo_path.startswith(os.path.expanduser("~"))
+
+
+def test_repo_path_empty_string_passthrough() -> None:
+    """Edge case: validator must not crash on empty string."""
+    app = RegisteredApp(app_id="x", name="X", repo_path="")
+    assert app.repo_path == ""
