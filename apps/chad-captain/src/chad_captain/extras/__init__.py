@@ -27,17 +27,21 @@ def _spark_extras() -> list[ExtraDimension]:
     # Cycle F: drafts/ and bible/ added so the rubric sees actual manuscript
     # work (exploratory drafting + worldbuilding canon), not just the
     # finished-chapter dir.
+    # PR2/T1: chapter_audit_progress added so the captain reports per-chapter
+    # audit state during the v2 publish prep.
     from chad_captain.extras.spark import (
         bible_intact,
         chapters_word_count_target,
         drafts_word_count_target,
         voice_guide_intact,
     )
+    from chad_captain.extras.spark_grades import chapter_audit_progress
     return [
         voice_guide_intact,
         chapters_word_count_target,
         drafts_word_count_target,
         bible_intact,
+        chapter_audit_progress,
     ]
 
 

@@ -184,8 +184,9 @@ SPARK_DEFAULT = RegisteredApp(
     name="Spark of Defiance",
     repo_path=str(Path.home() / "code" / "personal" / "spark_of_defiance"),
     mode="observe_only",  # manuscript work — admiral drives, captain scores
+    auto_replan=False,    # T1/PR2: admiral controls every replan explicitly
     schedule_hour=9,
-    notes="YA progression-fantasy novel. Captain runs daily scorecard + admiral-note channel; no goose dispatch.",
+    notes="YA progression-fantasy. Captain scores daily; admiral controls all replan via `chad-captain replan --app spark-of-defiance`.",
 )
 
 AUTHOR_TOOLKIT_DEFAULT = RegisteredApp(

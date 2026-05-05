@@ -1607,40 +1607,61 @@ def _maybe_handle_pr_merge(
         ),
     )
 
-    # Refresh main, then drop the stale captain branch. Both are
-    # best-effort — failures escalate but don't block the next tick.
+    # Refresh main first. PR2 R3-HIGH-2 fix: if the refresh fails, FAIL
+    # CLOSED — do NOT clear the roadmap, do NOT emit post_merge_cycle.
+    # Otherwise the next tick can re-dispatch new work on the stale
+    # captain branch (ensure_captain_branch returns ok if already on it),
+    # writing slices that miss whatever was merged on origin/main. Pause
+    # the captain instead so admiral resolves the refresh failure.
     rb = refresh_base_branch(
         repo_path=repo_path, base_branch=reg_app.pr_base_branch,
     )
     if not rb.ok:
+        until = datetime.now(timezone.utc) + timedelta(
+            minutes=max(1, int(reg_app.circuit_breaker_pause_minutes)),
+        )
+        _write_pause_until(ws, until.isoformat(), reason="post_merge_refresh_failed")
         append_captain_log(
             ws,
             CaptainLogEntry(
                 app_id=ws.app_id, slice_id=None, kind="escalation_raised",
-                rationale=f"post-merge base refresh failed: {rb.summary}",
-                references={"event": "post_merge_refresh_failed"},
+                rationale=(
+                    f"post-merge base refresh failed: {rb.summary}; "
+                    f"dispatch PAUSED to prevent stale-branch re-dispatch. "
+                    f"Roadmap NOT cleared. Resolve manually then unpause."
+                ),
+                references={
+                    "event": "post_merge_refresh_failed",
+                    "base": reg_app.pr_base_branch,
+                    "pause_until": until.isoformat(),
+                    "severity": "high",
+                },
             ),
         )
-    else:
-        # We're now on base; safe to delete the stale captain branch.
-        db = delete_local_branch(
-            repo_path=repo_path, branch=reg_app.captain_branch,
+        # Return True so caller knows we handled the post-merge state
+        # (suppresses the roadmap_complete fall-through this tick).
+        # The merged PR's pull_request_merged log entry is already written.
+        return True
+
+    # Refresh succeeded — safe to delete stale captain branch.
+    db = delete_local_branch(
+        repo_path=repo_path, branch=reg_app.captain_branch,
+    )
+    if not db.ok:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=f"local branch delete failed: {db.summary}",
+                references={
+                    "event": "post_merge_branch_delete_failed",
+                    "branch": reg_app.captain_branch,
+                },
+            ),
         )
-        if not db.ok:
-            append_captain_log(
-                ws,
-                CaptainLogEntry(
-                    app_id=ws.app_id, slice_id=None, kind="escalation_raised",
-                    rationale=f"local branch delete failed: {db.summary}",
-                    references={
-                        "event": "post_merge_branch_delete_failed",
-                        "branch": reg_app.captain_branch,
-                    },
-                ),
-            )
 
     # Clear roadmap + slice state so next tick starts a fresh cycle.
-    # Branch baseline already cleared on PR open; clear again defensively.
+    # Only happens after refresh succeeded (per fail-closed fix above).
     try:
         if ws.roadmap_path.exists():
             ws.roadmap_path.unlink()

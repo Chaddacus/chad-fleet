@@ -60,6 +60,10 @@ REPLAN_TRIGGERS = (
     "soft_accept_streak",
     "admiral_note",
     "manual",
+    # PR2 R3-MED-3: T1 Spark publish phase trigger. Lets admiral mark a
+    # replan as "we're now in publish mode" so the replanner prompt can
+    # pivot from drafting to launch.
+    "publish",
 )
 
 

@@ -219,3 +219,59 @@ def test_repo_path_empty_string_passthrough() -> None:
     """Edge case: validator must not crash on empty string."""
     app = RegisteredApp(app_id="x", name="X", repo_path="")
     assert app.repo_path == ""
+
+
+# ---------------------------------------------------------------------------
+# PR2 — goose-runner plist generator (R3-HIGH-1)
+# ---------------------------------------------------------------------------
+
+
+def test_goose_runner_label_is_distinct_from_tick_label() -> None:
+    from chad_captain.launchd import goose_runner_label_for, label_for
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    tick = label_for(app)
+    runner = goose_runner_label_for(app)
+    assert tick != runner
+    assert runner.endswith(".goose-runner")
+
+
+def test_render_goose_runner_plist_uses_keepalive_true(tmp_path: Path) -> None:
+    from chad_captain.launchd import render_goose_runner_plist
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    plist = render_goose_runner_plist(app, runner_bin="/usr/bin/runner")
+    assert "<key>KeepAlive</key>" in plist
+    # KeepAlive must be true so launchd respawns the runner if it dies.
+    assert "<true/>" in plist
+    assert "<key>RunAtLoad</key>" in plist
+    assert "/usr/bin/runner" in plist
+    assert "<string>x</string>" in plist
+    assert "/tmp/x" in plist
+
+
+def test_write_goose_runner_plist_creates_distinct_file(tmp_path: Path) -> None:
+    from chad_captain.launchd import (
+        goose_runner_label_for, label_for,
+        write_goose_runner_plist, write_plist,
+    )
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x",
+                        mode="autonomous")
+    target = tmp_path / "agents"
+    tick_path = write_plist(app, target_dir=target)
+    runner_path = write_goose_runner_plist(app, target_dir=target)
+    assert tick_path.exists()
+    assert runner_path.exists()
+    assert tick_path != runner_path
+    assert label_for(app) in tick_path.name
+    assert goose_runner_label_for(app) in runner_path.name
+
+
+def test_goose_runner_bootstrap_command_format() -> None:
+    from chad_captain.launchd import (
+        goose_runner_bootstrap_command,
+        goose_runner_plist_path_for,
+    )
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    cmd = goose_runner_bootstrap_command(app)
+    assert cmd[0] == "launchctl"
+    assert cmd[1] == "bootstrap"
+    assert str(goose_runner_plist_path_for(app)) in cmd
