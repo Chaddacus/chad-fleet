@@ -1,0 +1,77 @@
+{
+  "app_id": "es-bots",
+  "items": [
+    {
+      "id": "fb-001",
+      "title": "Sanitized chat_responder import + parameterize ES connection target",
+      "rationale": "Lift the existing chat_responder Python from noob-root VPS (presales_knowledge_expert + zoom_knowledge_expert), strip secrets, parameterize ES URL/index/auth via env vars. Add fake-ES fixture for unit tests so we can iterate without a real cluster.",
+      "priority": 0.95,
+      "estimated_slice_count": 2,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-002",
+      "title": "/render?topic=X page-on-demand FastAPI route",
+      "rationale": "Bot exposes /render?topic=X that queries ES for matching docs, prompts Claude haiku with the docs, renders HTML via Jinja, caches 5min in-memory LRU. No persistent frontend — page generated per request.",
+      "priority": 0.9,
+      "estimated_slice_count": 2,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-003",
+      "title": "cw-gateway route contract test",
+      "rationale": "Unit test that locks the bot's /render and /health JSON contracts against what cw-gateway expects. Doesn't deploy — just prevents drift.",
+      "priority": 0.85,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-004",
+      "title": "systemd unit templates (dev + prod) with op:// EnvironmentFile refs",
+      "rationale": "dev_es_bot.service and prod_es_bot.service. Secrets via op:// references documented in README, never committed. systemd-analyze --user verify validates locally before VPS deploy.",
+      "priority": 0.8,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-005",
+      "title": "Deploy runbook with op:// → /etc/...env → systemctl flow",
+      "rationale": "docs/DEPLOY.md with the manual sequence: pull secrets via op://, write /etc/es-bots/<env>.env, systemctl daemon-reload + start. Not auto-executed; admiral runs.",
+      "priority": 0.7,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-006",
+      "title": "Per-bot ES query expansion config",
+      "rationale": "Dev wants fuzzy search (broader recall while iterating); prod wants exact (stable behavior for live users). YAML config per env.",
+      "priority": 0.6,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-007",
+      "title": "/health endpoint with ES + Claude + cache stats",
+      "rationale": "Returns ES connection status, Claude API status (last-call latency), cache hit rate. Monitored by uptime watcher; cw-gateway uses it for routing health.",
+      "priority": 0.55,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-008",
+      "title": "Log retention monitor + systemd journal rotation",
+      "rationale": "Bot logs its own decisions (ES query, Claude prompt summary, cache hit/miss). systemd-journald-managed rotation; alert if log volume drops below baseline (silent failure signal).",
+      "priority": 0.5,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    }
+  ]
+}
