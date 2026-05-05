@@ -97,6 +97,21 @@ class RegisteredApp(BaseModel):
     low_yield_streak_threshold: int = 5
     low_yield_pause_minutes: int = 30
 
+    # --- Cycle C: pluggable validator chain ---
+    # Dotted import path for a module exporting `validate_app_completion`
+    # (signature documented at chad_captain.validator.validate_app_completion).
+    # When set, captain_tick uses this in place of the default validate +
+    # reuse_regression + verify_gate chain. Custom validators own the entire
+    # chain; their verdict is final (no post-hoc override).
+    #
+    # Failure modes are FAIL-CLOSED:
+    #   - module fails to import → escalate
+    #   - module lacks `validate_app_completion` → escalate
+    #   - validator raises → escalate
+    #   - dispatched-slice snapshot missing → escalate
+    # Default (None) keeps the existing default chain.
+    validator_module: str | None = None
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)

@@ -100,6 +100,48 @@ def test_default_seeds_have_consistent_app_ids() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cycle C — pluggable validator field
+# ---------------------------------------------------------------------------
+
+
+def test_validator_module_defaults_to_none() -> None:
+    app = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    assert app.validator_module is None
+
+
+def test_validator_module_round_trips() -> None:
+    reg = AppsRegistry(apps=[
+        RegisteredApp(
+            app_id="x",
+            name="X",
+            repo_path="/tmp/x",
+            validator_module="my_pkg.my_validator",
+        ),
+    ])
+    save_registry(reg)
+    loaded = load_registry()
+    assert loaded.apps[0].validator_module == "my_pkg.my_validator"
+
+
+def test_existing_registry_loads_when_validator_module_missing(
+    _isolate_registry: Path,
+) -> None:
+    """Back-compat: registry JSON written before Cycle C lacks `validator_module`.
+
+    Pydantic should default it to None on load; loading must not error.
+    """
+    legacy_json = (
+        '{"apps": [{"app_id": "old", "name": "Old", "repo_path": "/tmp/old", '
+        '"mode": "observe_only", "schedule_hour": 9}]}'
+    )
+    _isolate_registry.parent.mkdir(parents=True, exist_ok=True)
+    _isolate_registry.write_text(legacy_json)
+    loaded = load_registry()
+    assert len(loaded.apps) == 1
+    assert loaded.apps[0].validator_module is None
+
+
+# ---------------------------------------------------------------------------
 # launchd
 # ---------------------------------------------------------------------------
 
