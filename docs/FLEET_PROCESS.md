@@ -1,6 +1,6 @@
-# Fleet Process — End-to-End Spec (v8)
+# Fleet Process — End-to-End Spec (v9)
 
-> **Status:** v8 — codex R5 (6 findings on v7) addressed. R5 caught 4 HIGH issues: hosting topology gap (Twin on Linode can't tail MacBook logs), on-demand AGGREGATE blind to background spin-ups, safety rails miss shared-resource access, personal-vs-company Zoom fallback unsafe.
+> **Status:** v9 — Chad's 3 follow-up answers locked in. (1) Linode = host `linode` / `23.92.20.39` / user `root` (from Chad's ~/.ssh/config). (2) Twilio creds: deferred — SMS code ships in PR5 but stays disabled until Chad drops creds. (3) Zoom: ONE account (chad-agent's existing company creds — `chad.simon@cloudwarriors.ai`); v8's personal-vs-company isolation section was wrong and is removed. Twin DMs go directly to Chad's user JID via the existing chad-agent Zoom client.
 
 ## Engine prep work (R3 found 5 HIGH engine bugs the spec assumed away)
 
@@ -26,16 +26,16 @@ Before any Twin daemon code can ship, the chad-captain engine needs these change
 | Producer-pending state for split_task (v6 §6.4) | `validator.py` (roadmap_complete flow) | Check task manifest produces against artifact bus before opening PR | ~50 |
 | Cost projection for new captains (v7 auth-boundary #3) | `apps/chad-twin-daemon/cost_projection.py` (NEW) | Estimate captain LLM spend from research output (token estimates × backlog item count); gate scaffold install at $20/day | ~80 |
 | Captain spin-up rate limit + concurrency ceiling (v7) | `apps/chad-twin-daemon/captain_throttle.py` (NEW) + state file | 5 new/24h + 12 concurrent caps; queue overflow; `twin captain unthrottle` admin override | ~120 |
-| Personal Zoom S2S client (v7) | `apps/chad-twin-daemon/zoom_personal.py` (NEW) | Reuses chad-agent's S2S OAuth flow but with `CHAD_PERSONAL_ZOOM_*` creds; routed to personal account JID | ~80 |
+| Twin Zoom DM client (v9 — reuses chad-agent's existing S2S, no separate creds) | `apps/chad-twin-daemon/zoom_dm.py` (NEW) | Wraps chad-agent's existing zoom_client.py; resolves CHAD_DM_TARGET to 1:1 channel ID once at startup; caches channel ID; users/me identity check | ~50 |
 | Approved-classes registry deprecated (v7 first-of-class removed) | DELETE: `~/.chad/captain/approved_classes.json` references | Per-captain approval gate gone; profile registry takes its place | -40 |
 | Hosting topology: WorkerBinding + log_sink_url + heartbeat (v8 R5#1) | `apps_registry.py` + `goose_runner.py` + new `apps/chad-twin-daemon/event_sink.py` | WorkerBinding model on RegisteredApp; HTTPS POST event sink on Twin; goose-runner streams events to sink instead of local file write; heartbeat poller + 5min watchdog | ~290 |
 | Activity cursor + delta DMs (v8 R5#2) | `apps/chad-twin-daemon/aggregate.py` + new `activity_cursor.py` | Persisted cursor; "Changed since last viewed" header; delta DM emission on task transitions; `--since` drill flag | ~150 |
 | Resource access manifest + capability registry (v8 R5#3) | `apps/chad-twin-daemon/research.py` (manifest field) + new `apps/chad-captain/src/chad_captain/capabilities.py` + scaffold integration | ResourceAccess model; capability registry with flock; default-deny credential provisioner; scaffold reject when manifest entry not approved | ~260 |
-| Personal-Zoom-only fail-closed (v8 R5#4) | `apps/chad-twin-daemon/zoom_personal.py` (refactor) + `main.py` startup self-check | Refuse `CHAD_ZOOM_*` fallback in TWIN_ENV=prod; identity match against users/me at startup; degraded-mode if mismatch | ~80 |
+| Zoom startup identity check (v9 — slimmer than v8's isolation since one account) | `apps/chad-twin-daemon/zoom_dm.py` + `main.py` startup self-check | users/me account_id match + DM channel resolution at startup; degraded mode (no outbound Zoom) if mismatch | ~30 |
 | Cost projection + reconciliation (v8 R5#5) | `apps/chad-twin-daemon/cost_projection.py` (already counted) + new pricing table + reconciler | p50/p95 estimator with confidence; daily reconciliation against captain_log token usage; 2-day overrun auto-pause | ~120 (delta over earlier ~80) |
 | Captain task state machine + queue UX (v8 R5#6) | `apps/chad-twin-daemon/captain_throttle.py` (already counted) + new state.json schema | 12 explicit states; per-task state.json; queue position + earliest_start; `--captain-queue` drill | ~60 (delta over earlier ~120) |
 
-**Total engine prep:** ~2,540 LOC + tests. Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
+**Total engine prep:** ~2,460 LOC + tests (v9: -80 LOC from simplified Zoom client; one account instead of personal-vs-company isolation). Ships as **PR5 (engine prep) BEFORE PR6+ (twin daemon).**
 > **Goal:** Chad pushes a task; the fleet returns a finished task. Chad is the LAST stop, not stops 3, 5, 7, and 9.
 
 ---
@@ -85,14 +85,14 @@ Twin escalates to Chad ONLY for:
 
 Everything else: Twin acts on its own. PR review for non-authority-boundary work is BUNDLED into final task sign-off, not a per-PR ping.
 
-## Hosting topology (v8 — R5#1 fix: ONE canonical log/event plane)
+## Hosting topology (v8 R5#1 + v9 concrete Linode info)
 
 The fleet has TWO hosts and ONE log plane:
 
-| Host | Role | What lives here |
-|------|------|-----------------|
-| **Linode VPS (chad-personal)** | Twin daemon + canonical log plane | Twin daemon process; ALL captain workspaces (`~/.chad/fleet/apps/<app_id>/`); ALL captain_log.jsonl; admiral_notes/; chad_action_queue.json; task artifacts; apps_registry.json; approved profiles registry |
-| **Chad's MacBook** | goose-runner workers ONLY | Captain repos (where goose actually edits code); goose subprocesses; per-repo verify_cmd execution. NO captain state. |
+| Host | SSH | Role | What lives here |
+|------|-----|------|-----------------|
+| **Linode VPS** | `ssh linode` (`23.92.20.39`, user `root`, key `~/.ssh/id_ed25519`) | Twin daemon + canonical log plane | Twin daemon process; ALL captain workspaces (`~/.chad/fleet/apps/<app_id>/`); ALL captain_log.jsonl; admiral_notes/; chad_action_queue.json; task artifacts; apps_registry.json; approved profiles registry; `~/.chad/fleet/.env` |
+| **Chad's MacBook** | local | goose-runner workers ONLY | Captain repos (where goose actually edits code); goose subprocesses; per-repo verify_cmd execution. NO captain state. |
 
 **Event flow:**
 1. Linode Twin determines a slice should dispatch.
@@ -1227,25 +1227,23 @@ If a captain or task fails the green predicate, it MUST appear inline. The roll-
 | Captain spin-up (default path, no auth-boundary) | NEVER (silent; surfaces in next on-demand AGGREGATE) | n/a | n/a |
 | All captains green, nothing to decide | NEVER | n/a | n/a |
 
-**Channel destinations (v8 — personal accounts ONLY, NO company-Zoom fallback in prod per R5#4):**
+**Channel destinations (v9 — Chad has ONE Zoom account; reuse existing chad-agent S2S):**
 
-- **Zoom DM target = Chad's personal Zoom account.** chad-twin daemon uses a SEPARATE set of S2S creds from chad-agent's company-tied creds:
-  - `CHAD_PERSONAL_ZOOM_S2S_CLIENT_ID`
-  - `CHAD_PERSONAL_ZOOM_S2S_CLIENT_SECRET`
-  - `CHAD_PERSONAL_ZOOM_S2S_ACCOUNT_ID`
-  - `CHAD_PERSONAL_ZOOM_BOT_JID` (the personal account user/bot identity)
-- Personal Zoom creds live in `~/.chad/fleet/.env` on the Linode VPS, NEVER in the company chad-agent env
+- **Zoom DM target = Chad's user JID directly.** Twin reuses the existing chad-agent Zoom S2S creds (already in chad-agent's env: `CHAD_ZOOM_S2S_CLIENT_ID`, `CHAD_ZOOM_S2S_CLIENT_SECRET`, `CHAD_ZOOM_S2S_ACCOUNT_ID`, `CHAD_ZOOM_BOT_JID=chad.simon@cloudwarriors.ai`).
+- DM destination is configurable via `CHAD_DM_TARGET` env var (defaults to `chad.simon@cloudwarriors.ai`). Twin sends to Chad's 1:1 DM channel resolved at first run via `list_user_channels_detail` filtered for `type=1` (1:1 personal).
+- v8's personal-vs-company isolation was based on a wrong assumption (Chad has only one Zoom account). Removed in v9.
 
-**Fail-closed isolation (R5#4 fix — no company-Zoom contamination):**
-- Twin production daemon NEVER reads `CHAD_ZOOM_*` env vars. Period.
-- Systemd unit sets `TWIN_ENV=prod`. In `prod`, the Zoom client constructor refuses to fall back to `CHAD_ZOOM_*` even if `CHAD_PERSONAL_ZOOM_*` is missing — daemon starts in **degraded mode with outbound Zoom DISABLED**, NOT silently routed to company.
-- Company-Zoom test path lives in `apps/chad-twin-daemon/tests/zoom_company_fixtures.py` only; can NEVER be reached from prod runtime.
-- Startup self-check: Twin calls `users/me` on the configured Zoom account, validates returned `account_id` matches `CHAD_PERSONAL_ZOOM_S2S_ACCOUNT_ID` AND returned bot JID matches `CHAD_PERSONAL_ZOOM_BOT_JID`. Mismatch → daemon refuses to start, logs identity mismatch as critical fleet health alarm, escalates via SMS (P0).
-- AGGREGATE health section ALWAYS shows Zoom identity match status.
+**Startup safety check (slimmer than v8 isolation):**
+- On daemon start, Twin calls Zoom `users/me` and confirms returned account_id matches `CHAD_ZOOM_S2S_ACCOUNT_ID`.
+- Resolves the DM channel ID for `CHAD_DM_TARGET` once at startup; persists to `~/.chad/fleet/.zoom_dm_channel_cache` for fast subsequent posts.
+- Mismatch on either check → daemon refuses to start, logs identity mismatch, escalates via SMS (P0) IF Twilio creds present, else via stderr to systemd journal.
 
-**Twilio SMS channel** (NEW in v5; P0/P1 tiers + reply grammar fixed in v6 per R4):
+**Twilio SMS channel** (v5 design; v9 — Chad deferred creds, code ships disabled):
 
-- Twilio creds via env: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `CHAD_PHONE_NUMBER`
+- Code ships in PR5 but stays DISABLED until Twilio creds present in `~/.chad/fleet/.env` on Linode.
+- Without creds: every SMS path silently degrades — Zoom DM still fires for the same triggers (so high-priority escalations still reach Chad, just without the buzz). Twin logs "SMS disabled (no creds)" once at startup, NOT on every escalation.
+- Once Chad drops creds: Twin auto-detects, enables SMS path, sends a one-time confirmation SMS so Chad knows it's hot.
+- Required when enabled: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `CHAD_PHONE_NUMBER`
 
 **Two priority tiers (R4 fix — guarantees on the high-stakes path):**
 
@@ -1428,7 +1426,7 @@ Build-time and runtime are different. At runtime, deadlock-shaped failures CAN h
 8. **Twin auto-approves roadmaps** if sanity passes; retries 2x with hints; only escalates on persistent failure.
 9. **PRs bundled into task complete sign-off**, not per-PR pings.
 10. **Authority-boundary list is locked** (see top of doc): production deploys, external comms, money, destructive ops, new scaffold profile needed, genuine ambiguity, final task sign-off.
-11. **Hosting**: Twin daemon on Chad's personal Linode VPS (systemd); Zoom DMs to personal Zoom account; SMS to personal phone.
+11. **Hosting**: Twin daemon on Linode (`ssh linode` → `23.92.20.39`); Zoom DMs to Chad's user JID via existing chad-agent S2S creds; SMS deferred (code ships disabled, auto-enables on cred drop).
 12. **Captain rate caps**: max 5 new captains spun up per 24h; max 12 concurrent active captains (Linode resource ceiling).
 
 ---
@@ -1444,11 +1442,11 @@ All 6 v4/v5 questions resolved:
 5. **Authority-boundary list:** ✅ 7 items locked (with #5 redefined: "new scaffold profile needed" not "first-of-class captain").
 6. **First-of-class GATE:** ❌ REMOVED. Captains spin up in parallel automatically. Captain manages task → captain elevates updates to Twin (admiral) → Twin escalates to Chad ONLY on auth-boundary actions. Safety rails: profile-needed gate, $20/day cost gate, 5 new captains / 24h rate limit, 12 concurrent ceiling.
 
-### Open follow-ups (low-stakes, can answer when convenient)
+### Open follow-ups — ALL ANSWERED (v9)
 
-1. **Linode hostname / SSH config:** what's the personal Linode hostname? Twin daemon systemd unit needs to target it. Recommend: `chad-personal.linode` or actual FQDN; Twin reads from `~/.chad/fleet/.env` `LINODE_HOST=` so it's pluggable.
-2. **Twilio creds source:** in 1Password? if so, vault + item name so Twin's bootstrap doc points at it. Otherwise drop into `~/.chad/fleet/.env` directly.
-3. **Personal Zoom S2S app:** existing or needs to be created in your personal Zoom marketplace? (Required: server-to-server OAuth app with Team Chat scope on the personal account.)
+1. ✅ **Linode**: host `linode` / `23.92.20.39` / user `root` / key `~/.ssh/id_ed25519` (from Chad's ~/.ssh/config). Twin systemd unit deploys via `ssh linode`.
+2. ✅ **Twilio creds: deferred.** SMS code ships in PR5 disabled; auto-enables when creds appear in `~/.chad/fleet/.env`. High-priority escalations still reach Chad via Zoom DM in the meantime.
+3. ✅ **Zoom**: ONE account; reuse existing chad-agent S2S creds; DM target = `chad.simon@cloudwarriors.ai` (Chad's user JID); 1:1 channel ID resolved at first run via `list_user_channels_detail`.
 
 ---
 
