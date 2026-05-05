@@ -328,3 +328,117 @@ def test_workspace_cycle_c_paths(tmp_path: Path) -> None:
     w = AppWorkspace("baz", base=tmp_path)
     assert w.last_dispatched_slice_path == tmp_path / "baz" / "last_dispatched_slice.json"
     assert w.retry_context_path == tmp_path / "baz" / "retry_context.json"
+
+
+# ---------------------------------------------------------------------------
+# PR8: backlog generation lock + twin_holds dir
+# ---------------------------------------------------------------------------
+
+
+def test_twin_holds_dir_created_by_ensure(tmp_path: Path) -> None:
+    """ws.ensure() must materialize twin_holds_dir for Twin to write into."""
+    w = AppWorkspace("hold-test", base=tmp_path)
+    w.ensure()
+    assert w.twin_holds_dir.exists()
+    assert w.twin_holds_dir.is_dir()
+
+
+def test_twin_holds_dir_path_is_under_root(tmp_path: Path) -> None:
+    w = AppWorkspace("hold-test", base=tmp_path)
+    assert w.twin_holds_dir == w.root / "twin_holds"
+
+
+def test_feature_backlog_default_generation_zero(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import FeatureBacklog
+    bl = FeatureBacklog(app_id="x")
+    assert bl.generation == 0
+
+
+def test_update_feature_backlog_increments_generation(ws: AppWorkspace) -> None:
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem, read_feature_backlog,
+        update_feature_backlog, write_feature_backlog,
+    )
+    write_feature_backlog(ws, FeatureBacklog(app_id=ws.app_id))
+    update_feature_backlog(
+        ws,
+        lambda b: b.items.append(FeatureBacklogItem(id="fb-001", title="x")),
+    )
+    on_disk = read_feature_backlog(ws)
+    assert on_disk.generation == 1
+    assert len(on_disk.items) == 1
+
+
+def test_update_feature_backlog_cas_conflict_raises(ws: AppWorkspace) -> None:
+    """Stale expected_generation => BacklogGenerationConflict."""
+    from chad_captain.protocol import (
+        BacklogGenerationConflict, FeatureBacklog, FeatureBacklogItem,
+        update_feature_backlog, write_feature_backlog,
+    )
+    write_feature_backlog(ws, FeatureBacklog(app_id=ws.app_id, generation=5))
+    with pytest.raises(BacklogGenerationConflict, match="generation mismatch"):
+        update_feature_backlog(
+            ws,
+            lambda b: b.items.append(FeatureBacklogItem(id="fb-001", title="x")),
+            expected_generation=99,
+        )
+
+
+def test_update_feature_backlog_cas_match_proceeds(ws: AppWorkspace) -> None:
+    """Matching expected_generation => write succeeds and increments."""
+    from chad_captain.protocol import (
+        FeatureBacklog, FeatureBacklogItem, read_feature_backlog,
+        update_feature_backlog, write_feature_backlog,
+    )
+    write_feature_backlog(ws, FeatureBacklog(app_id=ws.app_id, generation=5))
+    update_feature_backlog(
+        ws,
+        lambda b: b.items.append(FeatureBacklogItem(id="fb-001", title="x")),
+        expected_generation=5,
+    )
+    assert read_feature_backlog(ws).generation == 6
+
+
+def _backlog_appender_proc(base_dir: str, app_id: str, item_id: str) -> None:
+    """Module-level worker for the concurrent-writer test (must be picklable
+    for multiprocessing spawn)."""
+    from chad_captain.protocol import (
+        AppWorkspace, FeatureBacklogItem, update_feature_backlog,
+    )
+    w = AppWorkspace(app_id, base=Path(base_dir))
+    update_feature_backlog(
+        w,
+        lambda b: b.items.append(FeatureBacklogItem(id=item_id, title=item_id)),
+    )
+
+
+def test_update_feature_backlog_serializes_concurrent_writers(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Two processes appending in parallel must NOT lose updates — flock
+    serializes them and all items end up on disk with generation=N.
+    """
+    import multiprocessing
+    from chad_captain.protocol import (
+        FeatureBacklog, read_feature_backlog, write_feature_backlog,
+    )
+
+    write_feature_backlog(ws, FeatureBacklog(app_id=ws.app_id))
+
+    base_dir = str(ws.root.parent)
+    procs = [
+        multiprocessing.Process(
+            target=_backlog_appender_proc,
+            args=(base_dir, ws.app_id, f"fb-{i:03d}"),
+        )
+        for i in range(4)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+
+    final = read_feature_backlog(ws)
+    assert final.generation == 4
+    ids = {it.id for it in final.items}
+    assert ids == {"fb-000", "fb-001", "fb-002", "fb-003"}
