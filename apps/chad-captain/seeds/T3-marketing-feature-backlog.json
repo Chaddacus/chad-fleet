@@ -1,0 +1,50 @@
+{
+  "app_id": "t3-chadacys-marketing",
+  "items": [
+    {
+      "id": "fb-001",
+      "title": "Voice research: 20-50 successful YA fantasy author socials → bible/AUTHOR_VOICE_GUIDE.md",
+      "rationale": "Mine 20-50 high-engagement YA-fantasy author Twitter/Instagram/TikTok posts. Distill cadence, hook patterns, persona signals, taboo phrases. Output bible/AUTHOR_VOICE_GUIDE.md as the canonical voice contract every later post fixture is gated against.",
+      "priority": 0.95,
+      "estimated_slice_count": 2,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-002",
+      "title": "First post emit: markdown + Django Post fixture + share_link.md",
+      "rationale": "End-to-end smoke: produce one post (Spark launch teaser) as markdown source + Django fixture (apps/marketing/fixtures/marketing_posts_001.json) + share_link.md. Captain validator runs fixture FK gate; admiral copy-pastes share_link to a real platform.",
+      "priority": 0.9,
+      "estimated_slice_count": 1,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-003",
+      "title": "Render verification: confirm post renders at chadacys.com/posts/<slug>",
+      "rationale": "Wire a public_pages route + template that consumes the Post fixture and renders at /posts/<slug>. Verify by curl + visual; this is what cw-gateway will route to when the marketing site goes live.",
+      "priority": 0.9,
+      "estimated_slice_count": 2,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-004",
+      "title": "4-week launch series content plan (12+ posts)",
+      "rationale": "Plan + draft 12+ posts covering the Spark launch ramp (T-28 → launch day → T+7). Each post is its own fixture; captain dispatches them as per-post slices in fb-005.",
+      "priority": 0.85,
+      "estimated_slice_count": 3,
+      "status": "queued",
+      "source": "admiral"
+    },
+    {
+      "id": "fb-005",
+      "title": "Per-post dispatch (1 post per slice, recurring)",
+      "rationale": "Once fb-004's plan exists, captain auto-replans into per-post slices (one Post fixture per slice). posts_queue_depth scorecard tracks burndown; admiral approves render before share_link.md gets published.",
+      "priority": 0.7,
+      "estimated_slice_count": 12,
+      "status": "queued",
+      "source": "admiral"
+    }
+  ]
+}

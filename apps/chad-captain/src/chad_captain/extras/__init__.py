@@ -58,12 +58,25 @@ def _captain_self_extras() -> list[ExtraDimension]:
     return [captain_test_count_growing]
 
 
+def _t3_marketing_extras() -> list[ExtraDimension]:
+    # PR4/T3: Chadacys marketing captain — pinned to the EXACT registry
+    # app_id "t3-chadacys-marketing" (no aliases, no fuzzy match) so
+    # mis-typed registry entries fall back to baseline-only and surface
+    # the misconfiguration immediately.
+    from chad_captain.extras.t3_marketing import (
+        posts_queue_depth,
+        voice_guide_present,
+    )
+    return [voice_guide_present, posts_queue_depth]
+
+
 EXTRAS_FACTORIES: dict[str, Callable[[], list[ExtraDimension]]] = {
     "spark-of-defiance": _spark_extras,
     "spark": _spark_extras,
     "author-toolkit": _author_toolkit_extras,
     "author_toolkit": _author_toolkit_extras,
     "captain-self": _captain_self_extras,
+    "t3-chadacys-marketing": _t3_marketing_extras,
 }
 
 
