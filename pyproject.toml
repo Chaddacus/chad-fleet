@@ -8,6 +8,12 @@ version = "0.0.0"
 description = "Monorepo root — not a publishable package"
 requires-python = ">=3.11"
 
+# Monorepo root has no Python package of its own — hatchling defaults to
+# scanning for one and fails. Tell hatch to skip wheel selection so
+# `uv sync` doesn't try to build an editable wheel for the root.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
 # uv workspace: include all Python packages under packages/ and apps/
 [tool.uv.workspace]
 members = [
