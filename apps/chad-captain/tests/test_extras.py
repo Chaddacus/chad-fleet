@@ -227,8 +227,31 @@ def test_get_extras_returns_author_toolkit_dimensions() -> None:
 
 
 def test_extras_registry_has_known_apps() -> None:
-    expected = {"spark-of-defiance", "spark", "author-toolkit", "author_toolkit", "captain-self"}
+    # PR4/T3: t3-chadacys-marketing pinned to exact app_id (no aliases).
+    expected = {
+        "spark-of-defiance",
+        "spark",
+        "author-toolkit",
+        "author_toolkit",
+        "captain-self",
+        "t3-chadacys-marketing",
+    }
     assert expected.issubset(EXTRAS_FACTORIES.keys())
+
+
+def test_get_extras_returns_t3_marketing_dimensions(tmp_path: Path) -> None:
+    """Wiring regression: every t3-chadacys-marketing extra must be a callable
+    that returns a DimensionScore. Catches the case where the factory is
+    registered under the wrong key, the import path is broken, or one of
+    the dim functions silently returns the wrong type."""
+    extras = get_extras("t3-chadacys-marketing")
+    assert len(extras) == 2
+    assert all(callable(fn) for fn in extras)
+    for fn in extras:
+        result = fn(tmp_path)
+        assert isinstance(result, DimensionScore)
+        assert isinstance(result.name, str) and result.name
+        assert 0.0 <= result.score <= 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +409,107 @@ def test_spark_default_has_auto_replan_false() -> None:
     never auto-mutates manuscript work."""
     from chad_captain.apps_registry import SPARK_DEFAULT
     assert SPARK_DEFAULT.auto_replan is False
+
+
+# ---------------------------------------------------------------------------
+# T3 marketing extras
+# ---------------------------------------------------------------------------
+
+
+def test_t3_voice_guide_present_zero_when_missing(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import voice_guide_present
+    score = voice_guide_present(tmp_path)
+    assert score.name == "voice_guide_present"
+    assert score.score == 0.0
+
+
+def test_t3_voice_guide_present_half_when_empty(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import voice_guide_present
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "AUTHOR_VOICE_GUIDE.md").write_text("")
+    score = voice_guide_present(tmp_path)
+    assert score.score == 0.5
+    assert "empty" in score.rationale
+
+
+def test_t3_voice_guide_present_full_when_populated(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import voice_guide_present
+    bible = tmp_path / "bible"
+    bible.mkdir()
+    (bible / "AUTHOR_VOICE_GUIDE.md").write_text("voice cadence persona taboos")
+    score = voice_guide_present(tmp_path)
+    assert score.score == 1.0
+
+
+def test_t3_voice_guide_present_at_repo_root(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import voice_guide_present
+    (tmp_path / "AUTHOR_VOICE_GUIDE.md").write_text("hello world")
+    score = voice_guide_present(tmp_path)
+    assert score.score == 1.0
+
+
+def test_t3_posts_queue_depth_no_fixtures(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import posts_queue_depth
+    score = posts_queue_depth(tmp_path)
+    assert score.name == "posts_queue_depth"
+    assert score.score == 0.5
+    assert "no post fixtures" in score.rationale
+
+
+def test_t3_posts_queue_depth_full_when_target_met(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import POSTS_QUEUE_TARGET, posts_queue_depth
+    fix_dir = tmp_path / "apps" / "marketing" / "fixtures"
+    fix_dir.mkdir(parents=True)
+    payload = [
+        {"model": "marketing.post", "fields": {"slug": f"p{i}", "published": False}}
+        for i in range(POSTS_QUEUE_TARGET + 2)
+    ]
+    (fix_dir / "marketing_posts_001.json").write_text(__import__("json").dumps(payload))
+    score = posts_queue_depth(tmp_path)
+    assert score.score == 1.0
+
+
+def test_t3_posts_queue_depth_partial(tmp_path: Path) -> None:
+    import json as _json
+    from chad_captain.extras.t3_marketing import POSTS_QUEUE_TARGET, posts_queue_depth
+    fix_dir = tmp_path / "apps" / "marketing" / "fixtures"
+    fix_dir.mkdir(parents=True)
+    payload = [
+        {"model": "marketing.post", "fields": {"slug": f"p{i}", "published": False}}
+        for i in range(3)
+    ] + [
+        {"model": "marketing.post", "fields": {"slug": "live", "published": True}},
+    ]
+    (fix_dir / "marketing_posts_001.json").write_text(_json.dumps(payload))
+    score = posts_queue_depth(tmp_path)
+    assert score.score == pytest.approx(3 / POSTS_QUEUE_TARGET)
+    assert "3/4 posts queued" in score.rationale
+
+
+def test_t3_posts_queue_depth_status_field(tmp_path: Path) -> None:
+    import json as _json
+    from chad_captain.extras.t3_marketing import posts_queue_depth
+    fix_dir = tmp_path / "apps" / "marketing" / "fixtures"
+    fix_dir.mkdir(parents=True)
+    payload = [
+        {"fields": {"status": "draft"}},
+        {"fields": {"status": "queued"}},
+        {"fields": {"status": "live"}},
+    ]
+    (fix_dir / "posts_001.json").write_text(_json.dumps(payload))
+    score = posts_queue_depth(tmp_path)
+    # 2 draft/queued out of POSTS_QUEUE_TARGET=10 = 0.2
+    assert score.score == pytest.approx(0.2)
+
+
+def test_t3_posts_queue_depth_malformed_listed_in_detail(tmp_path: Path) -> None:
+    from chad_captain.extras.t3_marketing import posts_queue_depth
+    fix_dir = tmp_path / "apps" / "marketing" / "fixtures"
+    fix_dir.mkdir(parents=True)
+    (fix_dir / "marketing_posts_bad.json").write_text("not json{{")
+    score = posts_queue_depth(tmp_path)
+    assert score.score == 0.5
+    assert score.detail and any(
+        "marketing_posts_bad.json" in p for p in score.detail.get("malformed", [])
+    )
