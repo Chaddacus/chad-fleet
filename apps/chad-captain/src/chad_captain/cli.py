@@ -232,6 +232,12 @@ def cmd_install_plists(args: argparse.Namespace) -> None:
         sys.exit(1)
     target = _Path(args.target_dir).expanduser() if args.target_dir else None
     for app in reg.apps:
+        # PR6: skip captains with enabled=false (scaffold staging gate).
+        # Their plists shouldn't be installed/bootstrapped until activation
+        # completes. Dry-run still prints them so admin can preview.
+        if not getattr(app, "enabled", True) and not args.dry_run:
+            print(f"Skipping {app.app_id} (enabled=false)")
+            continue
         if args.dry_run:
             print(f"=== {app.app_id} (tick) ===")
             print(render_plist(app))

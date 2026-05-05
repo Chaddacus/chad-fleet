@@ -400,6 +400,22 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
         logger.warning("replanner LLM call failed (%s); falling back to skeleton", e)
         return _fallback_roadmap(ctx, app_id=app_id)
 
+    # PR6/v8: derive task_id to stamp on every generated slice.
+    # Captains scaffolded by Twin have a backlog where every item shares
+    # one task_id. Pre-Twin captains have no task_id (None on every item).
+    # Strategy: pick the most common non-None task_id among queued items;
+    # None if no item carries one. All emitted slices get this task_id so
+    # the eventual CaptainLogEntry can be filtered by task in close.
+    derived_task_id: str | None = None
+    if ctx.backlog_queued:
+        from collections import Counter
+        task_id_counts = Counter(
+            item.get("task_id") for item in ctx.backlog_queued
+            if isinstance(item, dict) and item.get("task_id")
+        )
+        if task_id_counts:
+            derived_task_id = task_id_counts.most_common(1)[0][0]
+
     slices: list[RoadmapSlice] = []
     for raw in data.get("slices", []):
         try:
@@ -410,6 +426,7 @@ def _llm_roadmap(ctx: ReplanContext, *, app_id: str) -> Roadmap:
                 phase=str(raw.get("phase") or ""),
                 estimated_minutes=int(raw.get("estimated_minutes") or 30),
                 blocked_by=list(raw.get("blocked_by") or []),
+                task_id=derived_task_id,
             ))
         except (KeyError, ValueError) as e:
             logger.warning("dropping malformed slice %r: %s", raw, e)

@@ -18,17 +18,21 @@ The registry is loaded from ``apps_registry.json`` at the captain root
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_REGISTRY_PATH = Path.home() / ".chad" / "captain" / "apps_registry.json"
+DEFAULT_REGISTRY_LOCK_PATH = Path.home() / ".chad" / "captain" / ".apps_registry.lock"
 
 AppMode = Literal["autonomous", "observe_only"]
 
@@ -137,6 +141,14 @@ class RegisteredApp(BaseModel):
     # Default (None) keeps the existing default chain.
     validator_module: str | None = None
 
+    # --- PR6/v8 R5#2: scaffold staging via enabled flag ---
+    # When False, the daemon and CLI tick paths skip this captain entirely.
+    # Set to False during scaffold transaction phase 4 (REGISTER) so a
+    # captain that fails phase 5 (ACTIVATE) doesn't tick with broken state.
+    # Flipped to True after activation succeeds. Existing captains are
+    # enabled=True by default for back-compat.
+    enabled: bool = True
+
 
 class AppsRegistry(BaseModel):
     apps: list[RegisteredApp] = Field(default_factory=list)
@@ -157,21 +169,118 @@ def registry_path() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_REGISTRY_PATH
 
 
-def load_registry() -> AppsRegistry:
+def registry_lock_path() -> Path:
+    """Path to the registry advisory lock file (sibling of registry_path).
+
+    Lock file is separate from registry_path so locking semantics don't
+    interact with the JSON file's existence/parsing.
+    """
+    raw = os.environ.get("CHAD_CAPTAIN_APPS_REGISTRY_LOCK", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    rp = registry_path()
+    return rp.parent / f".{rp.name}.lock"
+
+
+@contextlib.contextmanager
+def _locked_fd(lock_path: Path, *, exclusive: bool) -> Iterator[int]:
+    """Hold an fcntl.flock on lock_path for the duration of the with-block.
+
+    Exclusive lock blocks all other readers and writers; shared lock blocks
+    only writers. Lock file is auto-created on first use.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        try:
+            yield fd
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def load_registry(*, shared: bool = True) -> AppsRegistry:
+    """Load the registry under a shared (default) or exclusive lock.
+
+    Use shared=True for read-mostly callers (daemon tick, status). Use
+    shared=False when the caller will mutate-then-save and wants
+    read-modify-write semantics; combine with save_registry to avoid
+    losing concurrent updates.
+
+    PR6 R3#1 fix: prior load_registry() did bare read_text() with no lock,
+    so a writer mid-flush could produce torn reads. Failures now propagate
+    instead of being swallowed as empty registry — silently empty registry
+    is worse than a parse error visible at the call site.
+    """
     path = registry_path()
     if not path.exists():
         return AppsRegistry()
-    try:
+    with _locked_fd(registry_lock_path(), exclusive=not shared):
         return AppsRegistry.model_validate_json(path.read_text())
-    except Exception as e:
-        logger.warning("registry parse failed: %s; returning empty", e)
-        return AppsRegistry()
 
 
 def save_registry(reg: AppsRegistry) -> None:
+    """Atomically save the registry under an exclusive lock.
+
+    Tempfile + os.replace gives torn-read protection for any reader using
+    load_registry; the flock ensures concurrent writers serialize and don't
+    lose updates.
+    """
     path = registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(reg.model_dump_json(indent=2))
+    payload = reg.model_dump_json(indent=2)
+    with _locked_fd(registry_lock_path(), exclusive=True):
+        # NamedTemporaryFile in same dir guarantees os.replace is same-fs
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+
+
+@contextlib.contextmanager
+def registry_transaction() -> Iterator[AppsRegistry]:
+    """Read-modify-write the registry atomically under an exclusive lock.
+
+    Usage:
+        with registry_transaction() as reg:
+            reg.upsert(app)
+            # save happens automatically on context exit
+
+    Use this instead of `reg = load_registry(); reg.upsert(...); save_registry(reg)`
+    when concurrent writers may interleave (scaffold + admin CLI both writing).
+    """
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _locked_fd(registry_lock_path(), exclusive=True):
+        reg = (
+            AppsRegistry.model_validate_json(path.read_text())
+            if path.exists()
+            else AppsRegistry()
+        )
+        yield reg
+        payload = reg.model_dump_json(indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +324,14 @@ __all__ = [
     "AppMode",
     "AppsRegistry",
     "DEFAULT_REGISTRY_PATH",
+    "DEFAULT_REGISTRY_LOCK_PATH",
     "DEFAULT_SEEDS",
     "RegisteredApp",
     "SPARK_DEFAULT",
     "load_registry",
+    "registry_lock_path",
     "registry_path",
+    "registry_transaction",
     "save_registry",
     "seed_default_registry",
 ]
