@@ -293,3 +293,204 @@ def test_route_item_propagates_register_errors(tmp_path) -> None:
     # No partial state mutations on failure.
     assert item.state == "ready"
     assert item.captain_note_id is None
+
+
+# ---------------------------------------------------------------------------
+# Cycle A — app_mode propagation
+# ---------------------------------------------------------------------------
+
+
+def test_route_item_default_app_mode_is_observe_only(tmp_path) -> None:
+    """Back-compat: omitted app_mode keeps the historical observe_only default."""
+    item = _item()
+    repo = tmp_path / "repos" / "thing"
+    repo.mkdir(parents=True)
+    (repo / ".git").mkdir()
+
+    with patch("week_intake.router.register_app_http") as reg_mock:
+        reg_mock.return_value = {"registered": True}
+        route_item(
+            item,
+            app_id="thing",
+            repo_path=str(repo),
+            fleet_base=tmp_path / "fleet",
+        )
+
+    assert reg_mock.called
+    kwargs = reg_mock.call_args.kwargs
+    assert kwargs["mode"] == "observe_only"
+
+
+def test_route_item_new_repo_propagates_autonomous_mode(tmp_path) -> None:
+    """new_repo mode + --app-mode autonomous reaches register_app_http."""
+    item = _item()
+    repo = tmp_path / "repos" / "auto-thing"
+    repo.mkdir(parents=True)
+    (repo / ".git").mkdir()
+
+    with patch("week_intake.router.register_app_http") as reg_mock:
+        reg_mock.return_value = {"registered": True}
+        route_item(
+            item,
+            app_id="auto-thing",
+            repo_path=str(repo),
+            fleet_base=tmp_path / "fleet",
+            app_mode="autonomous",
+        )
+
+    kwargs = reg_mock.call_args.kwargs
+    assert kwargs["mode"] == "autonomous"
+
+
+def test_route_item_greenfield_propagates_autonomous_mode(tmp_path) -> None:
+    """greenfield mode + --app-mode autonomous reaches register_app_http."""
+    item = _item()
+    item.kind = "greenfield"
+    repo = tmp_path / "repos" / "fresh-auto"
+
+    with (
+        patch("week_intake.router.scaffold_greenfield") as scaf_mock,
+        patch("week_intake.router.register_app_http") as reg_mock,
+    ):
+        scaf_mock.return_value = repo
+        reg_mock.return_value = {"registered": True}
+        route_item(
+            item,
+            app_id="fresh-auto",
+            repo_path=str(repo),
+            greenfield_name="fresh-auto",
+            fleet_base=tmp_path / "fleet",
+            app_mode="autonomous",
+        )
+
+    kwargs = reg_mock.call_args.kwargs
+    assert kwargs["mode"] == "autonomous"
+
+
+def test_route_item_existing_app_with_autonomous_raises(tmp_path) -> None:
+    """existing_app + --app-mode autonomous fails loudly (captain has no promote)."""
+    item = _item()
+    fleet_base = tmp_path / "fleet"
+    (fleet_base / "chad-agent").mkdir(parents=True)
+
+    with pytest.raises(RouteError) as exc_info:
+        route_item(
+            item,
+            app_id="chad-agent",
+            fleet_base=fleet_base,
+            app_mode="autonomous",
+        )
+    assert "existing-app" in str(exc_info.value)
+    assert "promote" in str(exc_info.value)
+    # No state mutation; admiral_note never written.
+    assert item.state == "ready"
+    assert item.captain_note_id is None
+
+
+def test_route_item_existing_app_with_observe_only_works(tmp_path) -> None:
+    """Existing app + observe_only (the default) works fine; mode is no-op there."""
+    item = _item()
+    fleet_base = tmp_path / "fleet"
+    (fleet_base / "chad-agent").mkdir(parents=True)
+
+    with patch("week_intake.router.register_app_http") as reg_mock:
+        updated = route_item(
+            item,
+            app_id="chad-agent",
+            fleet_base=fleet_base,
+            app_mode="observe_only",
+        )
+    # existing-app routes never call register
+    reg_mock.assert_not_called()
+    assert updated.state == "routed"
+
+
+def test_route_item_invalid_app_mode_raises(tmp_path) -> None:
+    """Garbage app_mode value fails before any side effects."""
+    item = _item()
+    repo = tmp_path / "repos" / "thing"
+    repo.mkdir(parents=True)
+    (repo / ".git").mkdir()
+
+    with pytest.raises(RouteError) as exc_info:
+        route_item(
+            item,
+            app_id="thing",
+            repo_path=str(repo),
+            fleet_base=tmp_path / "fleet",
+            app_mode="ludicrous",  # type: ignore[arg-type]
+        )
+    assert "invalid app_mode" in str(exc_info.value)
+    assert item.state == "ready"
+
+
+def test_cli_route_app_mode_flag_propagates(tmp_path, monkeypatch) -> None:
+    """End-to-end: chad-week route --app-mode autonomous reaches register_app_http."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setenv("CHAD_WEEK_DIR", str(tmp_path / "week"))
+    from week_intake.cli import main
+    from week_intake.protocol import WeekFolder
+    from week_intake.types import RouteTarget, WeekItem
+
+    week = "2026-W19"
+    item = WeekItem(
+        item_id="wk-001", week=week, raw_text="x", title="x",
+        kind="wip", state="ready", confidence=0.9,
+        target=RouteTarget(app_id="autobot"),
+    )
+    WeekFolder(week=week).upsert_item(item)
+
+    repo = tmp_path / "repo-autobot"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    with _patch("week_intake.router.register_app_http") as reg_mock:
+        reg_mock.return_value = {"registered": True}
+        rc = main([
+            "route", "wk-001",
+            "--week", week,
+            "--app", "autobot",
+            "--repo", str(repo),
+            "--app-mode", "autonomous",
+            "--format", "json",
+        ])
+
+    assert rc == 0
+    assert reg_mock.called
+    assert reg_mock.call_args.kwargs["mode"] == "autonomous"
+
+
+def test_cli_route_app_mode_default_is_observe_only(tmp_path, monkeypatch) -> None:
+    """End-to-end: chad-week route without --app-mode uses observe_only."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setenv("CHAD_WEEK_DIR", str(tmp_path / "week"))
+    from week_intake.cli import main
+    from week_intake.protocol import WeekFolder
+    from week_intake.types import RouteTarget, WeekItem
+
+    week = "2026-W19"
+    item = WeekItem(
+        item_id="wk-002", week=week, raw_text="x", title="x",
+        kind="wip", state="ready", confidence=0.9,
+        target=RouteTarget(app_id="defaultbot"),
+    )
+    WeekFolder(week=week).upsert_item(item)
+
+    repo = tmp_path / "repo-defaultbot"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    with _patch("week_intake.router.register_app_http") as reg_mock:
+        reg_mock.return_value = {"registered": True}
+        rc = main([
+            "route", "wk-002",
+            "--week", week,
+            "--app", "defaultbot",
+            "--repo", str(repo),
+            "--format", "json",
+        ])
+
+    assert rc == 0
+    assert reg_mock.call_args.kwargs["mode"] == "observe_only"

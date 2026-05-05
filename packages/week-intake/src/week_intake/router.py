@@ -45,6 +45,7 @@ from week_intake.validation import (
 )
 
 RouteMode = Literal["existing_app", "new_repo", "greenfield"]
+RouteAppMode = Literal["autonomous", "observe_only"]
 
 
 class RouteError(RuntimeError):
@@ -78,6 +79,7 @@ def route_item(
     greenfield_name: str | None = None,
     note_body: str | None = None,
     fleet_base: Path | None = None,
+    app_mode: RouteAppMode = "observe_only",
 ) -> WeekItem:
     """Execute the route for ``item`` and return the updated WeekItem.
 
@@ -88,12 +90,36 @@ def route_item(
     Validation happens first; nothing is written or registered until every
     boundary check passes. On failure mid-flight, side effects are rolled
     back (greenfield scaffold removed) so retry is safe.
+
+    ``app_mode`` controls captain mode at registration. Default
+    ``observe_only`` matches the historical safe default — captain tracks
+    the app but does not dispatch slices. ``autonomous`` lets the captain
+    daemon tick the app and dispatch from its roadmap. Existing-app routes
+    do NOT propagate mode (captain has no promote-existing endpoint today);
+    use ``observe_only`` or pre-set the mode on the captain side. Passing
+    ``autonomous`` for existing_app raises RouteError to fail loudly rather
+    than silently no-op.
     """
     mode = determine_mode(
         app_id=app_id,
         repo_path=repo_path,
         greenfield_name=greenfield_name,
     )
+
+    if app_mode not in ("autonomous", "observe_only"):
+        raise RouteError(
+            f"invalid app_mode {app_mode!r}; expected 'autonomous' or 'observe_only'"
+        )
+
+    # Existing-app mode does not call register_app_http (captain returns
+    # already-registered without updating mode), so the --app-mode flag
+    # would silently no-op. Fail loudly instead of pretending it worked.
+    if mode == "existing_app" and app_mode != "observe_only":
+        raise RouteError(
+            "existing-app routes cannot change captain mode via --app-mode "
+            "(register_app_http is idempotent and does not promote). "
+            "Either omit --app-mode, or update the captain registry directly."
+        )
 
     # ---- Pre-flight validation (no side effects yet) -------------------
     try:
@@ -143,7 +169,7 @@ def route_item(
                     app_id=app_id,  # type: ignore[arg-type]
                     name=greenfield_name or app_id,  # type: ignore[arg-type]
                     repo_path=str(resolved_repo),
-                    mode="observe_only",
+                    mode=app_mode,
                     notes=f"registered by chad-week from {item.item_id}",
                 )
             except CaptainError as e:

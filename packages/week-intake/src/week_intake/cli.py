@@ -176,6 +176,7 @@ def _cmd_route(args: argparse.Namespace) -> int:
                 repo_path=repo_path,
                 greenfield_name=greenfield_name,
                 note_body=args.note,
+                app_mode=args.app_mode,
             )
         except RouteError as e:
             print(f"ERROR routing {args.item_id}: {e}", file=sys.stderr)
@@ -650,6 +651,19 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--repo", default=None, help="local repo path (for new app or scaffold)")
     pr.add_argument("--greenfield", default=None, help="name for a brand-new project")
     pr.add_argument("--note", default=None, help="admiral-note body; falls back to item title+raw_text")
+    pr.add_argument(
+        "--app-mode",
+        dest="app_mode",
+        choices=("autonomous", "observe_only"),
+        default="observe_only",
+        help=(
+            "captain mode at registration. 'observe_only' (default): captain "
+            "tracks but does not dispatch. 'autonomous': captain daemon "
+            "ticks the app and dispatches from its roadmap. Only takes "
+            "effect for new_repo / greenfield routes (existing-app routes "
+            "do not re-register)."
+        ),
+    )
     pr.add_argument("--week", default=None)
     pr.add_argument("--format", choices=("json", "table"), default="table")
     pr.set_defaults(func=_cmd_route)
