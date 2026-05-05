@@ -83,11 +83,50 @@ EXTRAS_FACTORIES: dict[str, Callable[[], list[ExtraDimension]]] = {
 def get_extras(app_id: str) -> list[ExtraDimension]:
     """Return registered extras for an app, or [] if none."""
     factory = EXTRAS_FACTORIES.get(app_id)
-    return factory() if factory else []
+    if factory is not None:
+        return factory()
+
+    # PR11 R3#8 + R2#2 v6 — dynamic discovery for scaffold-installed
+    # extras modules. Tries importing chad_captain.extras.<slug> where
+    # slug is the app_id with hyphens normalized to underscores. The
+    # module must export EXTRAS: list[ExtraDimension].
+    import importlib
+    slug = _app_id_to_module_slug(app_id)
+    expected_module = f"chad_captain.extras.{slug}"
+    importlib.invalidate_caches()
+    try:
+        mod = importlib.import_module(expected_module)
+    except ModuleNotFoundError as e:
+        # Only swallow the OUTER missing module — nested ImportErrors
+        # (the extras module's own broken imports) must propagate so
+        # scaffold bugs surface immediately.
+        if e.name == expected_module:
+            return []
+        raise
+
+    extras = getattr(mod, "EXTRAS", None)
+    if extras is None:
+        return []
+    if not isinstance(extras, list):
+        raise TypeError(
+            f"{expected_module}.EXTRAS must be list[ExtraDimension], "
+            f"got {type(extras).__name__}"
+        )
+    return extras
+
+
+def _app_id_to_module_slug(app_id: str) -> str:
+    """Normalize an app_id like 't3-chadacys-marketing' to a Python
+    module slug 't3_chadacys_marketing'. Used by the dynamic extras
+    discovery path so scaffold-installed extras packages can be
+    found by app_id.
+    """
+    return app_id.replace("-", "_").lower()
 
 
 __all__ = [
     "ExtraDimension",
     "EXTRAS_FACTORIES",
     "get_extras",
+    "_app_id_to_module_slug",
 ]
