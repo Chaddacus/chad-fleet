@@ -775,6 +775,36 @@ def captain_tick(
                     return (status + "; " if status else "") + "roadmap_complete (PR opened)"
 
             if auto_replan:
+                # Cycle D: emit a roadmap_drained event before the replan so
+                # the daemon's exhaustion → replan churn is visible in the
+                # captain log. Useful when debugging stuck apps where slices
+                # silently vanish.
+                done = sum(1 for s in roadmap.slices if s.status == "done")
+                in_flight = sum(1 for s in roadmap.slices if s.status == "in_flight")
+                blocked = sum(1 for s in roadmap.slices if s.status == "blocked")
+                skipped = sum(1 for s in roadmap.slices if s.status == "skipped")
+                queued = sum(1 for s in roadmap.slices if s.status == "queued")
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id, slice_id=None,
+                        kind="roadmap_drained",
+                        rationale=(
+                            f"no dispatchable queued slice "
+                            f"(done={done}, in_flight={in_flight}, "
+                            f"blocked={blocked}, skipped={skipped}, "
+                            f"queued={queued}); triggering exhausted replan"
+                        ),
+                        references={
+                            "event": "roadmap_drained",
+                            "done": str(done),
+                            "in_flight": str(in_flight),
+                            "blocked": str(blocked),
+                            "skipped": str(skipped),
+                            "queued": str(queued),
+                        },
+                    ),
+                )
                 from chad_captain.replanner import replan
                 roadmap = replan(ws, repo_path, trigger="exhausted")
                 rs = next_queued_slice(roadmap)

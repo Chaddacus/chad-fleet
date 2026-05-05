@@ -260,6 +260,11 @@ class CaptainLogEntry(BaseModel):
         # checks). Emitted ONCE per pending PR; admiral resolves manually.
         # Suppresses re-firing of roadmap_complete + pull_request_opened.
         "pr_conflict",
+        # Cycle D: roadmap had no dispatchable queued slice but was not yet
+        # in a terminal state (some slices in_flight or blocked). Emitted
+        # before an "exhausted" replan so the daemon's churn is visible
+        # in the captain log.
+        "roadmap_drained",
     ]
     verdict: CaptainVerdict | None = None
     rubric_delta_pp: float | None = None

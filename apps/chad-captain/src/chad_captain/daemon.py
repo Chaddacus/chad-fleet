@@ -83,8 +83,10 @@ def _tick_one(app: RegisteredApp) -> str:
     try:
         ws = AppWorkspace(app.app_id)
         ws.ensure()
+        # Cycle D: honor per-app auto_replan policy. Default True keeps
+        # pre-Cycle-D behavior; manuscript captains (Spark) opt out.
         status = captain_tick(
-            ws, repo_path=app.repo_path, auto_replan=True,
+            ws, repo_path=app.repo_path, auto_replan=app.auto_replan,
         )
         return status or "no-op"
     except Exception as e:  # noqa: BLE001

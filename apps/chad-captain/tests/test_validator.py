@@ -3347,3 +3347,112 @@ def test_kill_replan_in_bad_verdicts_trips_circuit_breaker(
         "kill_replan must be in _BAD_VERDICTS so circuit breaker counts "
         "repeated timeouts (Cycle C HIGH-3 R2 fix)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Cycle D — auto_replan policy + roadmap_drained event
+# ---------------------------------------------------------------------------
+
+
+def test_roadmap_drained_event_emitted_before_exhausted_replan(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When roadmap has no dispatchable queued slice but is not yet
+    terminal, captain logs roadmap_drained before triggering replan."""
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[
+            # All slices are blocked by a non-existent dep — none dispatchable,
+            # not in terminal state either.
+            RoadmapSlice(slice_id="s1", objective="A", status="blocked"),
+            RoadmapSlice(slice_id="s2", objective="B", status="queued",
+                         blocked_by=["nonexistent"]),
+        ],
+    )
+    write_roadmap(ws, rm)
+
+    # Stub replan so we don't depend on LLM/research config in tests.
+    from chad_captain.replanner import replan as _real_replan
+    def fake_replan(ws, repo_path, *, trigger="exhausted", **kw):
+        new_rm = Roadmap(
+            app_id=ws.app_id,
+            slices=[RoadmapSlice(slice_id="post-replan",
+                                 objective="post", status="queued")],
+        )
+        write_roadmap(ws, new_rm)
+        return new_rm
+    monkeypatch.setattr("chad_captain.replanner.replan", fake_replan)
+
+    # Drained-but-not-terminal: is_roadmap_complete is False (s2 is queued
+    # but un-dispatchable), so we go through the auto_replan path.
+    captain_tick(ws, repo_path="/tmp/r", auto_replan=True,
+                 use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    drained = [e for e in log if e.kind == "roadmap_drained"]
+    assert len(drained) == 1
+    refs = drained[0].references
+    assert refs["blocked"] == "1"
+    assert refs["queued"] == "1"
+
+
+def test_roadmap_drained_not_emitted_when_auto_replan_off(
+    ws: AppWorkspace,
+) -> None:
+    """auto_replan=False → captain just returns 'roadmap exhausted'; no
+    drained event (admiral controls replan timing)."""
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[
+            RoadmapSlice(slice_id="s1", objective="A", status="blocked"),
+            RoadmapSlice(slice_id="s2", objective="B", status="queued",
+                         blocked_by=["nonexistent"]),
+        ],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path="/tmp/r", auto_replan=False,
+                 use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    assert not any(e.kind == "roadmap_drained" for e in log)
+
+
+def test_registered_app_auto_replan_field_default_true() -> None:
+    """Back-compat default — daemon's pre-Cycle-D behavior preserved."""
+    from chad_captain.apps_registry import RegisteredApp
+    a = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    assert a.auto_replan is True
+
+
+def test_registered_app_auto_replan_can_be_disabled() -> None:
+    """T1 (Spark) opts out via auto_replan=False."""
+    from chad_captain.apps_registry import RegisteredApp
+    a = RegisteredApp(app_id="spark", name="Spark", repo_path="/tmp/s",
+                      auto_replan=False)
+    assert a.auto_replan is False
+
+
+def test_daemon_passes_per_app_auto_replan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """daemon._tick_one threads RegisteredApp.auto_replan into captain_tick."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain import daemon
+
+    captured: dict = {}
+
+    def fake_tick(ws, *, repo_path, auto_replan):
+        captured["auto_replan"] = auto_replan
+        return "ok"
+
+    monkeypatch.setattr(daemon, "captain_tick", fake_tick)
+    monkeypatch.setenv("CHAD_FLEET_APPS_DIR", str(tmp_path))
+
+    app = RegisteredApp(
+        app_id="t", name="T", repo_path="/tmp/r",
+        mode="autonomous", auto_replan=False,
+    )
+    status = daemon._tick_one(app)
+    assert status == "ok"
+    assert captured["auto_replan"] is False

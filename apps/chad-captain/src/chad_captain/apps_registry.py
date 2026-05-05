@@ -97,6 +97,18 @@ class RegisteredApp(BaseModel):
     low_yield_streak_threshold: int = 5
     low_yield_pause_minutes: int = 30
 
+    # --- Cycle D: auto-replan policy ---
+    # When True (default), the daemon and API ticks pass `auto_replan=True`
+    # to captain_tick so the captain replans automatically when the roadmap
+    # is drained or absent. When False, captain only dispatches what's
+    # already on the roadmap and reports "no roadmap" / "roadmap exhausted"
+    # back to the caller — admiral controls when replan happens.
+    #
+    # Default True keeps the pre-Cycle-D daemon behavior. T1 (Spark) and
+    # other manuscript-style apps should opt out (False) so the captain
+    # doesn't auto-generate slices the admiral hasn't approved.
+    auto_replan: bool = True
+
     # --- Cycle C: pluggable validator chain ---
     # Dotted import path for a module exporting `validate_app_completion`
     # (signature documented at chad_captain.validator.validate_app_completion).
