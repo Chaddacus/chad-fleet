@@ -27,7 +27,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterator, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,23 @@ class RegisteredApp(BaseModel):
     # Flipped to True after activation succeeds. Existing captains are
     # enabled=True by default for back-compat.
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def _verify_cmd_required_for_auto_merge(self) -> "RegisteredApp":
+        """PR7 R3#7: auto_merge without verify_cmd is unsafe.
+
+        If captain auto-merges PRs to main with no per-slice build/test
+        gate, a green-looking captain can land breakage straight to main.
+        Reject the registry entry rather than discovering this at merge
+        time. Back-compat: apps with auto_merge=False (the default) are
+        unaffected — they can still leave verify_cmd unset.
+        """
+        if self.auto_merge and not (self.verify_cmd and self.verify_cmd.strip()):
+            raise ValueError(
+                f"app {self.app_id!r} has auto_merge=True but verify_cmd is "
+                f"unset; refusing to auto-merge with no per-slice build gate"
+            )
+        return self
 
 
 class AppsRegistry(BaseModel):

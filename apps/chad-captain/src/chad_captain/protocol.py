@@ -132,6 +132,15 @@ class AppWorkspace:
         return self.root / "retry_context.json"
 
     @property
+    def replan_history_path(self) -> Path:
+        """JSONL of recent replan attempts. Each line: {ts, trigger,
+        slice_count, shape_signature}. Replanner reads to enforce the
+        per-captain rate limit (5/hour by default; FLEET_PROCESS spec
+        line 17). Append-only; rotated by ops if it grows large.
+        """
+        return self.root / "replan_history.jsonl"
+
+    @property
     def pause_until_path(self) -> Path:
         """Wall-clock pause marker. Written by C8 circuit breaker when
         consecutive failures exceed the threshold, read by captain_tick
