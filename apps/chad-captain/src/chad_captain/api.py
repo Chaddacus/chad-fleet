@@ -395,7 +395,13 @@ def create_app() -> FastAPI:
     def app_tick(app_id: str, payload: TickIn) -> dict:
         ws = AppWorkspace(app_id)
         ws.ensure()
-        status = captain_tick(ws, repo_path=payload.repo_path, auto_replan=True)
+        # Cycle D: honor per-app auto_replan policy when registered. Falls
+        # back to True for unregistered apps (back-compat).
+        reg_app = load_registry().by_id(app_id)
+        auto_replan = reg_app.auto_replan if reg_app else True
+        status = captain_tick(
+            ws, repo_path=payload.repo_path, auto_replan=auto_replan,
+        )
         return {"app_id": app_id, "status": status}
 
     return app

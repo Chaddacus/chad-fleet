@@ -155,7 +155,14 @@ def cmd_tick(args: argparse.Namespace) -> None:
         # Validation only: process completion if present, no dispatch and no replan.
         from chad_captain.protocol import read_slice_complete
         if read_slice_complete(ws) is None:
-            # Cheapest signal of life: refresh scorecard + ensure roadmap exists.
+            # T1/Cycle D fix: registered apps with auto_replan=False
+            # (manuscript captains, T1 Spark publish) MUST NOT auto-replan.
+            # The admiral controls every replan via `chad-captain replan`.
+            if app and not app.auto_replan:
+                print(f"[{args.app}] observe_only: idle (auto_replan=False)")
+                return
+            # Legacy observe_only with auto_replan default-True: refresh
+            # scorecard + ensure roadmap exists.
             from chad_captain.replanner import replan_if_needed
             new_rm = replan_if_needed(ws, repo)
             print(f"[{args.app}] observe_only: " + (
@@ -210,7 +217,14 @@ def cmd_install_plists(args: argparse.Namespace) -> None:
     from pathlib import Path as _Path
 
     from chad_captain.apps_registry import load_registry
-    from chad_captain.launchd import bootstrap_command, render_plist, write_plist
+    from chad_captain.launchd import (
+        bootstrap_command,
+        goose_runner_bootstrap_command,
+        render_goose_runner_plist,
+        render_plist,
+        write_goose_runner_plist,
+        write_plist,
+    )
 
     reg = load_registry()
     if not reg.apps:
@@ -218,14 +232,31 @@ def cmd_install_plists(args: argparse.Namespace) -> None:
         sys.exit(1)
     target = _Path(args.target_dir).expanduser() if args.target_dir else None
     for app in reg.apps:
+        # PR6: skip captains with enabled=false (scaffold staging gate).
+        # Their plists shouldn't be installed/bootstrapped until activation
+        # completes. Dry-run still prints them so admin can preview.
+        if not getattr(app, "enabled", True) and not args.dry_run:
+            print(f"Skipping {app.app_id} (enabled=false)")
+            continue
         if args.dry_run:
-            print(f"=== {app.app_id} ===")
+            print(f"=== {app.app_id} (tick) ===")
             print(render_plist(app))
+            if app.mode == "autonomous":
+                print(f"=== {app.app_id} (goose-runner) ===")
+                print(render_goose_runner_plist(app))
             continue
         path = write_plist(app, target_dir=target)
         print(f"Wrote {path}")
         print("  Bootstrap with:")
         print("    " + " ".join(bootstrap_command(app)))
+        # PR2 R3-HIGH-1: autonomous apps need a long-running goose-runner
+        # alongside the periodic tick. observe_only apps don't dispatch
+        # slices so they don't need it.
+        if app.mode == "autonomous":
+            gr_path = write_goose_runner_plist(app, target_dir=target)
+            print(f"Wrote {gr_path}")
+            print("  Bootstrap with:")
+            print("    " + " ".join(goose_runner_bootstrap_command(app)))
 
 
 def cmd_init_workspace(args: argparse.Namespace) -> None:
@@ -251,13 +282,27 @@ def cmd_init_workspace(args: argparse.Namespace) -> None:
 
 
 def cmd_replan(args: argparse.Namespace) -> None:
+    from chad_captain.apps_registry import load_registry
     from chad_captain.protocol import AppWorkspace
     from chad_captain.replanner import replan
+
+    # PR2 fix: resolve repo from registry when --repo not provided. Lets
+    # admiral run `chad-captain replan --app <id>` without remembering
+    # the repo path for every captain.
+    repo = args.repo
+    if not repo:
+        reg_app = load_registry().by_id(args.app)
+        repo = reg_app.repo_path if reg_app else None
+    if not repo:
+        print(
+            f"Unknown app {args.app!r} and no --repo provided", file=sys.stderr,
+        )
+        sys.exit(2)
 
     ws = AppWorkspace(args.app)
     roadmap = replan(
         ws,
-        args.repo,
+        repo,
         trigger=args.trigger,
         refresh_research=args.refresh_research,
         use_llm=not args.no_llm,
@@ -308,6 +353,42 @@ def cmd_research(args: argparse.Namespace) -> None:
         print(profile.web.landscape_md)
     elif profile.web.reason:
         print(f"  reason: {profile.web.reason}")
+
+
+def cmd_scorecard(args: argparse.Namespace) -> None:
+    """Print one app's fresh scorecard (baseline dims + extras).
+
+    PR2 R3-MED-3 fix: T1 manuscript captain runbook needs a way for the
+    admiral to see "how is this app doing" without triggering replan or
+    dispatch. `chad-captain tick` is too side-effecty for the daily
+    glance; `chad-captain status` is global JSON. This is the missing
+    per-app inspection command.
+    """
+    from chad_captain.apps_registry import load_registry
+    from chad_captain.extras import get_extras
+    from chad_captain.scorecard import score_repo
+
+    reg_app = load_registry().by_id(args.app)
+    repo = args.repo or (reg_app.repo_path if reg_app else None)
+    if not repo:
+        print(
+            f"Unknown app {args.app!r} and no --repo provided", file=sys.stderr,
+        )
+        sys.exit(2)
+
+    sc = score_repo(repo, extras=get_extras(args.app))
+    if args.json:
+        print(sc.model_dump_json(indent=2))
+        return
+
+    print(f"App: {args.app}")
+    print(f"Repo: {repo}")
+    print(f"Aggregate: {sc.aggregate:.4f}")
+    print()
+    print(f"{'Dimension':<36} {'Score':>8}  Rationale")
+    print(f"{'-' * 36} {'-' * 8}  {'-' * 40}")
+    for d in sc.dimensions:
+        print(f"{d.name:<36} {d.score:>8.4f}  {d.rationale[:60]}")
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
@@ -435,6 +516,149 @@ def cmd_backlog(args: argparse.Namespace) -> None:
         return
 
     raise ValueError(f"unknown backlog subcommand: {sub}")
+
+
+def cmd_canary(args: argparse.Namespace) -> None:
+    """PR13 R3#5: synthetic engine-repair canary.
+
+    Twin runs this BEFORE merging an engine-repair PR. Verifies the
+    captain's core dispatch → validate loop works end-to-end against
+    a deliberately empty/synthetic workspace — proves the engine itself
+    isn't broken without depending on any real captain's state.
+
+    Steps:
+      1. Build an ephemeral CHAD_FLEET_APPS_DIR + CHAD_CAPTAIN_APPS_REGISTRY.
+      2. Create a synthetic git repo + RegisteredApp (auto_push=False,
+         auto_merge=False — no side effects on real branches).
+      3. Pre-populate a 1-slice roadmap, run captain_tick → expect
+         dispatched.
+      4. Synthesize SliceComplete (no real goose call), run captain_tick
+         → expect verdict in {accept, soft_accept}.
+      5. Verify roadmap advanced + captain_log got a validate entry.
+      6. Report JSON {ok, steps_passed, steps_failed, elapsed_seconds}.
+
+    Exit code: 0 on full success, 1 on any step failing — Twin uses
+    this as the engine-repair merge gate.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import time
+
+    start = time.time()
+    steps_passed: list[str] = []
+    steps_failed: list[dict] = []
+
+    def _record(name: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            steps_passed.append(name)
+        else:
+            steps_failed.append({"name": name, "detail": detail})
+
+    with tempfile.TemporaryDirectory(prefix="chad-captain-canary-") as tmp:
+        tmp_path = os.fspath(tmp)
+        apps_dir = os.path.join(tmp_path, "fleet")
+        registry_path = os.path.join(tmp_path, "apps_registry.json")
+        repo_path = os.path.join(tmp_path, "repo")
+
+        os.environ["CHAD_FLEET_APPS_DIR"] = apps_dir
+        os.environ["CHAD_CAPTAIN_APPS_REGISTRY"] = registry_path
+
+        # Step 1 — synthetic git repo.
+        try:
+            os.makedirs(repo_path)
+            for cmd in (
+                ["git", "init", "-b", "main"],
+                ["git", "config", "user.email", "canary@chad-fleet.local"],
+                ["git", "config", "user.name", "canary"],
+                ["git", "commit", "--allow-empty", "-m", "init"],
+            ):
+                subprocess.run(cmd, cwd=repo_path, check=True,
+                               capture_output=True)
+            _record("git_init", True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            _record("git_init", False, str(e)[:300])
+            print(json.dumps({"ok": False, "steps_passed": steps_passed,
+                              "steps_failed": steps_failed,
+                              "elapsed_seconds": time.time() - start}))
+            sys.exit(1)
+
+        # Step 2 — synthetic registry.
+        try:
+            from chad_captain.apps_registry import (
+                AppsRegistry, RegisteredApp, save_registry,
+            )
+            app = RegisteredApp(
+                app_id="canary-app", name="Canary",
+                repo_path=repo_path, mode="autonomous",
+                auto_push=False, auto_merge=False, auto_replan=False,
+            )
+            save_registry(AppsRegistry(apps=[app]))
+            _record("registry_seed", True)
+        except Exception as e:  # noqa: BLE001
+            _record("registry_seed", False, str(e)[:300])
+            print(json.dumps({"ok": False, "steps_passed": steps_passed,
+                              "steps_failed": steps_failed,
+                              "elapsed_seconds": time.time() - start}))
+            sys.exit(1)
+
+        # Step 3 — workspace + roadmap + first tick (dispatch).
+        try:
+            from chad_captain.protocol import (
+                AppWorkspace, Roadmap, RoadmapSlice, SliceComplete,
+                read_captain_log, read_roadmap, write_roadmap,
+                write_slice_complete,
+            )
+            from chad_captain.validator import captain_tick
+            ws = AppWorkspace("canary-app")
+            ws.ensure()
+            roadmap = Roadmap(
+                app_id="canary-app",
+                slices=[RoadmapSlice(slice_id="canary-s1",
+                                     objective="canary smoke")],
+            )
+            write_roadmap(ws, roadmap)
+            status1 = captain_tick(ws, repo_path=repo_path,
+                                   use_baseline_scorecard=False)
+            ok = bool(status1) and "canary-s1" in (status1 or "")
+            _record("dispatch_tick", ok, status1 or "no status")
+        except Exception as e:  # noqa: BLE001
+            _record("dispatch_tick", False, str(e)[:300])
+
+        # Step 4 — synthesize completion + second tick (validate).
+        try:
+            sc = SliceComplete(
+                slice_id="canary-s1", app_id="canary-app",
+                duration_seconds=0.1, goose_exit_code=0,
+                summary="canary synthetic completion",
+                files_changed=[],
+            )
+            write_slice_complete(ws, sc)
+            status2 = captain_tick(ws, repo_path=repo_path,
+                                   use_baseline_scorecard=False)
+            ok = bool(status2) and "validate" in (status2 or "")
+            _record("validate_tick", ok, status2 or "no status")
+        except Exception as e:  # noqa: BLE001
+            _record("validate_tick", False, str(e)[:300])
+
+        # Step 5 — roadmap advanced + captain_log entry exists.
+        try:
+            log = read_captain_log(ws, limit=10)
+            validate_entries = [e for e in log if e.kind == "validate"]
+            ok = len(validate_entries) >= 1
+            _record("captain_log_validate_entry", ok,
+                    f"validate_entries={len(validate_entries)}")
+        except Exception as e:  # noqa: BLE001
+            _record("captain_log_validate_entry", False, str(e)[:300])
+
+    overall_ok = not steps_failed
+    print(json.dumps({
+        "ok": overall_ok,
+        "steps_passed": steps_passed,
+        "steps_failed": steps_failed,
+        "elapsed_seconds": round(time.time() - start, 3),
+    }))
+    sys.exit(0 if overall_ok else 1)
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -622,10 +846,12 @@ def main(argv: list[str] | None = None) -> None:
 
     replan_p = sub.add_parser("replan", help="Run the replanner and write a fresh roadmap")
     replan_p.add_argument("--app", required=True, metavar="APP_ID")
-    replan_p.add_argument("--repo", required=True, metavar="PATH")
+    # PR2 fix: --repo is now optional; resolved from registry when registered.
+    replan_p.add_argument("--repo", default=None, metavar="PATH",
+                          help="Override repo_path (default: registry lookup)")
     replan_p.add_argument("--trigger", default="manual",
                           choices=("initial", "exhausted", "soft_accept_streak",
-                                    "admiral_note", "manual"))
+                                    "admiral_note", "manual", "publish"))
     replan_p.add_argument("--refresh-research", action="store_true")
     replan_p.add_argument("--no-llm", action="store_true",
                           help="Skip the LLM call; use the deterministic fallback")
@@ -702,6 +928,29 @@ def main(argv: list[str] | None = None) -> None:
     ideate_p.add_argument("--model", default="opus",
                            choices=("opus", "haiku", "sonnet"))
 
+    scorecard_p = sub.add_parser(
+        "scorecard",
+        help="Print one app's fresh scorecard (baseline dims + extras)",
+    )
+    scorecard_p.add_argument("--app", required=True, metavar="APP_ID")
+    scorecard_p.add_argument(
+        "--repo", default=None, metavar="PATH",
+        help="Override repo_path (default: registry lookup)",
+    )
+    scorecard_p.add_argument(
+        "--json", action="store_true", help="Print full scorecard as JSON",
+    )
+
+    sub.add_parser(
+        "canary",
+        help=(
+            "Engine-repair canary: synthetic dispatch+validate cycle "
+            "against a tmp workspace; exits 0 on engine health, 1 on "
+            "any step failure. Twin uses this as the engine-repair "
+            "merge gate."
+        ),
+    )
+
     research_p = sub.add_parser("research", help="Build or read app research profile")
     research_p.add_argument("--app", required=True, metavar="APP_ID")
     research_p.add_argument("--repo", default=None, metavar="PATH",
@@ -723,6 +972,7 @@ def main(argv: list[str] | None = None) -> None:
         "alerts": cmd_alerts,
         "actions": cmd_actions,
         "status": cmd_status,
+        "scorecard": cmd_scorecard,
         "research": cmd_research,
         "replan": cmd_replan,
         "tick": cmd_tick,
@@ -734,6 +984,7 @@ def main(argv: list[str] | None = None) -> None:
         "backlog": cmd_backlog,
         "ideate": cmd_ideate,
         "summary": cmd_summary,
+        "canary": cmd_canary,
     }
     dispatch[args.command](args)
 

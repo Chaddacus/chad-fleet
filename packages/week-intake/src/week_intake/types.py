@@ -75,6 +75,20 @@ class RouteTarget(BaseModel):
     greenfield_name: str | None = None  # human label for net-new projects
 
 
+class Note(BaseModel):
+    """One ad-hoc observation recorded against a WeekItem (cycle 7).
+
+    Notes are append-only and do not mutate state or revision. Use them
+    when execution surfaces information you want to attach to the item
+    without going through clarify (which requires an open question) or
+    triggering a lifecycle transition.
+    """
+
+    text: str
+    at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    by: str = "chad"
+
+
 class LifecycleEvent(BaseModel):
     """One lifecycle transition (complete/abandon/reopen) recorded on a WeekItem.
 
@@ -119,6 +133,9 @@ class WeekItem(BaseModel):
     # Cycle 5: append-only audit log of complete/abandon/reopen transitions.
     # Pre-cycle-5 items load with empty list (default factory).
     lifecycle_log: list[LifecycleEvent] = Field(default_factory=list)
+    # Cycle 7: append-only ad-hoc observations recorded via `chad-week note`.
+    # Does not mutate state or revision. Pre-cycle-7 items load empty.
+    notes: list[Note] = Field(default_factory=list)
 
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

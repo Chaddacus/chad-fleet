@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "email-mcp"
+version = "0.0.0"
+description = "Email connector (IMAP/SMTP) — library + stdio MCP. One credential home for the hub."
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.5"]
+
+[project.optional-dependencies]
+# `mcp` is only needed to RUN the stdio server (lazily imported in server.py). Kept optional so
+# the read-path library (accounts/backend, used by the aggregator) installs without it.
+server = ["mcp>=1.2"]
+dev = ["pytest>=8.0", "mcp>=1.2"]
+
+[project.scripts]
+email-mcp = "email_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/email_mcp"]

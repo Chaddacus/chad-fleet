@@ -12,10 +12,14 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "tracked-app-registry",
+    "email-mcp",
+    "calendar-mcp",
 ]
 
 [tool.uv.sources]
 tracked-app-registry = { workspace = true }
+email-mcp = { workspace = true }
+calendar-mcp = { workspace = true }
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "httpx>=0.27"]

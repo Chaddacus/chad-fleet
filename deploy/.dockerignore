@@ -1,0 +1,15 @@
+# Build-context excludes (shared by all hub images; keeps contexts small + boundary clean).
+**/node_modules
+**/.next
+**/.venv
+**/__pycache__
+**/*.pyc
+**/dist
+**/.turbo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+.git
+deploy/.env
+.bws-project
+**/*.log

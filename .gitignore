@@ -66,6 +66,7 @@ dist/
 .env.*
 !.env.example
 secrets/
+.bws-project
 
 # Playwright probe artifacts (host-local, captured per-run)
 .playwright-mcp/

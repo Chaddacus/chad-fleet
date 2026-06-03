@@ -1788,6 +1788,8 @@ def _common_auto_merge_setup(
         captain_branch="codex/captain-test-app",
         pr_base_branch="main",
         auto_push=True, auto_open_pr=True, auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2304,6 +2306,8 @@ def test_auto_merge_invokes_gh_pr_merge_when_enabled(
         auto_open_pr=True,
         auto_merge=True,
         auto_merge_method="squash",
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2441,6 +2445,8 @@ def test_auto_merge_blocked_when_scorecard_regression(
         auto_push=True,
         auto_open_pr=True,
         auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2517,6 +2523,8 @@ def test_auto_merge_failure_escalates_and_leaves_pr_open(
         auto_push=True,
         auto_open_pr=True,
         auto_merge=True,
+        # PR7 R3#7: auto_merge requires verify_cmd
+        verify_cmd="true",
     )])
     monkeypatch.setattr(
         "chad_captain.apps_registry.load_registry", lambda: fake_reg,
@@ -2731,3 +2739,1441 @@ def test_backlog_skips_already_shipped(tmp_path: Path) -> None:
     assert shipped == []
     bl2 = read_feature_backlog(ws)
     assert bl2.by_id("fb-001").shipped_in == "PR#1"  # not overwritten
+
+
+# ===========================================================================
+# Cycle B — PR-conflict 3-source loop break
+# ===========================================================================
+
+
+def test_pr_conflict_emits_log_and_admiral_note_once(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the captain's pending PR is OPEN+DIRTY, _maybe_handle_pr_merge:
+      - returns True (suppresses the re-emit fall-through)
+      - emits ONE pr_conflict log entry
+      - writes ONE admiral_note
+    A second tick must NOT re-emit either (de-dup by reading log history).
+    """
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry,
+        append_captain_log,
+        list_unread_admiral_notes,
+        read_captain_log,
+        write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    pr_url = "https://github.com/owner/repo/pull/174"
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id="test-app", slice_id=None, kind="pull_request_opened",
+            rationale="PR opened",
+            references={"pr_url": pr_url, "branch": "codex/captain-test-app"},
+        ),
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: (
+            "OPEN",
+            {
+                "number": 174, "url": pr_url,
+                "mergeStateStatus": "DIRTY", "mergeable": "CONFLICTING",
+                "isDraft": False,
+            },
+        ),
+    )
+    # Mock these so they fail loudly if reached (they shouldn't be).
+    sentinel_calls = {"push": 0, "open_pr": 0}
+
+    def fake_push(**_kw):
+        sentinel_calls["push"] += 1
+        return mf.CmdResult(ok=True, summary="ok")
+
+    def fake_open_pr(**_kw):
+        sentinel_calls["open_pr"] += 1
+        return mf.CmdResult(ok=True, summary="ok", stdout=pr_url)
+
+    monkeypatch.setattr(mf, "push_captain_branch", fake_push)
+    monkeypatch.setattr(mf, "open_pull_request", fake_open_pr)
+
+    # Tick 1: should emit pr_conflict + admiral_note, suppress re-emit.
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    pr_conflict_entries = [e for e in log if e.kind == "pr_conflict"]
+    assert len(pr_conflict_entries) == 1
+    entry = pr_conflict_entries[0]
+    assert entry.references["merge_state_status"] == "DIRTY"
+    assert entry.references["pr_url"] == pr_url
+
+    notes = list_unread_admiral_notes(ws)
+    assert len(notes) == 1
+    note_body = notes[0].read_text()
+    assert "DIRTY" in note_body
+    assert pr_url in note_body
+    # Suppression: roadmap_complete + new pull_request_opened did NOT fire
+    # this tick (push and open_pr were never called).
+    assert sentinel_calls["push"] == 0
+    assert sentinel_calls["open_pr"] == 0
+    # Count check: only the 1 seeded pull_request_opened exists; no new one.
+    pr_opened_count = sum(1 for e in log if e.kind == "pull_request_opened")
+    assert pr_opened_count == 1
+    # No roadmap_complete was emitted this tick (handler didn't run).
+    assert all(e.kind != "roadmap_complete" for e in log)
+
+    # Tick 2: same conflict state — must NOT re-emit pr_conflict.
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log2 = read_captain_log(ws)
+    pr_conflict_entries_2 = [e for e in log2 if e.kind == "pr_conflict"]
+    assert len(pr_conflict_entries_2) == 1, "pr_conflict must not re-emit"
+
+
+def test_roadmap_complete_log_dedups_within_run(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two consecutive ticks with all-done roadmap must NOT emit two
+    roadmap_complete entries when no intervening terminal event happened.
+    """
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log, read_captain_log, write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=False,  # keep test simple — just probe the dedup
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log_after_tick1 = read_captain_log(ws)
+    rc1 = [e for e in log_after_tick1 if e.kind == "roadmap_complete"]
+    assert len(rc1) == 1
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    log_after_tick2 = read_captain_log(ws)
+    rc2 = [e for e in log_after_tick2 if e.kind == "roadmap_complete"]
+    # Cycle B: dedup. Second tick must NOT add another roadmap_complete.
+    assert len(rc2) == 1
+
+
+def test_pull_request_opened_suppressed_when_already_exists(
+    ws: AppWorkspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When open_pull_request reports PR_ALREADY_EXISTS_MARKER, the
+    pull_request_opened log entry must NOT be appended again."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain.protocol import (
+        CaptainLogEntry, append_captain_log, read_captain_log, write_roadmap,
+    )
+    import chad_captain.merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="Test", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test-app",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    pr_url = "https://github.com/owner/repo/pull/9"
+
+    # No pre-existing pull_request_opened entry — _maybe_handle_pr_merge
+    # short-circuits (no pending_pr_url) and we fall through to
+    # _handle_roadmap_complete. open_pull_request reports already-exists.
+
+    monkeypatch.setattr(
+        mf, "push_captain_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ok"),
+    )
+    monkeypatch.setattr(
+        mf, "open_pull_request",
+        lambda **_kw: mf.CmdResult(
+            ok=True,
+            summary=f"{mf.PR_ALREADY_EXISTS_MARKER} (#9, OPEN)",
+            stdout=pr_url,
+        ),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    pr_opened = [e for e in log if e.kind == "pull_request_opened"]
+    # Suppression: marker means "no fresh open" → no log entry.
+    assert len(pr_opened) == 0
+    # roadmap_complete still fires (first time).
+    assert any(e.kind == "roadmap_complete" for e in log)
+
+
+# ---------------------------------------------------------------------------
+# Cycle C — pluggable validator + dispatched-slice snapshot + retry context
+# ---------------------------------------------------------------------------
+
+
+def _stub_registry(monkeypatch: pytest.MonkeyPatch, *apps) -> None:
+    """Helper: replace load_registry() with a stub returning the given apps."""
+    from chad_captain.apps_registry import AppsRegistry
+    fake = AppsRegistry(apps=list(apps))
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake,
+    )
+
+
+def test_dispatch_writes_snapshot_before_current_slice(
+    ws: AppWorkspace, tmp_path: Path,
+) -> None:
+    """Cycle C HIGH-3 R2 fix: snapshot must exist on disk before
+    current_slice.json (the runner's go-signal). At end of dispatch tick,
+    both files exist and contain the same slice."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="O")])
+    write_roadmap(ws, rm)
+
+    status = captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+    assert "dispatched s1" in status
+    assert ws.last_dispatched_slice_path.exists()
+    assert ws.current_slice_path.exists()
+
+    from chad_captain.protocol import read_last_dispatched_slice
+    snap = read_last_dispatched_slice(ws)
+    assert snap is not None
+    assert snap.slice_id == "s1"
+    assert "O" in snap.user_prompt  # real prompt, not blank
+
+
+def test_validation_clears_snapshot_after_consuming(ws: AppWorkspace) -> None:
+    """Cycle C HIGH-2 R1 fix: prompts don't linger on disk."""
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="SYS", user_prompt="USR", repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # Snapshot was for s1; it's been consumed → should be gone.
+    assert not ws.last_dispatched_slice_path.exists()
+
+
+def test_validation_uses_snapshot_prompts_when_present(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom validator receives real prompts from the snapshot, not blanks."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    captured: dict = {}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        captured["system_prompt"] = dispatched_slice.system_prompt
+        captured["user_prompt"] = dispatched_slice.user_prompt
+        captured["slice_id"] = dispatched_slice.slice_id
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_cycle_c_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_cycle_c_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="MY SYSTEM PROMPT", user_prompt="MY USER PROMPT",
+        repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    assert captured["slice_id"] == "s1"
+    assert captured["system_prompt"] == "MY SYSTEM PROMPT"
+    assert captured["user_prompt"] == "MY USER PROMPT"
+
+    log = read_captain_log(ws)
+    accepts = [e for e in log if e.kind == "validate" and e.verdict == "accept"]
+    assert len(accepts) == 1
+    assert "custom ok" in accepts[0].rationale
+
+
+def test_custom_validator_missing_module_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-1 R1 fix: fail-CLOSED on missing module (not silent
+    fallback to default chain — default may accept silently)."""
+    from chad_captain.apps_registry import RegisteredApp
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="nonexistent.module.path",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    # Exactly one validate entry, and it must be escalate (not accept).
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+
+    # Roadmap slice must NOT be marked done — escalate is a blocked status.
+    rm2 = read_roadmap(ws)
+    assert rm2.slices[0].status == "blocked"
+
+
+def test_custom_validator_missing_attribute_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Module loads but lacks validate_app_completion → escalate."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+
+    mod = types.ModuleType("test_cycle_c_empty_validator")
+    sys.modules["test_cycle_c_empty_validator"] = mod  # no validate_app_completion
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_empty_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+
+
+def test_custom_validator_runtime_error_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom validator raises → captain catches, escalates, doesn't crash."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    mod = types.ModuleType("test_cycle_c_crash_validator")
+
+    def crash(**_kwargs):
+        raise RuntimeError("validator boom")
+
+    mod.validate_app_completion = crash
+    sys.modules["test_cycle_c_crash_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_crash_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="SYS", user_prompt="USR", repo_path="/tmp/r",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+    assert "validator boom" in validates[0].rationale
+
+
+def test_custom_validator_with_missing_snapshot_escalates(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-1 R2 fix: when validator_module is set and the snapshot
+    is missing, captain escalates (does NOT call custom validator with blank
+    proxy prompts)."""
+    import sys
+    import types
+    from chad_captain.apps_registry import RegisteredApp
+
+    called = {"n": 0}
+
+    def should_not_run(**_kwargs):
+        called["n"] += 1
+        from chad_captain.validator import ValidationResult
+        return ValidationResult(verdict="accept", rationale="should not run")
+
+    mod = types.ModuleType("test_cycle_c_unused_validator")
+    mod.validate_app_completion = should_not_run
+    sys.modules["test_cycle_c_unused_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path="/tmp/r",
+            mode="autonomous",
+            validator_module="test_cycle_c_unused_validator",
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    # NO snapshot written — simulates upgrade or lost file.
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    assert called["n"] == 0  # custom validator must NOT have been called
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    assert validates[0].verdict == "escalate"
+    assert "snapshot" in validates[0].rationale.lower()
+
+
+def test_default_validator_uses_proxy_when_snapshot_missing(
+    ws: AppWorkspace,
+) -> None:
+    """Back-compat: no validator_module + no snapshot = default chain runs
+    against a proxy slice (blank prompts). Existing behavior preserved."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    # No snapshot, no registered app at all.
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    validates = [e for e in log if e.kind == "validate"]
+    assert len(validates) == 1
+    # Default chain: clean exit + files_changed → accept.
+    assert validates[0].verdict == "accept"
+
+
+def test_retry_context_threaded_into_next_dispatch_prompt(
+    ws: AppWorkspace,
+) -> None:
+    """Cycle C MED-5 R1 fix: rejected slice's rationale shows up in the
+    retry's user_prompt as 'PRIOR ATTEMPT FAILED: ...'."""
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    # Trigger reject_retry: clean exit but no files changed.
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="zero changes",
+                      files_changed=[]),
+    )
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # First tick: validate reject_retry + retry_context written + slice
+    # re-queued + retry dispatched (the captain dispatches in same tick).
+    assert ws.current_slice_path.exists()
+    cs = read_current_slice(ws)
+    assert cs.slice_id == "s1-retry"
+    assert "PRIOR ATTEMPT FAILED" in cs.user_prompt
+    assert "no files changed" in cs.user_prompt.lower()
+    # Sidecar cleared after consumption.
+    assert not ws.retry_context_path.exists()
+
+
+def test_retry_context_cleared_when_stale_slice_id(ws: AppWorkspace) -> None:
+    """Defensive clear: a sidecar pointing at a different slice id must not
+    bleed into an unrelated retry."""
+    from chad_captain.protocol import RetryContext, write_retry_context
+    write_retry_context(
+        ws,
+        RetryContext(slice_id="ghost-slice", rationale="not-this-slice"),
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A")])
+    write_roadmap(ws, rm)
+
+    # Manually trigger a "retry" detection by seeding a recent reject_retry
+    # validate entry for s1 (so is_retry path is taken), but no real prior
+    # rejection of s1 specifically — sidecar is for ghost-slice, must clear.
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id="s1", kind="validate",
+        verdict="reject_retry", rationale="prior",
+    ))
+
+    captain_tick(ws, repo_path="/tmp/r", use_baseline_scorecard=False)
+
+    # Stale sidecar for "ghost-slice" must be gone (defensive clear),
+    # and retry prompt must NOT contain "not-this-slice".
+    assert not ws.retry_context_path.exists()
+    cs = read_current_slice(ws)
+    assert cs is not None
+    assert "not-this-slice" not in cs.user_prompt
+
+
+def test_kill_replan_in_bad_verdicts_trips_circuit_breaker(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cycle C HIGH-3 R2 fix: kill_replan now counts toward the circuit
+    breaker so unbounded timeout loops are bounded."""
+    from chad_captain.validator import _BAD_VERDICTS
+    assert "kill_replan" in _BAD_VERDICTS, (
+        "kill_replan must be in _BAD_VERDICTS so circuit breaker counts "
+        "repeated timeouts (Cycle C HIGH-3 R2 fix)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cycle D — auto_replan policy + roadmap_drained event
+# ---------------------------------------------------------------------------
+
+
+def test_roadmap_drained_event_emitted_before_exhausted_replan(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When roadmap has no dispatchable queued slice but is not yet
+    terminal, captain logs roadmap_drained before triggering replan."""
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[
+            # All slices are blocked by a non-existent dep — none dispatchable,
+            # not in terminal state either.
+            RoadmapSlice(slice_id="s1", objective="A", status="blocked"),
+            RoadmapSlice(slice_id="s2", objective="B", status="queued",
+                         blocked_by=["nonexistent"]),
+        ],
+    )
+    write_roadmap(ws, rm)
+
+    # Stub replan so we don't depend on LLM/research config in tests.
+    from chad_captain.replanner import replan as _real_replan
+    def fake_replan(ws, repo_path, *, trigger="exhausted", **kw):
+        new_rm = Roadmap(
+            app_id=ws.app_id,
+            slices=[RoadmapSlice(slice_id="post-replan",
+                                 objective="post", status="queued")],
+        )
+        write_roadmap(ws, new_rm)
+        return new_rm
+    monkeypatch.setattr("chad_captain.replanner.replan", fake_replan)
+
+    # Drained-but-not-terminal: is_roadmap_complete is False (s2 is queued
+    # but un-dispatchable), so we go through the auto_replan path.
+    captain_tick(ws, repo_path="/tmp/r", auto_replan=True,
+                 use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    drained = [e for e in log if e.kind == "roadmap_drained"]
+    assert len(drained) == 1
+    refs = drained[0].references
+    assert refs["blocked"] == "1"
+    assert refs["queued"] == "1"
+
+
+def test_roadmap_drained_not_emitted_when_auto_replan_off(
+    ws: AppWorkspace,
+) -> None:
+    """auto_replan=False → captain just returns 'roadmap exhausted'; no
+    drained event (admiral controls replan timing)."""
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[
+            RoadmapSlice(slice_id="s1", objective="A", status="blocked"),
+            RoadmapSlice(slice_id="s2", objective="B", status="queued",
+                         blocked_by=["nonexistent"]),
+        ],
+    )
+    write_roadmap(ws, rm)
+
+    captain_tick(ws, repo_path="/tmp/r", auto_replan=False,
+                 use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    assert not any(e.kind == "roadmap_drained" for e in log)
+
+
+def test_registered_app_auto_replan_field_default_true() -> None:
+    """Back-compat default — daemon's pre-Cycle-D behavior preserved."""
+    from chad_captain.apps_registry import RegisteredApp
+    a = RegisteredApp(app_id="x", name="X", repo_path="/tmp/x")
+    assert a.auto_replan is True
+
+
+def test_registered_app_auto_replan_can_be_disabled() -> None:
+    """T1 (Spark) opts out via auto_replan=False."""
+    from chad_captain.apps_registry import RegisteredApp
+    a = RegisteredApp(app_id="spark", name="Spark", repo_path="/tmp/s",
+                      auto_replan=False)
+    assert a.auto_replan is False
+
+
+def test_daemon_passes_per_app_auto_replan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """daemon._tick_one threads RegisteredApp.auto_replan into captain_tick."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain import daemon
+
+    captured: dict = {}
+
+    def fake_tick(ws, *, repo_path, auto_replan):
+        captured["auto_replan"] = auto_replan
+        return "ok"
+
+    monkeypatch.setattr(daemon, "captain_tick", fake_tick)
+    monkeypatch.setenv("CHAD_FLEET_APPS_DIR", str(tmp_path))
+
+    app = RegisteredApp(
+        app_id="t", name="T", repo_path="/tmp/r",
+        mode="autonomous", auto_replan=False,
+    )
+    status = daemon._tick_one(app)
+    assert status == "ok"
+    assert captured["auto_replan"] is False
+
+
+# ---------------------------------------------------------------------------
+# Cycle E — RoadmapSlice.custom_prompt passthrough
+# ---------------------------------------------------------------------------
+
+
+def test_custom_system_prompt_replaces_default() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="YOU ARE A MANUSCRIPT EDITOR.",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.system_prompt == "YOU ARE A MANUSCRIPT EDITOR."
+    # User prompt path unchanged when only system was customized.
+    assert "OBJECTIVE: O" in cs.user_prompt
+
+
+def test_custom_user_prompt_replaces_default() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_user_prompt="REWRITE CHAPTER 3 IN A LOWER REGISTER.",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.user_prompt.startswith("REWRITE CHAPTER 3 IN A LOWER REGISTER.")
+    # No "OBJECTIVE: ..." prefix when user provides their own prompt.
+    assert "OBJECTIVE:" not in cs.user_prompt
+
+
+def test_custom_prompts_both_replaced() -> None:
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="SYS",
+        custom_user_prompt="USR",
+    )
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert cs.system_prompt == "SYS"
+    assert cs.user_prompt.strip() == "USR"
+
+
+def test_custom_user_prompt_still_appends_extra_context() -> None:
+    """Cycle C retry plumbing must keep working with custom prompts."""
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_user_prompt="MY CUSTOM PROMPT",
+    )
+    cs = build_current_slice(
+        rs, app_id="t", repo_path="/tmp/r",
+        extra_context="PRIOR ATTEMPT FAILED: bad things",
+    )
+    assert "MY CUSTOM PROMPT" in cs.user_prompt
+    assert "PRIOR ATTEMPT FAILED: bad things" in cs.user_prompt
+
+
+def test_default_prompts_when_custom_unset() -> None:
+    """Back-compat: existing roadmaps without custom_* fields use defaults."""
+    from chad_captain.validator import build_current_slice
+    rs = RoadmapSlice(slice_id="s1", objective="add a TODO")
+    cs = build_current_slice(rs, app_id="t", repo_path="/tmp/r")
+    assert "careful coding agent" in cs.system_prompt
+    assert "OBJECTIVE: add a TODO" in cs.user_prompt
+
+
+def test_roadmap_slice_custom_prompt_round_trips() -> None:
+    """Pydantic round-trip preserves custom_* fields."""
+    rs = RoadmapSlice(
+        slice_id="s1", objective="O",
+        custom_system_prompt="SYS",
+        custom_user_prompt="USR",
+    )
+    raw = rs.model_dump_json()
+    loaded = RoadmapSlice.model_validate_json(raw)
+    assert loaded.custom_system_prompt == "SYS"
+    assert loaded.custom_user_prompt == "USR"
+
+
+def test_roadmap_slice_back_compat_loads_without_custom_fields() -> None:
+    """JSON written before Cycle E lacks custom_* — must still load."""
+    legacy = (
+        '{"slice_id": "old", "objective": "O", "title": "", "phase": "", '
+        '"estimated_minutes": 30, "blocked_by": [], "status": "queued", '
+        '"notes": ""}'
+    )
+    rs = RoadmapSlice.model_validate_json(legacy)
+    assert rs.custom_system_prompt is None
+    assert rs.custom_user_prompt is None
+
+
+# ---------------------------------------------------------------------------
+# PR2 R3-HIGH-2 — post-merge refresh failure fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_post_merge_refresh_failure_pauses_dispatch_and_keeps_roadmap(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Codex R3 finding: when refresh_base_branch fails, captain previously
+    cleared roadmap + emitted post_merge_cycle. Next tick could re-dispatch
+    new work on the stale captain branch. Fix: pause dispatch, KEEP roadmap,
+    don't emit post_merge_cycle."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain import merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/test-branch",
+        pr_base_branch="main",
+        auto_open_pr=True,
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    # Seed a pull_request_opened entry so _maybe_handle_pr_merge has work.
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id=None, kind="pull_request_opened",
+        rationale="seed",
+        references={"pr_url": "https://github.com/o/r/pull/1"},
+    ))
+
+    # Stub gh: PR is MERGED so post-merge handler runs.
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc123"},
+                                   "mergedAt": "2026-05-05T00:00:00Z"}),
+    )
+    # Refresh fails:
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **_kw: mf.CmdResult(ok=False, summary="fetch failed: timeout"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    # Pause file MUST be set (dispatch blocked).
+    assert ws.pause_until_path.exists()
+    pause_data = __import__("json").loads(ws.pause_until_path.read_text())
+    assert pause_data.get("reason") == "post_merge_refresh_failed"
+
+    # Roadmap MUST still exist (don't clear when refresh failed).
+    assert ws.roadmap_path.exists()
+
+    # post_merge_cycle MUST NOT have been emitted.
+    log = read_captain_log(ws)
+    assert not any(e.kind == "post_merge_cycle" for e in log)
+    # Escalation WAS emitted with the right event tag.
+    escalations = [
+        e for e in log
+        if e.kind == "escalation_raised"
+        and (e.references or {}).get("event") == "post_merge_refresh_failed"
+    ]
+    assert len(escalations) == 1
+    assert "stale-branch" in escalations[0].rationale.lower()
+
+
+def test_post_merge_refresh_success_clears_roadmap_and_emits_cycle(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Back-compat: when refresh succeeds, the original behavior holds —
+    roadmap cleared, post_merge_cycle emitted."""
+    from chad_captain.apps_registry import AppsRegistry, RegisteredApp
+    from chad_captain import merge_facilitator as mf
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    rm = Roadmap(
+        app_id="test-app",
+        slices=[RoadmapSlice(slice_id="s1", objective="A", status="done")],
+    )
+    write_roadmap(ws, rm)
+
+    fake_reg = AppsRegistry(apps=[RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/test-branch",
+        pr_base_branch="main",
+        auto_open_pr=True,
+        verify_cmd=None,  # skip post-merge verify
+    )])
+    monkeypatch.setattr(
+        "chad_captain.apps_registry.load_registry", lambda: fake_reg,
+    )
+
+    from chad_captain.protocol import CaptainLogEntry, append_captain_log
+    append_captain_log(ws, CaptainLogEntry(
+        app_id="test-app", slice_id=None, kind="pull_request_opened",
+        rationale="seed",
+        references={"pr_url": "https://github.com/o/r/pull/1"},
+    ))
+
+    monkeypatch.setattr(
+        mf, "get_pr_state",
+        lambda **_kw: ("MERGED", {"mergeCommit": {"oid": "abc123"},
+                                   "mergedAt": "2026-05-05T00:00:00Z"}),
+    )
+    monkeypatch.setattr(
+        mf, "refresh_base_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="ff: at abc123"),
+    )
+    monkeypatch.setattr(
+        mf, "delete_local_branch",
+        lambda **_kw: mf.CmdResult(ok=True, summary="deleted"),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    assert any(e.kind == "post_merge_cycle" for e in log)
+    # Roadmap WAS cleared.
+    assert not ws.roadmap_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# PR10 R3#7 v6 §validation L2: verify_cmd wrapper enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_custom_validator_skipped_when_verify_cmd_fails(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Custom validator MUST NOT run when verify_cmd fails. Even if the
+    custom validator would have returned accept, the L1 build gate
+    short-circuits to reject_retry."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        # Custom validator would shamelessly accept everything.
+        return ValidationResult(verdict="accept", rationale="custom always accepts")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_permissive_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_permissive_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_permissive_validator",
+            verify_cmd="false",  # always exits non-zero
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert custom_called["n"] == 0, "custom validator was called despite failed verify_cmd"
+    log = read_captain_log(ws)
+    rejects = [e for e in log if e.kind == "validate" and e.verdict == "reject_retry"]
+    assert len(rejects) == 1
+    assert "verify_cmd failed BEFORE custom validator" in rejects[0].rationale
+
+
+def test_custom_validator_runs_when_verify_cmd_passes(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Happy path: verify_cmd passes, custom validator runs and its
+    verdict (accept) is honored."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_passing_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_passing_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_passing_validator",
+            verify_cmd="true",  # always exits 0
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    assert custom_called["n"] == 1
+    log = read_captain_log(ws)
+    accepts = [e for e in log if e.kind == "validate" and e.verdict == "accept"]
+    assert len(accepts) == 1
+    assert "custom ok" in accepts[0].rationale
+
+
+def test_custom_validator_with_no_verify_cmd_runs_normally(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When verify_cmd is unset, the pre-check is skipped (back-compat)
+    and the custom validator owns the verdict."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import (
+        CurrentSlice as _CS,
+        write_last_dispatched_slice,
+    )
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    custom_called = {"n": 0}
+
+    def fake_validate(*, ws, complete, dispatched_slice, repo_path,
+                      reg_app, score_delta, was_retry, use_baseline_scorecard):
+        from chad_captain.validator import ValidationResult
+        custom_called["n"] += 1
+        return ValidationResult(verdict="accept", rationale="custom ok")
+
+    import sys
+    import types
+    mod = types.ModuleType("test_pr10_no_verify_validator")
+    mod.validate_app_completion = fake_validate
+    sys.modules["test_pr10_no_verify_validator"] = mod
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            validator_module="test_pr10_no_verify_validator",
+            # verify_cmd intentionally unset
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+    write_last_dispatched_slice(ws, _CS(
+        slice_id="s1", app_id="test-app", objective="A", title="A",
+        system_prompt="x", user_prompt="y", repo_path=str(repo),
+    ))
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+    assert custom_called["n"] == 1
+
+
+def test_default_validator_is_unaffected_by_verify_pre_check(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Default chain already runs apply_verify_gate at the END; the new
+    pre-check is custom-validator-only. Confirm default chain still
+    runs verify_cmd via the existing post-process path."""
+    from chad_captain.apps_registry import RegisteredApp
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+
+    _stub_registry(
+        monkeypatch,
+        RegisteredApp(
+            app_id="test-app", name="T", repo_path=str(repo),
+            mode="autonomous",
+            verify_cmd="false",  # always fails
+            verify_timeout_seconds=30,
+        ),
+    )
+
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="A",
+                                      status="in_flight")])
+    write_roadmap(ws, rm)
+    write_slice_complete(
+        ws,
+        SliceComplete(slice_id="s1", app_id="test-app", duration_seconds=5,
+                      goose_exit_code=0, summary="done", files_changed=["a.py"]),
+    )
+
+    captain_tick(ws, repo_path=str(repo), use_baseline_scorecard=False)
+
+    log = read_captain_log(ws)
+    rejects = [e for e in log if e.kind == "validate"
+               and e.verdict in ("reject_retry", "reject_hard")]
+    assert len(rejects) == 1
+    # Default chain's verify_gate uses different rationale prefix —
+    # NOT the new "BEFORE custom validator" message.
+    assert "BEFORE custom validator" not in rejects[0].rationale
+    assert "verify_cmd" in rejects[0].rationale
+
+
+# ---------------------------------------------------------------------------
+# PR12 R3#7 v6 §validation close: remote verify_cmd via SSH
+# ---------------------------------------------------------------------------
+
+
+def test_run_verify_gate_local_path_unchanged(tmp_path: Path) -> None:
+    """No verify_host => existing local subprocess path."""
+    from chad_captain.validator import run_verify_gate
+    passed, summary = run_verify_gate(
+        repo_path=str(tmp_path), verify_cmd="true", timeout_seconds=10,
+    )
+    assert passed is True
+    assert "passed" in summary
+
+
+def test_run_verify_gate_with_verify_host_invokes_ssh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """verify_host present => ssh argv built + executed."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = "remote ok"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(
+        hostname="ci.example.com", user="builder", port=2222,
+        identity_file="/keys/id", remote_workdir="/srv/build",
+        ssh_options=["ConnectTimeout=10"],
+    )
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=120, verify_host=vh,
+    )
+    assert passed is True
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    assert "-i" in argv and "/keys/id" in argv
+    assert "-p" in argv and "2222" in argv
+    assert "-o" in argv and "ConnectTimeout=10" in argv
+    # BatchMode default added since user didn't set it.
+    assert "BatchMode=yes" in argv
+    # Target + remote command at the end.
+    assert "builder@ci.example.com" in argv
+    assert any("cd /srv/build && make check" in a for a in argv)
+
+
+def test_run_verify_gate_remote_failure_returns_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote non-zero exit => passed=False with stderr tail."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    class FakeProc:
+        returncode = 2
+        stdout = ""
+        stderr = "build broke at line 42"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeProc())
+
+    vh = VerifyHost(hostname="h")
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=10, verify_host=vh,
+    )
+    assert passed is False
+    assert "exit 2" in summary
+    assert "build broke at line 42" in summary
+
+
+def test_run_verify_gate_remote_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SSH timeout => passed=False with a timeout summary."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(hostname="h")
+    passed, summary = run_verify_gate(
+        repo_path="/ignored", verify_cmd="make check",
+        timeout_seconds=5, verify_host=vh,
+    )
+    assert passed is False
+    assert "timed out" in summary
+
+
+def test_run_verify_gate_user_batchmode_not_double_added(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If user already specified BatchMode, captain must not duplicate it."""
+    import subprocess
+    from chad_captain.apps_registry import VerifyHost
+    from chad_captain.validator import run_verify_gate
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    vh = VerifyHost(hostname="h", ssh_options=["BatchMode=no"])
+    run_verify_gate(
+        repo_path="/x", verify_cmd="t", timeout_seconds=5, verify_host=vh,
+    )
+    batch_modes = [a for a in captured["argv"] if a.startswith("BatchMode=")]
+    assert batch_modes == ["BatchMode=no"]
+
+
+# ---------------------------------------------------------------------------
+# PR15 R3#7 v6 §6.4: producer-pending check on roadmap_complete
+# ---------------------------------------------------------------------------
+
+
+def test_pending_produces_empty_when_no_manifest(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """No task_manifest declared => no gate fires (back-compat)."""
+    from chad_captain.validator import _pending_produces
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+    assert _pending_produces(ws) == set()
+
+
+def test_pending_produces_returns_all_when_bus_empty(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Manifest declares produces but bus has no manifest yet => all pending."""
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1", "fixtures.v1"],
+    ))
+    assert _pending_produces(ws) == {"spec.v1", "fixtures.v1"}
+
+
+def test_pending_produces_subtracts_published(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Bus manifest contains some declared artifacts => only the rest pending."""
+    import json
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    art_root = tmp_path / "art"
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(art_root))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1", "fixtures.v1", "report.v1"],
+    ))
+    bus_manifest_dir = art_root / "t-1"
+    bus_manifest_dir.mkdir(parents=True)
+    (bus_manifest_dir / "manifest.json").write_text(json.dumps({
+        "task_id": "t-1",
+        "artifacts": {
+            "spec.v1": {"name": "spec.v1", "schema_id": "s",
+                        "produced_at": "now",
+                        "produced_by_app_id": "p"},
+            "fixtures.v1": {"name": "fixtures.v1", "schema_id": "s",
+                            "produced_at": "now",
+                            "produced_by_app_id": "p"},
+        },
+    }))
+    assert _pending_produces(ws) == {"report.v1"}
+
+
+def test_pending_produces_empty_when_all_published(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    import json
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _pending_produces
+    art_root = tmp_path / "art"
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(art_root))
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-1", produces=["spec.v1"],
+    ))
+    bus_manifest_dir = art_root / "t-1"
+    bus_manifest_dir.mkdir(parents=True)
+    (bus_manifest_dir / "manifest.json").write_text(json.dumps({
+        "task_id": "t-1",
+        "artifacts": {
+            "spec.v1": {"name": "spec.v1", "schema_id": "s",
+                        "produced_at": "now",
+                        "produced_by_app_id": "p"},
+        },
+    }))
+    assert _pending_produces(ws) == set()
+
+
+def test_handle_roadmap_complete_blocks_pr_when_producer_pending(
+    ws: AppWorkspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Roadmap structurally complete + manifest.produces missing from bus
+    => log roadmap_complete_pending_producer + DO NOT call PR open path."""
+    from chad_captain.apps_registry import RegisteredApp
+    from chad_captain.protocol import TaskManifest, write_task_manifest
+    from chad_captain.validator import _handle_roadmap_complete
+
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    monkeypatch.setenv("CHAD_FLEET_ARTIFACTS_DIR", str(tmp_path / "art"))
+
+    write_task_manifest(ws, TaskManifest(
+        task_id="t-7", produces=["spec.v1"],
+    ))
+
+    push_calls = {"n": 0}
+
+    def boom_push(*a, **kw):
+        push_calls["n"] += 1
+        raise AssertionError("push_captain_branch must NOT be called")
+
+    monkeypatch.setattr(
+        "chad_captain.merge_facilitator.push_captain_branch", boom_push,
+    )
+
+    reg_app = RegisteredApp(
+        app_id="test-app", name="T", repo_path=str(repo),
+        mode="autonomous",
+        captain_branch="codex/captain-test",
+        auto_push=True, auto_open_pr=True,
+        verify_cmd="true",
+    )
+    rm = Roadmap(app_id="test-app",
+                 slices=[RoadmapSlice(slice_id="s1", objective="O",
+                                      status="done")])
+
+    _handle_roadmap_complete(ws, str(repo), rm, reg_app)
+
+    assert push_calls["n"] == 0
+    log = read_captain_log(ws, limit=10)
+    pending = [e for e in log if e.kind == "roadmap_complete_pending_producer"]
+    assert len(pending) == 1
+    assert "spec.v1" in pending[0].rationale

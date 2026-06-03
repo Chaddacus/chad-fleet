@@ -74,6 +74,12 @@ def tick_autonomous_apps() -> dict[str, str]:
     for app in registry.apps:
         if app.mode != "autonomous":
             continue
+        # PR6: respect enabled=False (scaffold staging gate). A captain
+        # whose scaffold transaction failed phase 5 ACTIVATE stays
+        # enabled=false; daemon must NOT tick it.
+        if not getattr(app, "enabled", True):
+            results[app.app_id] = "skipped (enabled=false)"
+            continue
         results[app.app_id] = _tick_one(app)
     return results
 
@@ -83,8 +89,10 @@ def _tick_one(app: RegisteredApp) -> str:
     try:
         ws = AppWorkspace(app.app_id)
         ws.ensure()
+        # Cycle D: honor per-app auto_replan policy. Default True keeps
+        # pre-Cycle-D behavior; manuscript captains (Spark) opt out.
         status = captain_tick(
-            ws, repo_path=app.repo_path, auto_replan=True,
+            ws, repo_path=app.repo_path, auto_replan=app.auto_replan,
         )
         return status or "no-op"
     except Exception as e:  # noqa: BLE001

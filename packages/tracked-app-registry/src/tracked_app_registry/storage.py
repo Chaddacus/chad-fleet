@@ -25,13 +25,44 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
+_JSONL_ATOMIC_WRITE_LIMIT = 4096
+"""POSIX PIPE_BUF guarantees writes ≤ this size are atomic in O_APPEND mode.
+
+Lines larger than this need exclusive flock during the write to prevent
+interleaved partial-line corruption. Twin's tail reader buffers until
+newline so a partial line is never advanced past, but a writer racing
+on a large line can still produce torn output without the flock.
+"""
+
+
 def append_jsonl(path: Path, record: dict) -> None:
-    """Append one JSON record to a JSONL file. Creates parent dirs if needed."""
+    """Append one JSON record to a JSONL file (PR6 R3#6: atomic append).
+
+    Uses ``os.open(O_APPEND)`` + single ``os.write`` per encoded line so
+    the write is one syscall, atomic up to PIPE_BUF (~4KB) on POSIX. For
+    larger lines an exclusive ``fcntl.flock`` serializes writers so a
+    concurrent reader (Twin tail loop) never sees interleaved bytes.
+    Caller responsibility (per FLEET_PROCESS v6 §R3#6): diff snippets
+    > 4KB belong in a referenced file, not in the log JSON.
+    """
+    import fcntl
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, default=str) + "\n"
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.flush()
+    payload = (json.dumps(record, default=str) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    fd = os.open(path, flags, 0o644)
+    try:
+        if len(payload) > _JSONL_ATOMIC_WRITE_LIMIT:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                os.write(fd, payload)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            # Single write under PIPE_BUF — POSIX guarantees atomicity in
+            # O_APPEND mode without needing a lock.
+            os.write(fd, payload)
+    finally:
+        os.close(fd)
 
 
 def read_jsonl(path: Path) -> list[dict]:

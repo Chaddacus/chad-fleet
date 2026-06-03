@@ -195,10 +195,14 @@ def get_pr_state(
     Returns ``(state, raw)`` where ``state`` is one of ``"OPEN"``, ``"MERGED"``,
     ``"CLOSED"`` or None on lookup failure (no PR, gh down, network error).
     Caller treats None as "unknown — try again next tick."
+
+    The raw dict includes ``mergeStateStatus`` so callers can distinguish
+    OPEN+CLEAN (ready) from OPEN+DIRTY/BLOCKED (conflict — captain should
+    suppress further roadmap_complete cycling and escalate).
     """
     res = _run(
         ["gh", "pr", "view", head, "--json",
-         "state,number,url,mergeCommit,isDraft,mergedAt"],
+         "state,number,url,mergeCommit,isDraft,mergedAt,mergeStateStatus,mergeable"],
         cwd=repo_path, timeout=timeout,
     )
     if not res.ok:
@@ -299,6 +303,9 @@ def refresh_base_branch(
     )
 
 
+PR_ALREADY_EXISTS_MARKER = "PR already exists"
+
+
 def open_pull_request(
     *,
     repo_path: str,
@@ -310,9 +317,16 @@ def open_pull_request(
     timeout: int = 60,
 ) -> CmdResult:
     """Open a PR via `gh pr create`. Returns CmdResult with PR url in stdout
-    on success. If a PR for this branch already exists, gh prints the URL to
-    stderr and exits 1 — we surface that as a non-error 'already exists' state
-    by running `gh pr view` as a fallback."""
+    on success.
+
+    If a PR for this branch already exists, gh prints the URL to stderr and
+    exits 1. We surface that as ok=True (so callers don't escalate on a
+    benign repeat) but the summary starts with ``PR_ALREADY_EXISTS_MARKER``
+    so callers that care (e.g. captain log emitter) can distinguish a fresh
+    open from an idempotent re-call and suppress redundant log entries.
+
+    To check programmatically: ``res.summary.startswith(PR_ALREADY_EXISTS_MARKER)``.
+    """
     cmd = [
         "gh", "pr", "create",
         "--base", base,
@@ -327,8 +341,9 @@ def open_pull_request(
         return res
 
     # If PR already exists, gh prints the existing PR URL on stderr. Detect
-    # and treat as success — we don't want a duplicate-PR error to look like
-    # a failure to the admiral.
+    # and treat as ok=True with an explicit marker in the summary so the
+    # caller can distinguish "we just opened a fresh PR" from "PR already
+    # existed; nothing changed."
     if "already exists" in (res.stderr + res.stdout).lower():
         view = _run(
             ["gh", "pr", "view", head, "--json", "url,number,state"],
@@ -339,7 +354,10 @@ def open_pull_request(
                 data = json.loads(view.stdout)
                 return CmdResult(
                     ok=True,
-                    summary=f"PR already exists (#{data.get('number')}, {data.get('state')})",
+                    summary=(
+                        f"{PR_ALREADY_EXISTS_MARKER} "
+                        f"(#{data.get('number')}, {data.get('state')})"
+                    ),
                     stdout=data.get("url", ""),
                 )
             except json.JSONDecodeError:

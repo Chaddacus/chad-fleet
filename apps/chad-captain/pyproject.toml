@@ -33,6 +33,10 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 [project.scripts]
 chad-captain = "chad_captain.cli:main"
 chad-captain-api = "chad_captain.api:main"
+# PR2 R3-HIGH-1 fix: first-class console script for the goose-runner.
+# Without this, captains dispatched current_slice.json with no consumer
+# and stalled until the watchdog fired ~30min later.
+chad-captain-goose-runner = "chad_captain.goose_runner:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chad_captain"]

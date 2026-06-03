@@ -139,7 +139,7 @@ export default async function AppDetailPage({ params }: PageProps) {
         <h2 className="mb-3 text-sm font-semibold uppercase tracking-wider text-gray-500">
           Obsessive-loop runs
         </h2>
-        {app.obsessive_loop_runs.length === 0 ? (
+        {(app.obsessive_loop_runs ?? []).length === 0 ? (
           <p className="text-sm text-gray-500">No runs recorded yet.</p>
         ) : (
           <div className="overflow-auto rounded border border-gray-800">
@@ -153,7 +153,7 @@ export default async function AppDetailPage({ params }: PageProps) {
                 </tr>
               </thead>
               <tbody>
-                {app.obsessive_loop_runs.map((run: ObsessiveLoopRun) => (
+                {((app.obsessive_loop_runs ?? []) as ObsessiveLoopRun[]).map((run) => (
                   <tr
                     key={run.run_id}
                     className="border-b border-gray-900 hover:bg-gray-900 transition-colors"

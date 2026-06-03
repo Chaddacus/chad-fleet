@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chad-captain-scaffold"
+version = "0.0.0"
+description = "Captain scaffold engine — produces new captains from task profiles, owns the cross-task artifact bus"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.5",
+    "tracked-app-registry",
+]
+
+[tool.uv.sources]
+tracked-app-registry = { workspace = true }
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+chad-captain-scaffold = "chad_captain_scaffold.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chad_captain_scaffold"]

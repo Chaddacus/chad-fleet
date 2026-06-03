@@ -27,6 +27,7 @@ Replan triggers (caller — the daemon — handles these):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import Callable
 
 from chad_captain.protocol import (
+    AdmiralNote,
     AppWorkspace,
     CaptainLogEntry,
     CaptainVerdict,
@@ -48,6 +50,7 @@ from chad_captain.protocol import (
     read_current_slice,
     read_roadmap,
     read_slice_complete,
+    write_admiral_note,
     write_current_slice,
     write_roadmap,
 )
@@ -65,6 +68,10 @@ class ValidationResult:
     verdict: CaptainVerdict
     rationale: str
     rubric_delta_pp: float | None = None
+    # Cycle C: optional retry guidance threaded into the next dispatch's
+    # user_prompt when the verdict is reject_retry/kill_replan. Empty by
+    # default — the rationale alone is enough for most retries.
+    retry_context: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +214,26 @@ def run_verify_gate(
     repo_path: str,
     verify_cmd: str | None,
     timeout_seconds: int = 300,
+    verify_host: "VerifyHost | None" = None,
 ) -> tuple[bool, str]:
     """Run the per-app verify command (e.g. 'make check', 'npm test').
 
     Returns ``(passed, summary)`` — when ``verify_cmd`` is None/empty the gate
     is skipped (passed=True). Tails stderr/stdout on failure so the captain
     log captures *why* CI failed without dumping the full build log.
+
+    PR12 R3#7: when ``verify_host`` is provided, the command runs on the
+    remote host via SSH instead of in repo_path locally. SSH must be
+    passwordless; captain does not prompt.
     """
     if not verify_cmd or not verify_cmd.strip():
         return True, "no verify_cmd configured"
+    if verify_host is not None:
+        return _run_verify_remote(
+            verify_host=verify_host,
+            verify_cmd=verify_cmd,
+            timeout_seconds=timeout_seconds,
+        )
     try:
         proc = subprocess.run(  # noqa: S602 — operator-configured local cmd
             verify_cmd,
@@ -235,6 +253,59 @@ def run_verify_gate(
     return True, f"verify_cmd passed ({verify_cmd!r})"
 
 
+def _run_verify_remote(
+    *,
+    verify_host: "VerifyHost",
+    verify_cmd: str,
+    timeout_seconds: int,
+) -> tuple[bool, str]:
+    """PR12 R3#7: SSH to verify_host and run verify_cmd in remote_workdir.
+
+    Builds an ssh argv (no shell=True so we don't double-quote things)
+    and lets ssh handle the remote shell. Captures stdout+stderr; on
+    non-zero exit returns the tail so the captain log shows why CI
+    failed remotely.
+    """
+    import shlex
+    target = f"{verify_host.user}@{verify_host.hostname}"
+    remote_cmd = (
+        f"cd {shlex.quote(verify_host.remote_workdir)} && {verify_cmd}"
+    )
+    ssh_argv: list[str] = ["ssh"]
+    if verify_host.identity_file:
+        ssh_argv += ["-i", verify_host.identity_file]
+    if verify_host.port and verify_host.port != 22:
+        ssh_argv += ["-p", str(verify_host.port)]
+    for opt in verify_host.ssh_options:
+        ssh_argv += ["-o", opt]
+    # Default to BatchMode=yes so ssh won't hang waiting for a password
+    # prompt — captain has no terminal.
+    if not any(o.startswith("BatchMode=") for o in verify_host.ssh_options):
+        ssh_argv += ["-o", "BatchMode=yes"]
+    ssh_argv += [target, remote_cmd]
+
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv list, no shell injection
+            ssh_argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"verify_cmd (remote {target}) timed out after {timeout_seconds}s"
+        )
+    except OSError as e:
+        return False, f"ssh failed to launch: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1024:].strip()
+        return False, (
+            f"verify_cmd (remote {target}) exit {proc.returncode}: "
+            f"{tail[:500]}"
+        )
+    return True, f"verify_cmd passed (remote {target}: {verify_cmd!r})"
+
+
 def apply_verify_gate(
     result: ValidationResult,
     *,
@@ -242,12 +313,16 @@ def apply_verify_gate(
     repo_path: str,
     verify_cmd: str | None,
     timeout_seconds: int = 300,
+    verify_host: "VerifyHost | None" = None,
 ) -> ValidationResult:
     """Run the verify gate against an accepted slice and downgrade if CI fails.
 
     Only runs for verdicts where goose claims success (``accept``, ``soft_accept``).
     For already-rejecting verdicts the gate is a no-op — the slice is going to
     be retried/escalated regardless.
+
+    PR12: ``verify_host`` propagated to run_verify_gate so apps configured
+    with a remote VerifyHost run their verify_cmd over SSH.
     """
     if result.verdict not in ("accept", "soft_accept"):
         return result
@@ -255,6 +330,7 @@ def apply_verify_gate(
         repo_path=repo_path,
         verify_cmd=verify_cmd,
         timeout_seconds=timeout_seconds,
+        verify_host=verify_host,
     )
     if passed:
         return result
@@ -319,22 +395,37 @@ def build_current_slice(
     System + user prompts are kept terse here — the replanner (S8) is the
     component that builds rich, research-grounded prompts from playbook +
     scorecard + research artifacts. For S3 we just route the objective.
-    """
-    system = (
-        "You are a careful coding agent working under a captain's direction. "
-        "Make the smallest correct change that satisfies the objective. "
-        "Run tests for the code you changed before declaring done. "
-        "Do not introduce abstractions that weren't asked for. "
-        "If the objective is ambiguous, do the obvious interpretation and "
-        "describe your reasoning briefly at the end."
-    )
 
-    user = f"OBJECTIVE: {rs.objective}\n"
-    if rs.phase:
-        user += f"PHASE: {rs.phase}\n"
-    if extra_context:
-        user += f"\nCONTEXT:\n{extra_context}\n"
-    user += "\nWhen done, summarize what you changed and why.\n"
+    Cycle E: when ``rs.custom_system_prompt`` / ``rs.custom_user_prompt`` are
+    set, they replace the defaults. ``extra_context`` (retry hints from
+    Cycle C) is still appended to the user prompt regardless.
+    """
+    if rs.custom_system_prompt is not None:
+        system = rs.custom_system_prompt
+    else:
+        system = (
+            "You are a careful coding agent working under a captain's direction. "
+            "Make the smallest correct change that satisfies the objective. "
+            "Run tests for the code you changed before declaring done. "
+            "Do not introduce abstractions that weren't asked for. "
+            "If the objective is ambiguous, do the obvious interpretation and "
+            "describe your reasoning briefly at the end."
+        )
+
+    if rs.custom_user_prompt is not None:
+        user = rs.custom_user_prompt
+        # Custom user prompts are responsible for embedding their own objective
+        # text — but we still append extra_context (retry hints) so per-slice
+        # custom prompts don't lose Cycle C retry plumbing.
+        if extra_context:
+            user += f"\n\nCONTEXT:\n{extra_context}\n"
+    else:
+        user = f"OBJECTIVE: {rs.objective}\n"
+        if rs.phase:
+            user += f"PHASE: {rs.phase}\n"
+        if extra_context:
+            user += f"\nCONTEXT:\n{extra_context}\n"
+        user += "\nWhen done, summarize what you changed and why.\n"
 
     return CurrentSlice(
         slice_id=rs.slice_id if not parent_slice_id else f"{rs.slice_id}-retry",
@@ -345,6 +436,161 @@ def build_current_slice(
         user_prompt=user,
         repo_path=repo_path,
         parent_slice_id=parent_slice_id,
+        # PR6/v8: propagate task_id from RoadmapSlice → CurrentSlice so the
+        # eventual SliceComplete + CaptainLogEntry can carry it forward.
+        task_id=rs.task_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cycle C — pluggable validator chain
+# ---------------------------------------------------------------------------
+
+
+def validate_app_completion(
+    *,
+    ws: AppWorkspace,
+    complete: SliceComplete,
+    dispatched_slice: CurrentSlice,
+    repo_path: str,
+    reg_app,  # RegisteredApp | None
+    score_delta: Callable[[CurrentSlice, SliceComplete], float | None] | None,
+    was_retry: bool,
+    use_baseline_scorecard: bool,
+) -> ValidationResult:
+    """Default validation chain: validate_slice → reuse-regression override →
+    verify-gate downgrade.
+
+    Custom validators (set via ``RegisteredApp.validator_module``) implement
+    this same signature. They own the entire chain — captain does NOT post-
+    process their verdict with reuse_regression or verify_gate.
+
+    Returns a fully-resolved ``ValidationResult``. Caller (captain_tick) is
+    responsible for advancing the roadmap, writing the captain log entry, and
+    clearing slice_complete + the dispatched-slice snapshot.
+    """
+    if score_delta is None:
+        score_delta = _no_score_delta
+
+    result = validate_slice(
+        complete=complete, slice_=dispatched_slice, score_delta=score_delta,
+    )
+
+    # C14 — reuse-regression guard. Override generic "rubric regression"
+    # rationale with explicit "EXTEND existing package" message when a new
+    # parallel package was introduced.
+    if use_baseline_scorecard:
+        reuse_drop = _detect_reuse_regression(ws, repo_path)
+        if reuse_drop is not None:
+            verdict = "reject_hard" if was_retry else "reject_retry"
+            suffix = "after retry; reject hard" if was_retry else (
+                "retry — EXTEND existing package instead of parallel"
+            )
+            result = ValidationResult(
+                verdict=verdict,
+                rationale=(
+                    f"reuse_consistency regressed {reuse_drop} — "
+                    f"slice introduced parallel package; {suffix}"
+                ),
+                rubric_delta_pp=result.rubric_delta_pp,
+            )
+
+    # C1 verify gate: per-app `verify_cmd` must pass for the slice to ship.
+    # PR12: pass verify_host so remote-CI captains run gate over SSH.
+    if reg_app is not None:
+        result = apply_verify_gate(
+            result,
+            is_retry=was_retry,
+            repo_path=repo_path,
+            verify_cmd=reg_app.verify_cmd,
+            timeout_seconds=reg_app.verify_timeout_seconds,
+            verify_host=reg_app.verify_host,
+        )
+
+    return result
+
+
+def _resolve_validate_fn(
+    reg_app, ws: AppWorkspace,
+) -> Callable[..., ValidationResult] | None:
+    """Resolve the per-app validator function.
+
+    Returns the default ``validate_app_completion`` when no custom module is
+    configured. Returns the custom module's ``validate_app_completion`` when
+    one is. Returns None on import/attribute failure (caller emits ``escalate``
+    — fail-CLOSED, never silently fall back to default).
+    """
+    if not (reg_app and reg_app.validator_module):
+        return validate_app_completion
+
+    import importlib
+    try:
+        mod = importlib.import_module(reg_app.validator_module)
+    except ImportError as e:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=(
+                    f"validator_module {reg_app.validator_module!r} import "
+                    f"failed: {e}; emitting escalate verdict (fail-closed)"
+                ),
+                references={
+                    "event": "validator_module_load_failed",
+                    "module": reg_app.validator_module,
+                    "error": str(e),
+                },
+            ),
+        )
+        return None
+
+    fn = getattr(mod, "validate_app_completion", None)
+    if fn is None:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=(
+                    f"validator_module {reg_app.validator_module!r} loaded "
+                    f"but lacks validate_app_completion; emitting escalate "
+                    f"verdict (fail-closed)"
+                ),
+                references={
+                    "event": "validator_module_load_failed",
+                    "module": reg_app.validator_module,
+                    "error": "missing validate_app_completion",
+                },
+            ),
+        )
+        return None
+    return fn
+
+
+def _build_proxy_dispatched_slice(
+    completion: SliceComplete,
+    roadmap: Roadmap | None,
+    repo_path: str,
+    app_id: str,
+) -> CurrentSlice:
+    """Back-compat fallback when no last_dispatched_slice snapshot exists.
+
+    Uses the existing pre-Cycle-C reconstruction: blank prompts, objective +
+    title pulled from the roadmap. Safe ONLY for the default validator chain
+    (which doesn't read prompts). Custom validators get an ``escalate`` verdict
+    instead — see captain_tick's snapshot-resolution branch.
+    """
+    rs_id = completion.slice_id.removesuffix("-retry")
+    rs = next((s for s in (roadmap.slices if roadmap else []) if s.slice_id == rs_id), None)
+    was_retry = completion.slice_id.endswith("-retry")
+    return CurrentSlice(
+        slice_id=completion.slice_id,
+        app_id=app_id,
+        objective=rs.objective if rs else "",
+        title=rs.title if rs else "",
+        system_prompt="",
+        user_prompt="",
+        repo_path=repo_path,
+        parent_slice_id="parent" if was_retry else None,
     )
 
 
@@ -409,68 +655,132 @@ def captain_tick(
                 ),
             )
             clear_slice_complete(ws)
+            # Defensive: drop snapshot/retry-context too — they're orphaned
+            # without a roadmap to advance.
+            from chad_captain.protocol import (
+                clear_last_dispatched_slice as _clear_snap,
+                clear_retry_context as _clear_rc,
+            )
+            _clear_snap(ws)
+            _clear_rc(ws)
             return f"completion {completion.slice_id} consumed; no roadmap → escalate"
 
-        # We need the original slice context to know if it was a retry. The
-        # protocol doesn't currently persist the issued CurrentSlice once
-        # consumed; we reconstruct minimal context from the roadmap.
-        rs = next((s for s in roadmap.slices if s.slice_id == completion.slice_id or s.slice_id == completion.slice_id.removesuffix("-retry")), None)
         was_retry = completion.slice_id.endswith("-retry")
-        proxy_slice = CurrentSlice(
-            slice_id=completion.slice_id,
-            app_id=ws.app_id,
-            objective=rs.objective if rs else "",
-            title=rs.title if rs else "",
-            system_prompt="",
-            user_prompt="",
-            repo_path=repo_path,
-            parent_slice_id="parent" if was_retry else None,
+
+        # Cycle C — resolve the dispatched slice. Prefer the captain-owned
+        # snapshot (real prompts) so custom validators can match on prompt
+        # state. Fall back to the proxy reconstruction ONLY for the default
+        # validator (it doesn't read prompts). Custom validator + missing
+        # snapshot → escalate (fail-closed).
+        from chad_captain.protocol import read_last_dispatched_slice
+        snap = read_last_dispatched_slice(ws)
+        snap_ok = bool(
+            snap
+            and snap.slice_id.removesuffix("-retry")
+            == completion.slice_id.removesuffix("-retry")
         )
-        result = validate_slice(complete=completion, slice_=proxy_slice, score_delta=score_delta)
+        has_custom_validator = bool(reg_app and reg_app.validator_module)
 
-        # C14 — reuse-regression guard. If the slice introduced a NEW
-        # parallel package (reuse_consistency dropped from before to
-        # after), override the verdict / rationale with a specific
-        # parallel-package message. Live failure: PR #145 shipped two
-        # parallel `entitlements.py` modules — one in top-level
-        # `billing/` with TIER_RANK and one in `apps/billing/services/`
-        # with TIER_FEATURE_MATRIX. reuse_consistency dropped, but the
-        # generic "rubric regression" message gave the captain no
-        # actionable signal. The override turns it into an explicit
-        # "EXTEND existing package instead" instruction.
-        if use_baseline_scorecard:
-            reuse_drop = _detect_reuse_regression(ws, repo_path)
-            if reuse_drop is not None:
-                was_retry = completion.slice_id.endswith("-retry")
-                # Always reject when a parallel package is introduced.
-                # On retry, reject_hard so we don't loop on the same
-                # mistake. First time, reject_retry with explicit
-                # guidance.
-                verdict = "reject_hard" if was_retry else "reject_retry"
-                suffix = "after retry; reject hard" if was_retry else (
-                    "retry — EXTEND existing package instead of parallel"
-                )
-                result = ValidationResult(
-                    verdict=verdict,
-                    rationale=(
-                        f"reuse_consistency regressed {reuse_drop} — "
-                        f"slice introduced parallel package; {suffix}"
-                    ),
-                    rubric_delta_pp=result.rubric_delta_pp,
-                )
-
-        # C1 verify gate: if the registered app has a verify_cmd, run it
-        # against the repo. Goose's exit-code is local to the slice; the
-        # verify gate is global ("does the project still build/test?").
-        # Failure downgrades accept/soft_accept → reject_retry/reject_hard.
-        if reg_app is not None:
-            result = apply_verify_gate(
-                result,
-                is_retry=was_retry,
-                repo_path=repo_path,
-                verify_cmd=reg_app.verify_cmd,
-                timeout_seconds=reg_app.verify_timeout_seconds,
+        if snap_ok:
+            dispatched_slice = snap
+        elif has_custom_validator:
+            # Fail-closed for custom validators. The default chain is safe
+            # with blank prompts, but custom validators may match on
+            # prompts and we don't ship under wrong policy.
+            result = ValidationResult(
+                verdict="escalate",
+                rationale=(
+                    "dispatched-slice snapshot missing/mismatch; custom "
+                    "validator requires real prompts"
+                ),
             )
+            dispatched_slice = None  # not used past this point
+        else:
+            dispatched_slice = _build_proxy_dispatched_slice(
+                completion, roadmap, repo_path, ws.app_id,
+            )
+
+        # Resolve + run the validator chain (default OR per-app custom).
+        if not has_custom_validator or snap_ok:
+            validate_fn = _resolve_validate_fn(reg_app, ws)
+            if validate_fn is None:
+                # Module load failed — fail-closed.
+                result = ValidationResult(
+                    verdict="escalate",
+                    rationale=(
+                        f"validator_module {reg_app.validator_module!r} "
+                        f"unavailable; admiral fix required"
+                    ),
+                )
+            else:
+                # PR10 R3#7 v6 §validation L2 — verify_cmd wrapper enforcement.
+                # When a custom validator is configured, run verify_cmd FIRST
+                # so a buggy/permissive custom validator can't suppress an L1
+                # build failure by returning accept. The default chain already
+                # runs verify_gate at the END (apply_verify_gate), but only
+                # post-processes accept/soft_accept results — a custom
+                # validator that bypasses verify_cmd entirely could ship
+                # broken code if we trusted its accept verdict blindly.
+                # Default validators skip this pre-check (they call
+                # apply_verify_gate themselves).
+                pre_check_short_circuit = False
+                if has_custom_validator and reg_app.verify_cmd:
+                    pre_passed, pre_summary = run_verify_gate(
+                        repo_path=repo_path,
+                        verify_cmd=reg_app.verify_cmd,
+                        timeout_seconds=reg_app.verify_timeout_seconds,
+                        verify_host=reg_app.verify_host,
+                    )
+                    if not pre_passed:
+                        verdict_kind: CaptainVerdict = (
+                            "reject_hard" if was_retry else "reject_retry"
+                        )
+                        result = ValidationResult(
+                            verdict=verdict_kind,
+                            rationale=(
+                                f"verify_cmd failed BEFORE custom validator "
+                                f"({reg_app.validator_module!r}); custom "
+                                f"validator skipped to prevent override of "
+                                f"L1 build gate. {pre_summary}"
+                            ),
+                        )
+                        pre_check_short_circuit = True
+                if not pre_check_short_circuit:
+                    try:
+                        result = validate_fn(
+                            ws=ws,
+                            complete=completion,
+                            dispatched_slice=dispatched_slice,
+                            repo_path=repo_path,
+                            reg_app=reg_app,
+                            score_delta=score_delta,
+                            was_retry=was_retry,
+                            use_baseline_scorecard=use_baseline_scorecard,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        append_captain_log(
+                            ws,
+                            CaptainLogEntry(
+                                app_id=ws.app_id, slice_id=completion.slice_id,
+                                kind="escalation_raised",
+                                rationale=(
+                                    f"validator_module raised: "
+                                    f"{type(e).__name__}: {e}"
+                                ),
+                                references={
+                                    "event": "validator_module_runtime_error",
+                                    "module": reg_app.validator_module if reg_app else "",
+                                    "error": str(e),
+                                },
+                            ),
+                        )
+                        result = ValidationResult(
+                            verdict="escalate",
+                            rationale=(
+                                f"custom validator crashed: "
+                                f"{type(e).__name__}: {e}"
+                            ),
+                        )
 
         rs_id_in_roadmap = completion.slice_id.removesuffix("-retry")
         advance_roadmap(roadmap, rs_id_in_roadmap, result.verdict)
@@ -486,9 +796,30 @@ def captain_tick(
                 rubric_delta_pp=result.rubric_delta_pp,
                 rationale=result.rationale,
                 references={"diff_path": completion.diff_path or "", "log_path": completion.log_path or ""},
+                # PR6/v8: propagate task_id from the dispatched slice so
+                # Twin's close-handler can filter validate entries by task.
+                task_id=getattr(dispatched_slice, "task_id", None) if dispatched_slice else None,
             ),
         )
         clear_slice_complete(ws)
+        # Cycle C — the snapshot served its purpose; clear it now so prompts
+        # don't linger on disk across a pause / crash / escalation.
+        from chad_captain.protocol import clear_last_dispatched_slice as _clear_snap
+        _clear_snap(ws)
+
+        # Cycle C — retry context plumbing. On reject_retry/kill_replan,
+        # persist the rationale so the next dispatch of this slice can
+        # surface "PRIOR ATTEMPT FAILED: ..." in the user prompt.
+        if result.verdict in ("reject_retry", "kill_replan"):
+            from chad_captain.protocol import RetryContext, write_retry_context
+            write_retry_context(
+                ws,
+                RetryContext(
+                    slice_id=completion.slice_id.removesuffix("-retry"),
+                    rationale=result.rationale,
+                    retry_hint=result.retry_context,
+                ),
+            )
         # Baseline snapshot was specific to this completed slice — drop it.
         from chad_captain.scorecard import clear_baseline
         clear_baseline(ws.slice_baseline_path)
@@ -570,6 +901,36 @@ def captain_tick(
                     return (status + "; " if status else "") + "roadmap_complete (PR opened)"
 
             if auto_replan:
+                # Cycle D: emit a roadmap_drained event before the replan so
+                # the daemon's exhaustion → replan churn is visible in the
+                # captain log. Useful when debugging stuck apps where slices
+                # silently vanish.
+                done = sum(1 for s in roadmap.slices if s.status == "done")
+                in_flight = sum(1 for s in roadmap.slices if s.status == "in_flight")
+                blocked = sum(1 for s in roadmap.slices if s.status == "blocked")
+                skipped = sum(1 for s in roadmap.slices if s.status == "skipped")
+                queued = sum(1 for s in roadmap.slices if s.status == "queued")
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id, slice_id=None,
+                        kind="roadmap_drained",
+                        rationale=(
+                            f"no dispatchable queued slice "
+                            f"(done={done}, in_flight={in_flight}, "
+                            f"blocked={blocked}, skipped={skipped}, "
+                            f"queued={queued}); triggering exhausted replan"
+                        ),
+                        references={
+                            "event": "roadmap_drained",
+                            "done": str(done),
+                            "in_flight": str(in_flight),
+                            "blocked": str(blocked),
+                            "skipped": str(skipped),
+                            "queued": str(queued),
+                        },
+                    ),
+                )
                 from chad_captain.replanner import replan
                 roadmap = replan(ws, repo_path, trigger="exhausted")
                 rs = next_queued_slice(roadmap)
@@ -627,16 +988,38 @@ def captain_tick(
         is_retry = any(e.verdict in ("reject_retry", "kill_replan") for e in log_tail)
         parent_id = rs.slice_id if is_retry else None
 
+        # Cycle C — thread retry context into the prompt when this is a
+        # retry of a slice we just rejected. Cleared after read so the next
+        # fresh dispatch isn't polluted.
+        extra_context = ""
+        if is_retry:
+            from chad_captain.protocol import (
+                clear_retry_context, read_retry_context,
+            )
+            rc = read_retry_context(ws)
+            if rc and rc.slice_id == rs.slice_id:
+                extra_context = f"PRIOR ATTEMPT FAILED: {rc.rationale}\n"
+                if rc.retry_hint:
+                    extra_context += f"\nGUIDANCE: {rc.retry_hint}\n"
+                clear_retry_context(ws)
+            elif rc:
+                # Stale context from a different slice — defensively clear.
+                clear_retry_context(ws)
+
         new_slice = build_current_slice(
             rs,
             app_id=ws.app_id,
             repo_path=repo_path,
             parent_slice_id=parent_id,
+            extra_context=extra_context,
         )
-        write_current_slice(ws, new_slice)
 
-        # Snapshot pre-slice scorecard so we can compute a real delta when
-        # the slice completes. Best-effort — failures shouldn't block dispatch.
+        # Cycle C — write order: scorecard baseline FIRST, dispatched-slice
+        # snapshot SECOND, current_slice.json LAST. The runner's "go" signal
+        # is current_slice.json existing; everything captain-side that
+        # validation depends on must be on disk before that file appears.
+        # Any failure aborts dispatch (no current_slice written → runner
+        # waits; admiral fixes the issue and the next tick retries).
         if use_baseline_scorecard:
             try:
                 from chad_captain.extras import get_extras
@@ -645,8 +1028,41 @@ def captain_tick(
                     ws.slice_baseline_path,
                     score_repo(repo_path, extras=get_extras(ws.app_id)),
                 )
-            except Exception as e:
-                logger.warning("baseline scorecard write failed for %s: %s", ws.app_id, e)
+            except Exception as e:  # noqa: BLE001
+                append_captain_log(
+                    ws,
+                    CaptainLogEntry(
+                        app_id=ws.app_id, slice_id=rs.slice_id,
+                        kind="escalation_raised",
+                        rationale=f"baseline write failed pre-dispatch: {e}",
+                        references={"event": "baseline_write_failed"},
+                    ),
+                )
+                return (
+                    (status + "; " if status else "")
+                    + f"baseline write failed for {rs.slice_id}; not dispatching"
+                )
+
+        try:
+            from chad_captain.protocol import write_last_dispatched_slice
+            write_last_dispatched_slice(ws, new_slice)
+        except OSError as e:
+            append_captain_log(
+                ws,
+                CaptainLogEntry(
+                    app_id=ws.app_id, slice_id=rs.slice_id,
+                    kind="escalation_raised",
+                    rationale=f"snapshot write failed pre-dispatch: {e}",
+                    references={"event": "snapshot_write_failed"},
+                ),
+            )
+            return (
+                (status + "; " if status else "")
+                + f"snapshot write failed for {rs.slice_id}; not dispatching"
+            )
+
+        # Commit point — runner can pick up after this line.
+        write_current_slice(ws, new_slice)
 
         # Mark in-flight in roadmap.
         rs.status = "in_flight"
@@ -726,7 +1142,10 @@ def _recent_auto_merge_failure(ws: AppWorkspace, *, minutes: int) -> bool:
 # --- C8 circuit breaker helpers ---
 
 
-_BAD_VERDICTS = {"reject_hard", "revert", "escalate"}
+# Cycle C HIGH-3 R2 fix: kill_replan was previously excluded, so repeated
+# goose timeouts were unbounded — captain looped forever. Including it means
+# 3 consecutive timeouts now trip the circuit breaker (60min default pause).
+_BAD_VERDICTS = {"reject_hard", "revert", "escalate", "kill_replan"}
 
 
 def _is_paused(ws: AppWorkspace) -> bool:
@@ -1144,36 +1563,114 @@ def _maybe_self_merge_pr(
     )
 
 
+def _emit_pr_conflict(
+    ws: AppWorkspace,
+    reg_app,  # RegisteredApp
+    pr_url: str,
+    merge_state: str,
+    raw: dict,
+) -> None:
+    """Cycle B: log a pr_conflict event + file an admiral_note, exactly
+    once per pending PR.
+
+    The dual emission lets the dashboard show the conflict in the captain
+    log AND surfaces an actionable item in admiral_notes so Chad sees it
+    when steering. Suppressing further roadmap_complete cycles is the
+    caller's job (return True from _maybe_handle_pr_merge).
+    """
+    pr_number = (raw or {}).get("number")
+    is_draft = (raw or {}).get("isDraft", False)
+    append_captain_log(
+        ws,
+        CaptainLogEntry(
+            app_id=ws.app_id, slice_id=None, kind="pr_conflict",
+            rationale=(
+                f"PR is OPEN with mergeStateStatus={merge_state!r}; captain "
+                f"will not re-emit roadmap_complete until admiral resolves "
+                f"the conflict (rebase / close + restart / fix CI)."
+            ),
+            references={
+                "event": "pr_conflict",
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "merge_state_status": merge_state,
+                "is_draft": is_draft,
+                "branch": reg_app.captain_branch,
+                "severity": "high",
+            },
+        ),
+    )
+
+    note_id = f"pr-conflict-{ws.app_id}-{pr_number or 'unknown'}-{merge_state.lower()}"
+    body = (
+        f"Captain detected its pending PR is in a non-mergeable state.\n\n"
+        f"- PR: {pr_url}\n"
+        f"- mergeStateStatus: {merge_state}\n"
+        f"- Branch: {reg_app.captain_branch}\n\n"
+        f"Captain has paused the roadmap_complete loop for this PR. "
+        f"Resolve manually, then captain will resume on next tick:\n"
+        f"  - Rebase + push to clear conflicts, OR\n"
+        f"  - Close the PR + restart from main, OR\n"
+        f"  - Fix the failing required check.\n"
+    )
+    write_admiral_note(
+        ws,
+        AdmiralNote(
+            note_id=note_id,
+            app_id=ws.app_id,
+            body=body,
+            expects_response=False,
+        ),
+    )
+
+
 def _maybe_handle_pr_merge(
     ws: AppWorkspace,
     repo_path: str,
     reg_app,  # RegisteredApp | None
 ) -> bool:
     """If the captain has a pull_request_opened event since its last
-    pull_request_merged event, poll the PR's state. On MERGED:
+    pull_request_merged event, poll the PR's state.
+
+    On MERGED:
       - emit pull_request_merged log
       - refresh local base branch (fetch + checkout + ff-pull)
       - delete the stale captain branch (it's now in main)
       - clear current_slice / slice_complete / roadmap so the next tick
         replans against the freshly-merged main
       - emit post_merge_cycle log
+      - return True (caller skips _handle_roadmap_complete this tick)
 
-    Returns True iff the post-merge cycle ran. False = nothing to do
-    (no PR, PR not merged, gh lookup failed). All errors tolerated.
+    On OPEN with mergeStateStatus DIRTY/BLOCKED (Cycle B):
+      - emit pr_conflict log + admiral_note ONCE per pending PR
+      - return True (caller skips _handle_roadmap_complete this tick,
+        breaking the every-60s re-emit loop)
+      - admiral resolves manually (rebase / close / fix CI), then captain
+        resumes via fresh pull_request_opened on next conflict-free PR
+
+    Returns True iff handler ran (post-merge cycle OR conflict-suppress).
+    False = nothing to do (no PR, PR is fresh-OPEN-mergeable, gh lookup
+    failed). All errors tolerated.
     """
     if reg_app is None or not reg_app.captain_branch:
         return False
 
     # Find the most recent pull_request_opened with no later merged event.
+    # Also collect any pr_conflict entries for the SAME PR so we don't
+    # re-emit the conflict signal on every tick.
     from chad_captain.protocol import read_captain_log
     log = read_captain_log(ws, limit=200)
     pending_pr_url: str | None = None
+    conflict_already_emitted_for_url: str | None = None
     for entry in reversed(log):
         if entry.kind == "pull_request_merged":
             break  # we already handled the latest PR
-        if entry.kind == "pull_request_opened":
+        if entry.kind == "pull_request_opened" and pending_pr_url is None:
             pending_pr_url = (entry.references or {}).get("pr_url") or None
-            break
+        if entry.kind == "pr_conflict" and conflict_already_emitted_for_url is None:
+            conflict_already_emitted_for_url = (
+                (entry.references or {}).get("pr_url") or None
+            )
     if not pending_pr_url:
         return False
 
@@ -1186,6 +1683,22 @@ def _maybe_handle_pr_merge(
     state, raw = get_pr_state(
         repo_path=repo_path, head=reg_app.captain_branch,
     )
+
+    # Cycle B: detect non-mergeable open PRs and break the loop.
+    if state == "OPEN":
+        merge_state = (raw or {}).get("mergeStateStatus") or ""
+        if merge_state in {"DIRTY", "BLOCKED"}:
+            # Already escalated for THIS PR — don't spam. Return True so
+            # caller still suppresses the re-emit cycle.
+            if conflict_already_emitted_for_url == pending_pr_url:
+                return True
+            _emit_pr_conflict(ws, reg_app, pending_pr_url, merge_state, raw)
+            return True
+        # Other OPEN states (CLEAN, UNSTABLE, BEHIND, HAS_HOOKS, UNKNOWN):
+        # let the existing fall-through handle re-push if needed. The
+        # idempotent "already exists" path in open_pull_request keeps
+        # log noise bounded via the pull_request_opened de-dup below.
+
     if state != "MERGED":
         return False
 
@@ -1205,40 +1718,61 @@ def _maybe_handle_pr_merge(
         ),
     )
 
-    # Refresh main, then drop the stale captain branch. Both are
-    # best-effort — failures escalate but don't block the next tick.
+    # Refresh main first. PR2 R3-HIGH-2 fix: if the refresh fails, FAIL
+    # CLOSED — do NOT clear the roadmap, do NOT emit post_merge_cycle.
+    # Otherwise the next tick can re-dispatch new work on the stale
+    # captain branch (ensure_captain_branch returns ok if already on it),
+    # writing slices that miss whatever was merged on origin/main. Pause
+    # the captain instead so admiral resolves the refresh failure.
     rb = refresh_base_branch(
         repo_path=repo_path, base_branch=reg_app.pr_base_branch,
     )
     if not rb.ok:
+        until = datetime.now(timezone.utc) + timedelta(
+            minutes=max(1, int(reg_app.circuit_breaker_pause_minutes)),
+        )
+        _write_pause_until(ws, until.isoformat(), reason="post_merge_refresh_failed")
         append_captain_log(
             ws,
             CaptainLogEntry(
                 app_id=ws.app_id, slice_id=None, kind="escalation_raised",
-                rationale=f"post-merge base refresh failed: {rb.summary}",
-                references={"event": "post_merge_refresh_failed"},
+                rationale=(
+                    f"post-merge base refresh failed: {rb.summary}; "
+                    f"dispatch PAUSED to prevent stale-branch re-dispatch. "
+                    f"Roadmap NOT cleared. Resolve manually then unpause."
+                ),
+                references={
+                    "event": "post_merge_refresh_failed",
+                    "base": reg_app.pr_base_branch,
+                    "pause_until": until.isoformat(),
+                    "severity": "high",
+                },
             ),
         )
-    else:
-        # We're now on base; safe to delete the stale captain branch.
-        db = delete_local_branch(
-            repo_path=repo_path, branch=reg_app.captain_branch,
+        # Return True so caller knows we handled the post-merge state
+        # (suppresses the roadmap_complete fall-through this tick).
+        # The merged PR's pull_request_merged log entry is already written.
+        return True
+
+    # Refresh succeeded — safe to delete stale captain branch.
+    db = delete_local_branch(
+        repo_path=repo_path, branch=reg_app.captain_branch,
+    )
+    if not db.ok:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id, slice_id=None, kind="escalation_raised",
+                rationale=f"local branch delete failed: {db.summary}",
+                references={
+                    "event": "post_merge_branch_delete_failed",
+                    "branch": reg_app.captain_branch,
+                },
+            ),
         )
-        if not db.ok:
-            append_captain_log(
-                ws,
-                CaptainLogEntry(
-                    app_id=ws.app_id, slice_id=None, kind="escalation_raised",
-                    rationale=f"local branch delete failed: {db.summary}",
-                    references={
-                        "event": "post_merge_branch_delete_failed",
-                        "branch": reg_app.captain_branch,
-                    },
-                ),
-            )
 
     # Clear roadmap + slice state so next tick starts a fresh cycle.
-    # Branch baseline already cleared on PR open; clear again defensively.
+    # Only happens after refresh succeeded (per fail-closed fix above).
     try:
         if ws.roadmap_path.exists():
             ws.roadmap_path.unlink()
@@ -1329,6 +1863,41 @@ def _post_merge_verify(
     )
 
 
+def _pending_produces(ws: AppWorkspace) -> set[str]:
+    """PR15 R3#7 v6 §6.4: return artifact names this captain declared
+    in its task_manifest.produces[] but hasn't yet written to the
+    cross-task artifact bus manifest.
+
+    Reads ~/.chad/fleet/artifacts/<task_id>/manifest.json directly to
+    avoid pulling chad-captain-scaffold as a runtime dep — captain only
+    needs the presence check, not the full bus client.
+
+    Returns empty set when no task_manifest is declared (back-compat:
+    pre-bus captains never block on this gate).
+    """
+    import os
+    from chad_captain.protocol import read_task_manifest
+    tm = read_task_manifest(ws)
+    if tm is None or not tm.produces:
+        return set()
+    raw = os.environ.get("CHAD_FLEET_ARTIFACTS_DIR")
+    base = (
+        Path(raw).expanduser() if raw
+        else Path.home() / ".chad" / "fleet" / "artifacts"
+    )
+    bus_manifest = base / tm.task_id / "manifest.json"
+    if not bus_manifest.exists():
+        return set(tm.produces)  # nothing on the bus yet
+    try:
+        data = json.loads(bus_manifest.read_text())
+    except (ValueError, OSError):
+        # Corrupt bus manifest — treat as missing everything; safer
+        # than auto-merging on degraded state.
+        return set(tm.produces)
+    published = set((data.get("artifacts") or {}).keys())
+    return set(tm.produces) - published
+
+
 def _handle_roadmap_complete(
     ws: AppWorkspace,
     repo_path: str,
@@ -1340,23 +1909,44 @@ def _handle_roadmap_complete(
     Idempotent — re-running on an already-complete roadmap may try to push
     again (no-op fast-forward) and re-open a PR (gh detects existing PR
     and the merge_facilitator surfaces it as success). Safe.
+
+    Cycle B: dedup the roadmap_complete log entry. On a tick where the
+    most recent terminal log event is already roadmap_complete (no
+    intervening pull_request_merged or pr_conflict), skip re-emitting.
+    The PR-open path below is still allowed so admiral sees the open
+    attempt result, but open_pull_request itself signals 'already exists'
+    via summary marker and the open-log emitter further down skips that
+    duplicate.
     """
-    # Always emit the roadmap_complete log entry, even when auto_open_pr is
-    # off — admiral observes via dashboard / log tail and can take manual action.
-    append_captain_log(
-        ws,
-        CaptainLogEntry(
-            app_id=ws.app_id,
-            slice_id=None,
-            kind="roadmap_complete",
-            rationale=(
-                f"{len(roadmap.slices)} slices reached terminal state "
-                f"({sum(1 for s in roadmap.slices if s.status == 'done')} done, "
-                f"{sum(1 for s in roadmap.slices if s.status == 'skipped')} skipped)"
-            ),
-            references={"event": "roadmap_complete"},
+    from chad_captain.protocol import read_captain_log
+    recent = read_captain_log(ws, limit=20)
+    last_terminal_kind = next(
+        (
+            e.kind for e in reversed(recent)
+            if e.kind in {
+                "roadmap_complete",
+                "pull_request_merged",
+                "pr_conflict",
+                "post_merge_cycle",
+            }
         ),
+        None,
     )
+    if last_terminal_kind != "roadmap_complete":
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id,
+                slice_id=None,
+                kind="roadmap_complete",
+                rationale=(
+                    f"{len(roadmap.slices)} slices reached terminal state "
+                    f"({sum(1 for s in roadmap.slices if s.status == 'done')} done, "
+                    f"{sum(1 for s in roadmap.slices if s.status == 'skipped')} skipped)"
+                ),
+                references={"event": "roadmap_complete"},
+            ),
+        )
 
     if reg_app is None or not reg_app.auto_open_pr:
         return
@@ -1367,6 +1957,32 @@ def _handle_roadmap_complete(
                 app_id=ws.app_id, slice_id=None, kind="escalation_raised",
                 rationale="auto_open_pr=true but captain_branch is unset; cannot open PR",
                 references={"event": "roadmap_complete"},
+            ),
+        )
+        return
+
+    # PR15 R3#7 v6 §6.4: producer-pending check. If this captain has a
+    # task_manifest declaring produces[] artifacts, they MUST be on the
+    # bus before we ship a PR. Otherwise a downstream consumer captain
+    # blocks waiting on artifacts the producer "completed" without
+    # publishing.
+    pending = _pending_produces(ws)
+    if pending:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id,
+                slice_id=None,
+                kind="roadmap_complete_pending_producer",
+                rationale=(
+                    f"roadmap structurally complete but task_manifest.produces "
+                    f"missing from artifact bus: {sorted(pending)}; holding PR "
+                    f"until producer publishes"
+                ),
+                references={
+                    "event": "roadmap_complete_pending_producer",
+                    "missing_artifacts": ",".join(sorted(pending)),
+                },
             ),
         )
         return
@@ -1456,24 +2072,37 @@ def _handle_roadmap_complete(
             _mark_backlog_items_shipped(ws, roadmap, pr_url=pr_res.stdout.strip())
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("backlog ship-mark failed for %s: %s", ws.app_id, e)
-    append_captain_log(
-        ws,
-        CaptainLogEntry(
-            app_id=ws.app_id,
-            slice_id=None,
-            kind="pull_request_opened" if pr_res.ok else "escalation_raised",
-            rationale=(
-                f"PR opened: {pr_res.stdout.strip()}" if pr_res.ok
-                else f"PR open failed: {pr_res.summary}"
-            ),
-            references={
-                "event": "roadmap_complete_pr",
-                "branch": reg_app.captain_branch,
-                "base": reg_app.pr_base_branch,
-                "pr_url": pr_res.stdout.strip() if pr_res.ok else "",
-            },
-        ),
+    # Cycle B: open_pull_request reports "PR already exists" via summary
+    # marker when gh's pr-create returned the duplicate-error and we
+    # fell back to gh pr view. In that case, do NOT append another
+    # pull_request_opened log entry — the original open is still the
+    # source of truth and re-emitting causes the every-60s log-spam
+    # the admiral saw on PR #174.
+    from chad_captain.merge_facilitator import PR_ALREADY_EXISTS_MARKER
+    pr_url_str = pr_res.stdout.strip() if pr_res.ok else ""
+    is_duplicate_open = (
+        pr_res.ok
+        and pr_res.summary.startswith(PR_ALREADY_EXISTS_MARKER)
     )
+    if not is_duplicate_open:
+        append_captain_log(
+            ws,
+            CaptainLogEntry(
+                app_id=ws.app_id,
+                slice_id=None,
+                kind="pull_request_opened" if pr_res.ok else "escalation_raised",
+                rationale=(
+                    f"PR opened: {pr_url_str}" if pr_res.ok
+                    else f"PR open failed: {pr_res.summary}"
+                ),
+                references={
+                    "event": "roadmap_complete_pr",
+                    "branch": reg_app.captain_branch,
+                    "base": reg_app.pr_base_branch,
+                    "pr_url": pr_url_str,
+                },
+            ),
+        )
 
 
 _BACKLOG_STOPWORDS = frozenset({
