@@ -32,8 +32,56 @@ class InboxItem(BaseModel):
     body: str
 
 
+class SessionSnapshot(BaseModel):
+    """One agent session, normalized across runtimes (Claude, auto_runtime
+    captain tracks, Codex). The hub's "all my sessions" surface reads these."""
+
+    id: str
+    source: str  # "claude" | "auto-runtime" | "codex"
+    title: str
+    cwd: str | None = None
+    updated_at: datetime
+    status: str | None = None  # e.g. an auto_runtime objective state
+
+
+class ToolSnapshot(BaseModel):
+    """One MCP server the operator has registered. Safe projection — names/transport/scope
+    only, never args/headers/urls/env (those carry tokens)."""
+
+    name: str
+    transport: str  # "stdio" | "http" | "sse" | "unknown"
+    source: str  # "user" (~/.claude.json) | "project" (~/.mcp.json)
+    detail: str | None = None  # command basename or remote host — never secrets
+
+
+class EmailMessage(BaseModel):
+    """One inbox message — read-fast list view (no body; full body via the email-mcp read tool)."""
+
+    id: str
+    subject: str = ""
+    from_: str = ""  # sender display/address; `from` is reserved in Python
+    date: str = ""
+    unread: bool = False
+    snippet: str = ""
+
+
+class CalendarEvent(BaseModel):
+    """One upcoming calendar event — read-fast list view (read via the calendar connector)."""
+
+    id: str
+    summary: str = ""
+    start: str = ""  # ISO datetime (or date for all-day)
+    end: str = ""
+    location: str = ""
+    all_day: bool = False
+
+
 class FleetState(BaseModel):
     generated_at: datetime
     apps: list[AppSnapshot]
     inbox_recent: list[InboxItem]  # last 50 by default
+    sessions: list[SessionSnapshot] = []  # most-recent agent sessions, all runtimes
+    tools: list[ToolSnapshot] = []  # registered MCP servers (safe projection)
+    email: list[EmailMessage] = []  # recent inbox messages (read via the email connector)
+    calendar: list[CalendarEvent] = []  # upcoming events (read via the calendar connector)
     summary: dict  # cross-cut counts: total_apps, by_state, blocked_count, etc.

@@ -10,11 +10,13 @@
 
 import { ViewSpecSchema, type ViewSpec, type ViewNode } from './schema.js';
 import { buildSystemPrompt, buildRetryPrompt } from './prompt.js';
-import { claudeComplete } from './subprocess.js';
+import { getProvider } from './providers/index.js';
 
 // Re-export subprocess primitives for callers that want them directly.
 export { claudeComplete, CLAUDE_BIN, LLMError } from './subprocess.js';
 export type { ClaudeCompleteOptions } from './subprocess.js';
+export { getProvider } from './providers/index.js';
+export type { LLMProvider } from './providers/index.js';
 
 // ---------------------------------------------------------------------------
 // Stream events
@@ -68,7 +70,10 @@ export async function generateView(
   ): Promise<{ view: ViewSpec | null; raw: string; error?: string }> => {
     let raw: string;
     try {
-      raw = await claudeComplete(prompt, { model: options.model ?? 'sonnet', system });
+      raw = await getProvider().complete(prompt, {
+        ...(options.model !== undefined ? { model: options.model } : {}),
+        system,
+      });
     } catch (err) {
       return { view: null, raw: '', error: String(err) };
     }

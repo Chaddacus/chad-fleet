@@ -1,0 +1,26 @@
+{
+  "name": "@chad-fleet/hub-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Canonical cross-boundary contracts for the hub. Pydantic is the source of truth; schema + TS are generated.",
+  "type": "module",
+  "main": "ts/snapshot.ts",
+  "types": "ts/snapshot.ts",
+  "exports": {
+    ".": "./ts/snapshot.ts",
+    "./snapshot": "./ts/snapshot.ts",
+    "./schema": "./schema/snapshot.schema.json"
+  },
+  "scripts": {
+    "codegen": "python3 codegen.py",
+    "check": "tsc --noEmit -p tsconfig.check.json && node fixtures/validate.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.17.0",
+    "ajv-formats": "^3.0.1"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^15.0.0",
+    "typescript": "^5.4.0"
+  }
+}

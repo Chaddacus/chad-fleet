@@ -1,0 +1,2 @@
+- [chad-fleet admiral](project_chad_fleet_admiral.md) — HUB admiral on :8901, Odysseus front door on :7050; all slices S1–S5 + S4b done; how to run + verify; what's out of scope
+- [chad-fleet escalation gotchas](feedback_chad_fleet_escalation_gotchas.md) — prompt-echo false-positive; HTML-comment sentinel survives Odysseus; multi-task carry-forward; stream_llm needs full URL; AgentOps .js imports

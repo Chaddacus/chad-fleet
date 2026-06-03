@@ -1,0 +1,16 @@
+# chad-admiral (:8901). Not a workspace member; runtime deps are fastapi/uvicorn/pydantic only
+# (it dispatches captains via the CLI/file protocol — a boundary, not an import — so it boots
+# without the proprietary engine present). Build context = repo root.
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+WORKDIR /app
+
+COPY apps/chad-admiral/src ./src
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv "$VIRTUAL_ENV" \
+ && uv pip install --python "$VIRTUAL_ENV/bin/python" fastapi uvicorn pydantic
+ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH=/app/src
+
+EXPOSE 8901
+CMD ["uvicorn", "chad_admiral.server:app", "--host", "0.0.0.0", "--port", "8901"]

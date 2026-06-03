@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chad-fleet/hub-contracts/admiral-chat.schema.json",
+  "title": "AdmiralChat",
+  "description": "The chat contract between the dashboard and the admiral. This pins the SUBSET of the OpenAI chat-completions shape the hub relies on. It is hand-authored (not pydantic-generated like snapshot.schema.json) because the source of truth is an external standard, not our own model.",
+  "type": "object",
+  "$defs": {
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "role": { "enum": ["system", "user", "assistant"] },
+        "content": { "type": "string" }
+      },
+      "required": ["role", "content"]
+    },
+    "ChatRequest": {
+      "title": "ChatRequest",
+      "description": "Dashboard -> /api/admiral -> admiral :8901.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "model": { "type": "string" },
+        "stream": { "type": "boolean" },
+        "messages": { "type": "array", "items": { "$ref": "#/$defs/ChatMessage" } }
+      },
+      "required": ["messages"]
+    },
+    "ChatDelta": {
+      "title": "ChatDelta",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": { "content": { "type": "string" } }
+    },
+    "ChatChoice": {
+      "title": "ChatChoice",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "delta": { "$ref": "#/$defs/ChatDelta" },
+        "finish_reason": { "type": ["string", "null"] }
+      }
+    },
+    "ChatCompletionChunk": {
+      "title": "ChatCompletionChunk",
+      "description": "One SSE `data:` frame streamed back from the admiral.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "choices": { "type": "array", "items": { "$ref": "#/$defs/ChatChoice" } }
+      },
+      "required": ["choices"]
+    }
+  },
+  "properties": {
+    "request": { "$ref": "#/$defs/ChatRequest" },
+    "chunk": { "$ref": "#/$defs/ChatCompletionChunk" }
+  }
+}

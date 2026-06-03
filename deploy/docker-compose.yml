@@ -1,0 +1,60 @@
+# chad-fleet hub — full stack. Build contexts are the repo root (..); Dockerfiles live here.
+#   cd deploy && cp .env.example .env && <fill in> && docker compose up --build
+# omni-mem (the truth spine) is an EXTERNAL dependency — run it separately and point
+# OMNI_MEM_URL at it; it is intentionally not built here.
+name: chad-fleet
+
+services:
+  chad-admiral:
+    build: { context: .., dockerfile: deploy/Dockerfile.admiral }
+    ports: ["8901:8901"]
+    env_file: [.env]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('localhost',8901),2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  state-aggregator:
+    build: { context: .., dockerfile: deploy/Dockerfile.aggregator }
+    ports: ["8106:8106"]
+    env_file: [.env]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8106/api/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  view-registry:
+    build: { context: .., dockerfile: deploy/Dockerfile.view-registry }
+    ports: ["8108:8108"]
+    env_file: [.env]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;socket.create_connection(('localhost',8108),2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  genui-renderer:
+    build: { context: .., dockerfile: deploy/Dockerfile.genui }
+    ports: ["8107:8107"]
+    env_file: [.env]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(8107,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  chad-dashboard:
+    build: { context: .., dockerfile: deploy/Dockerfile.dashboard }
+    ports: ["3000:3000"]
+    env_file: [.env]
+    depends_on:
+      chad-admiral: { condition: service_healthy }
+      state-aggregator: { condition: service_healthy }
+      genui-renderer: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

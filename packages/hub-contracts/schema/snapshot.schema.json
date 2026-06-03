@@ -1,0 +1,318 @@
+{
+  "$defs": {
+    "AppSnapshot": {
+      "description": "Per-tracked-app slice of fleet state.",
+      "properties": {
+        "baseline": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "blocked_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "cadence": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_progress_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "obsessive_loop_runs": {
+          "default": [],
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "owner_brand": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "state",
+        "mode",
+        "cadence",
+        "owner_brand",
+        "last_progress_at"
+      ],
+      "title": "AppSnapshot",
+      "type": "object"
+    },
+    "CalendarEvent": {
+      "description": "One upcoming calendar event \u2014 read-fast list view (read via the calendar connector).",
+      "properties": {
+        "all_day": {
+          "default": false,
+          "type": "boolean"
+        },
+        "end": {
+          "default": "",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "location": {
+          "default": "",
+          "type": "string"
+        },
+        "start": {
+          "default": "",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "CalendarEvent",
+      "type": "object"
+    },
+    "EmailMessage": {
+      "description": "One inbox message \u2014 read-fast list view (no body; full body via the email-mcp read tool).",
+      "properties": {
+        "date": {
+          "default": "",
+          "type": "string"
+        },
+        "from_": {
+          "default": "",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "snippet": {
+          "default": "",
+          "type": "string"
+        },
+        "subject": {
+          "default": "",
+          "type": "string"
+        },
+        "unread": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "EmailMessage",
+      "type": "object"
+    },
+    "InboxItem": {
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "warn",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "ts": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ts",
+        "channel",
+        "severity",
+        "title",
+        "body"
+      ],
+      "title": "InboxItem",
+      "type": "object"
+    },
+    "SessionSnapshot": {
+      "description": "One agent session, normalized across runtimes (Claude, auto_runtime\ncaptain tracks, Codex). The hub's \"all my sessions\" surface reads these.",
+      "properties": {
+        "cwd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "title",
+        "updated_at"
+      ],
+      "title": "SessionSnapshot",
+      "type": "object"
+    },
+    "ToolSnapshot": {
+      "description": "One MCP server the operator has registered. Safe projection \u2014 names/transport/scope\nonly, never args/headers/urls/env (those carry tokens).",
+      "properties": {
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "transport",
+        "source"
+      ],
+      "title": "ToolSnapshot",
+      "type": "object"
+    }
+  },
+  "$id": "https://chad-fleet/hub-contracts/snapshot.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "apps": {
+      "items": {
+        "$ref": "#/$defs/AppSnapshot"
+      },
+      "type": "array"
+    },
+    "calendar": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/CalendarEvent"
+      },
+      "type": "array"
+    },
+    "email": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/EmailMessage"
+      },
+      "type": "array"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "inbox_recent": {
+      "items": {
+        "$ref": "#/$defs/InboxItem"
+      },
+      "type": "array"
+    },
+    "sessions": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SessionSnapshot"
+      },
+      "type": "array"
+    },
+    "summary": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "tools": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ToolSnapshot"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "generated_at",
+    "apps",
+    "inbox_recent",
+    "summary"
+  ],
+  "title": "FleetState",
+  "type": "object"
+}
