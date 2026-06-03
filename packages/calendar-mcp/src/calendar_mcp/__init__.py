@@ -6,6 +6,6 @@ both obtaining the single backend from `get_backend()`.
 
 from __future__ import annotations
 
-from .backend import CalendarBackend, CalDavBackend, get_backend
+from .backend import CalendarBackend, CalDavBackend, GoogleCalendarBackend, get_backend
 
-__all__ = ["CalendarBackend", "CalDavBackend", "get_backend"]
+__all__ = ["CalendarBackend", "CalDavBackend", "GoogleCalendarBackend", "get_backend"]
