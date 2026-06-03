@@ -1,57 +1,12 @@
-"""State source protocol and concrete implementations."""
+"""Obsessive-loop run-state source."""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
-from typing import Protocol, runtime_checkable
 
-from .types import InboxItem
-
-_DEFAULT_REGISTRY_BASE = Path.home() / ".chad" / "fleet" / "registry"
 _DEFAULT_OL_STATE_ROOT = Path.home() / ".claude" / "state" / "obsessive-loop"
-_DEFAULT_INBOX_PATH = Path.home() / ".chad" / "notifier" / "inbox.jsonl"
-
-
-@runtime_checkable
-class StateSource(Protocol):
-    name: str
-
-    def fetch(self) -> dict: ...
-
-
-class RegistrySource:
-    """Reads tracked apps from the tracked-app-registry package."""
-
-    name = "tracked-app-registry"
-
-    def __init__(self, registry_dir: Path | None = None) -> None:
-        self._registry_dir = registry_dir
-
-    def fetch(self) -> dict:
-        """Returns {"apps": [TrackedApp.model_dump()...]}."""
-        from tracked_app_registry import Registry
-
-        kwargs: dict = {}
-        if self._registry_dir is not None:
-            kwargs["view_path"] = self._registry_dir / "apps.json"
-            kwargs["events_path"] = self._registry_dir / "events.jsonl"
-            registry = Registry(**kwargs)
-        else:
-            env_dir = os.environ.get("CHAD_FLEET_REGISTRY_DIR")
-            if env_dir:
-                d = Path(env_dir)
-                registry = Registry(
-                    view_path=d / "apps.json",
-                    events_path=d / "events.jsonl",
-                )
-            else:
-                registry = Registry()
-
-        apps = registry.list()
-        return {"apps": [a.model_dump(mode="json") for a in apps]}
 
 
 class ObsessiveLoopSource:
@@ -167,57 +122,3 @@ class ObsessiveLoopSource:
                     runs.append(run_data)
 
         return {"runs": runs}
-
-
-class InboxSource:
-    """Reads notification inbox from a JSONL file."""
-
-    name = "notifier-inbox"
-
-    def __init__(self, inbox_path: Path | None = None, last_n: int = 50) -> None:
-        self._inbox_path = inbox_path
-        self._last_n = last_n
-
-    def _resolve_path(self) -> Path:
-        if self._inbox_path is not None:
-            return self._inbox_path
-        env = os.environ.get("CHAD_NOTIFIER_INBOX_PATH")
-        if env:
-            return Path(env)
-        return _DEFAULT_INBOX_PATH
-
-    def fetch(self) -> dict:
-        """Returns {"items": [InboxItem...]}."""
-        path = self._resolve_path()
-        if not path.exists():
-            return {"items": []}
-
-        lines = []
-        try:
-            lines = path.read_text().splitlines()
-        except OSError:
-            return {"items": []}
-
-        # Take last N non-empty lines
-        raw_lines = [l.strip() for l in lines if l.strip()]
-        tail = raw_lines[-self._last_n :]
-
-        items = []
-        for line in tail:
-            try:
-                record = json.loads(line)
-                item = InboxItem.model_validate(record)
-                items.append(item.model_dump(mode="json"))
-            except (json.JSONDecodeError, Exception):
-                pass
-
-        return {"items": items}
-
-
-class MemorySource:
-    """Stub for future omni-mem integration. Returns empty list."""
-
-    name = "omni-mem"
-
-    def fetch(self) -> dict:
-        return {"memories": []}

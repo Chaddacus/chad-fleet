@@ -5,8 +5,23 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from .sources import InboxSource, ObsessiveLoopSource, RegistrySource, StateSource
-from .types import AppSnapshot, FleetState, InboxItem
+from .sources import (
+    EmailSource,
+    InboxSource,
+    ObsessiveLoopSource,
+    RegistrySource,
+    SessionsSource,
+    StateSource,
+    ToolsSource,
+)
+from .types import (
+    AppSnapshot,
+    EmailMessage,
+    FleetState,
+    InboxItem,
+    SessionSnapshot,
+    ToolSnapshot,
+)
 
 _UNMATCHED_ID = "_unmatched"
 
@@ -16,7 +31,14 @@ class Aggregator:
 
     def __init__(self, sources: list[StateSource] | None = None) -> None:
         if sources is None:
-            sources = [RegistrySource(), ObsessiveLoopSource(), InboxSource()]
+            sources = [
+                RegistrySource(),
+                ObsessiveLoopSource(),
+                InboxSource(),
+                SessionsSource(),
+                ToolsSource(),
+                EmailSource(),
+            ]
         self._sources = sources
 
     def _source(self, name: str) -> StateSource | None:
@@ -42,6 +64,21 @@ class Aggregator:
         raw_inbox_items: list[dict] = []
         if inbox_src is not None:
             raw_inbox_items = inbox_src.fetch().get("items", [])
+
+        sessions_src = self._source("sessions")
+        raw_sessions: list[dict] = []
+        if sessions_src is not None:
+            raw_sessions = sessions_src.fetch().get("sessions", [])
+
+        tools_src = self._source("tools")
+        raw_tools: list[dict] = []
+        if tools_src is not None:
+            raw_tools = tools_src.fetch().get("tools", [])
+
+        email_src = self._source("email")
+        raw_email: list[dict] = []
+        if email_src is not None:
+            raw_email = email_src.fetch().get("email", [])
 
         # --- pair runs to apps by repo_path ---
         # Build index: repo_path -> app_id
@@ -120,6 +157,30 @@ class Aggregator:
             except Exception:
                 pass
 
+        # --- sessions (all runtimes) ---
+        sessions: list[SessionSnapshot] = []
+        for s in raw_sessions:
+            try:
+                sessions.append(SessionSnapshot.model_validate(s))
+            except Exception:
+                pass
+
+        # --- tools (registered MCP servers) ---
+        tools: list[ToolSnapshot] = []
+        for t in raw_tools:
+            try:
+                tools.append(ToolSnapshot.model_validate(t))
+            except Exception:
+                pass
+
+        # --- email (recent inbox via the connector) ---
+        email: list[EmailMessage] = []
+        for m in raw_email:
+            try:
+                email.append(EmailMessage.model_validate(m))
+            except Exception:
+                pass
+
         # --- summary counts ---
         by_state: dict[str, int] = defaultdict(int)
         blocked_count = 0
@@ -128,6 +189,10 @@ class Aggregator:
             if app.state == "blocked":
                 blocked_count += 1
 
+        sessions_by_source: dict[str, int] = defaultdict(int)
+        for s in sessions:
+            sessions_by_source[s.source] += 1
+
         summary = {
             "total_apps": len(apps),
             "by_state": dict(by_state),
@@ -135,11 +200,19 @@ class Aggregator:
             "total_runs": len(ol_runs),
             "unmatched_runs": len(unmatched_runs),
             "inbox_count": len(inbox_recent),
+            "session_count": len(sessions),
+            "sessions_by_source": dict(sessions_by_source),
+            "tool_count": len(tools),
+            "email_count": len(email),
+            "email_unread": sum(1 for m in email if m.unread),
         }
 
         return FleetState(
             generated_at=datetime.now(UTC),
             apps=apps,
             inbox_recent=inbox_recent,
+            sessions=sessions,
+            tools=tools,
+            email=email,
             summary=summary,
         )
