@@ -1,0 +1,14 @@
+{
+  "request": {
+    "model": "admiral",
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "- helm: add a health endpoint" }
+    ]
+  },
+  "chunk": {
+    "choices": [
+      { "delta": { "content": "Admiral — discovery across 1 task" }, "finish_reason": null }
+    ]
+  }
+}

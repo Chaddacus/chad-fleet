@@ -1,0 +1,55 @@
+{
+  "generated_at": "2026-06-02T18:30:00+00:00",
+  "apps": [
+    {
+      "id": "helm",
+      "name": "Helm",
+      "state": "running",
+      "mode": "obsessive",
+      "cadence": "5m",
+      "owner_brand": "cloudwarriors",
+      "last_progress_at": "2026-06-02T18:25:00+00:00",
+      "blocked_reason": null,
+      "obsessive_loop_runs": [
+        { "run_id": "r-1", "status": "passed", "weighted_avg": 0.92 }
+      ],
+      "baseline": { "score": 0.88 },
+      "metadata": { "repo_path": "/Users/x/code/helm" }
+    }
+  ],
+  "inbox_recent": [
+    {
+      "ts": "2026-06-02T18:20:00+00:00",
+      "channel": "fleet",
+      "severity": "warn",
+      "title": "Captain stalled",
+      "body": "trk-abc has not progressed in 20m"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "trk-deadbeef",
+      "source": "auto-runtime",
+      "title": "build the hub",
+      "cwd": "/Users/x/code/chad-fleet",
+      "updated_at": "2026-06-02T18:28:00+00:00",
+      "status": "RUNNING"
+    }
+  ],
+  "tools": [
+    { "name": "omni-mem", "transport": "stdio", "source": "user", "detail": "omni-mem" },
+    { "name": "dev-gateway", "transport": "http", "source": "user", "detail": "gw.example.com" }
+  ],
+  "email": [
+    { "id": "42", "subject": "Re: launch", "from_": "ada@example.com", "date": "Mon, 2 Jun 2026 09:00:00 +0000", "unread": true, "snippet": "" }
+  ],
+  "summary": {
+    "total_apps": 1,
+    "by_state": { "running": 1 },
+    "blocked_count": 0,
+    "session_count": 1,
+    "tool_count": 2,
+    "email_count": 1,
+    "email_unread": 1
+  }
+}
