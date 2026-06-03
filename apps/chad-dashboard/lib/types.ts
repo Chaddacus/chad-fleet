@@ -1,42 +1,37 @@
-// Types mirroring state-aggregator's Python models (FleetState, AppSnapshot, InboxItem)
+// Snapshot contract types — GENERATED from the pydantic source of truth and re-exported
+// here so the dashboard has a single import surface. Do not hand-duplicate these; edit the
+// pydantic models in state_aggregator.types and run `npm run codegen` in packages/hub-contracts.
+export type {
+  AppSnapshot,
+  FleetState,
+  InboxItem,
+  SessionSnapshot,
+  ToolSnapshot,
+  EmailMessage,
+} from '../../../packages/hub-contracts/ts/snapshot';
 
+// Admiral chat contract (hand-authored OpenAI subset — see hub-contracts/schema/admiral-chat).
+export type {
+  ChatMessage,
+  ChatRequest,
+  ChatCompletionChunk,
+} from '../../../packages/hub-contracts/ts/admiral-chat';
+
+import type { FleetState, InboxItem } from '../../../packages/hub-contracts/ts/snapshot';
+
+// --- Dashboard-local view helpers (NOT part of the cross-boundary contract) ---
+
+// Severity is inlined in the contract's InboxItem; named here for component ergonomics.
+export type Severity = 'info' | 'warn' | 'critical';
+
+// A richer view of an obsessive-loop run row. The contract types these as opaque dicts
+// (`Record<string, unknown>`); this is the dashboard's read-view of the fields it renders.
 export interface ObsessiveLoopRun {
   run_id: string;
   branch?: string;
   status?: string;
   weighted_avg?: number;
   [key: string]: unknown;
-}
-
-export interface AppSnapshot {
-  id: string;
-  name: string;
-  state: string;
-  mode: string;
-  cadence: string;
-  owner_brand: string;
-  last_progress_at: string; // ISO datetime string
-  blocked_reason?: string | null;
-  obsessive_loop_runs: ObsessiveLoopRun[];
-  baseline?: Record<string, unknown> | null;
-  metadata: Record<string, unknown>;
-}
-
-export type Severity = 'info' | 'warn' | 'critical';
-
-export interface InboxItem {
-  ts: string; // ISO datetime string
-  channel: string;
-  severity: Severity;
-  title: string;
-  body: string;
-}
-
-export interface FleetState {
-  generated_at: string; // ISO datetime string
-  apps: AppSnapshot[];
-  inbox_recent: InboxItem[];
-  summary: Record<string, unknown>;
 }
 
 export interface FleetStateResponse extends FleetState {
