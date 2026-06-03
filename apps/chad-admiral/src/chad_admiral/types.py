@@ -52,7 +52,7 @@ class CaptainDossier(BaseModel):
 class EscalationPacket(BaseModel):
     """captain -> admiral -> user. Reply travels back down by correlation_id (D6).
 
-    Defined now so Slice 3 (escalation routing to Odysseus) has a stable contract.
+    Defined now so Slice 3 (escalation routing through the hub) has a stable contract.
     Sibling to the Evidence/Closure packets in fleet-orchestration-doctrine.md.
     """
     correlation_id: str              # routes the reply to the exact captain/slice

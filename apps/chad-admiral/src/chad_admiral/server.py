@@ -1,6 +1,6 @@
 """Admiral as an OpenAI-compatible service — the real replacement for stub_admiral.
 
-Odysseus (the HUB front door) talks to this exactly as it would any model:
+The hub front door (the chad-dashboard) talks to this exactly as it would any model:
     GET  /v1/models           -> the "admiral" model
     POST /v1/chat/completions -> streaming or non-streaming OpenAI shape
 
@@ -72,7 +72,7 @@ async def chat_completions(request: Request):
         first["choices"][0]["delta"] = {"role": "assistant"}
         yield f"data: {json.dumps(first)}\n\n"
         # reply_stream yields text fragments; emit each as a delta so dispatch
-        # progress (captain heartbeats, results) streams live to Odysseus.
+        # progress (captain heartbeats, results) streams live to the dashboard.
         for fragment in reply_stream(messages):
             yield f"data: {json.dumps(_chunk(fragment))}\n\n"
         yield f"data: {json.dumps(_chunk(None, finish='stop'))}\n\n"

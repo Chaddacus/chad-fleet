@@ -1,6 +1,6 @@
 """The admiral state machine: chat messages -> reply (+ dispatch side-effects).
 
-Stateless by design — Odysseus sends the full message history on every call, so
+Stateless by design — the client sends the full message history on every call, so
 the admiral reconstructs its state from the transcript (HUB_ARCHITECTURE's
 frontload-heavy loop maps cleanly onto a chat thread):
 
@@ -26,10 +26,10 @@ from .intake import looks_like_intake, parse_task_list
 from .types import DiscoveryResult, TaskItem
 
 # --- S3 in-band escalation -------------------------------------------------
-# The admiral is stateless (Odysseus replays the full transcript each turn), so a
+# The admiral is stateless (the client replays the full transcript each turn), so a
 # parked captain's resume state must live IN the chat. We embed it in an HTML
 # comment on the escalation message: invisible in the rendered chat, but it
-# round-trips in the message history Odysseus sends back. On the operator's next
+# round-trips in the message history the client sends back. On the operator's next
 # turn we parse it and resume the exact captain.
 _SENTINEL_PREFIX = "<!--ADMIRAL-ESCALATION:"
 _SENTINEL_SUFFIX = "-->"
