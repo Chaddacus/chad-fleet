@@ -74,6 +74,39 @@
       "title": "AppSnapshot",
       "type": "object"
     },
+    "CalendarEvent": {
+      "description": "One upcoming calendar event \u2014 read-fast list view (read via the calendar connector).",
+      "properties": {
+        "all_day": {
+          "default": false,
+          "type": "boolean"
+        },
+        "end": {
+          "default": "",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "location": {
+          "default": "",
+          "type": "string"
+        },
+        "start": {
+          "default": "",
+          "type": "string"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "CalendarEvent",
+      "type": "object"
+    },
     "EmailMessage": {
       "description": "One inbox message \u2014 read-fast list view (no body; full body via the email-mcp read tool).",
       "properties": {
@@ -228,6 +261,13 @@
     "apps": {
       "items": {
         "$ref": "#/$defs/AppSnapshot"
+      },
+      "type": "array"
+    },
+    "calendar": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/CalendarEvent"
       },
       "type": "array"
     },

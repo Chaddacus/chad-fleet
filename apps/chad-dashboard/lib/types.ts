@@ -8,6 +8,7 @@ export type {
   SessionSnapshot,
   ToolSnapshot,
   EmailMessage,
+  CalendarEvent,
 } from '../../../packages/hub-contracts/ts/snapshot';
 
 // Admiral chat contract (hand-authored OpenAI subset — see hub-contracts/schema/admiral-chat).

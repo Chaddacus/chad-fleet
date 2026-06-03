@@ -32,6 +32,7 @@ HUB_SOURCE_ROOTS = [
     "packages/genui-renderer/src",
     "packages/hub-contracts",
     "packages/email-mcp/src",
+    "packages/calendar-mcp/src",
 ]
 
 # Hub package manifests that must not declare a dependency on proprietary packages.
@@ -41,6 +42,7 @@ HUB_MANIFESTS = [
     "packages/genui-renderer/package.json",
     "apps/chad-dashboard/package.json",
     "packages/email-mcp/pyproject.toml",
+    "packages/calendar-mcp/pyproject.toml",
 ]
 
 # Proprietary import names (python module names + npm package names).

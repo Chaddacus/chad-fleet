@@ -13,6 +13,7 @@ const navLinks = [
   { href: '/', label: 'Chat' },
   { href: '/sessions', label: 'Sessions' },
   { href: '/email', label: 'Email' },
+  { href: '/calendar', label: 'Calendar' },
   { href: '/tools', label: 'Tools' },
   { href: '/inbox', label: 'Inbox' },
   { href: '/apps', label: 'Apps' },

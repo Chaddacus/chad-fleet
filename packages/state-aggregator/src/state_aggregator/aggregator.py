@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 
 from .sources import (
+    CalendarSource,
     EmailSource,
     InboxSource,
     ObsessiveLoopSource,
@@ -16,6 +17,7 @@ from .sources import (
 )
 from .types import (
     AppSnapshot,
+    CalendarEvent,
     EmailMessage,
     FleetState,
     InboxItem,
@@ -38,6 +40,7 @@ class Aggregator:
                 SessionsSource(),
                 ToolsSource(),
                 EmailSource(),
+                CalendarSource(),
             ]
         self._sources = sources
 
@@ -79,6 +82,11 @@ class Aggregator:
         raw_email: list[dict] = []
         if email_src is not None:
             raw_email = email_src.fetch().get("email", [])
+
+        calendar_src = self._source("calendar")
+        raw_calendar: list[dict] = []
+        if calendar_src is not None:
+            raw_calendar = calendar_src.fetch().get("calendar", [])
 
         # --- pair runs to apps by repo_path ---
         # Build index: repo_path -> app_id
@@ -181,6 +189,14 @@ class Aggregator:
             except Exception:
                 pass
 
+        # --- calendar (upcoming events via the connector) ---
+        calendar: list[CalendarEvent] = []
+        for ev in raw_calendar:
+            try:
+                calendar.append(CalendarEvent.model_validate(ev))
+            except Exception:
+                pass
+
         # --- summary counts ---
         by_state: dict[str, int] = defaultdict(int)
         blocked_count = 0
@@ -205,6 +221,7 @@ class Aggregator:
             "tool_count": len(tools),
             "email_count": len(email),
             "email_unread": sum(1 for m in email if m.unread),
+            "calendar_count": len(calendar),
         }
 
         return FleetState(
@@ -214,5 +231,6 @@ class Aggregator:
             sessions=sessions,
             tools=tools,
             email=email,
+            calendar=calendar,
             summary=summary,
         )

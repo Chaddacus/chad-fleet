@@ -7,16 +7,18 @@ WORKDIR /app
 
 COPY packages/tracked-app-registry packages/tracked-app-registry
 COPY packages/email-mcp packages/email-mcp
+COPY packages/calendar-mcp packages/calendar-mcp
 COPY packages/state-aggregator packages/state-aggregator
 
 ENV VIRTUAL_ENV=/opt/venv
 # --no-sources: ignore state-aggregator's [tool.uv.sources] workspace directives (there is no
 # workspace here by design — that would pull proprietary captain-core); the local package dirs
-# passed below satisfy the email-mcp / tracked-app-registry name deps directly.
+# passed below satisfy the email-mcp / calendar-mcp / tracked-app-registry name deps directly.
 RUN uv venv "$VIRTUAL_ENV" \
  && uv pip install --no-sources --python "$VIRTUAL_ENV/bin/python" \
       ./packages/tracked-app-registry \
       ./packages/email-mcp \
+      ./packages/calendar-mcp \
       ./packages/state-aggregator
 ENV PATH="/opt/venv/bin:$PATH"
 

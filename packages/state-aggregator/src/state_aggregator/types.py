@@ -65,6 +65,17 @@ class EmailMessage(BaseModel):
     snippet: str = ""
 
 
+class CalendarEvent(BaseModel):
+    """One upcoming calendar event — read-fast list view (read via the calendar connector)."""
+
+    id: str
+    summary: str = ""
+    start: str = ""  # ISO datetime (or date for all-day)
+    end: str = ""
+    location: str = ""
+    all_day: bool = False
+
+
 class FleetState(BaseModel):
     generated_at: datetime
     apps: list[AppSnapshot]
@@ -72,4 +83,5 @@ class FleetState(BaseModel):
     sessions: list[SessionSnapshot] = []  # most-recent agent sessions, all runtimes
     tools: list[ToolSnapshot] = []  # registered MCP servers (safe projection)
     email: list[EmailMessage] = []  # recent inbox messages (read via the email connector)
+    calendar: list[CalendarEvent] = []  # upcoming events (read via the calendar connector)
     summary: dict  # cross-cut counts: total_apps, by_state, blocked_count, etc.

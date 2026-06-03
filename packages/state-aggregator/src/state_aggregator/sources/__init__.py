@@ -8,6 +8,7 @@ it here; nothing else changes.
 from __future__ import annotations
 
 from .base import StateSource
+from .calendar import CalendarSource
 from .email import EmailSource
 from .inbox import InboxSource
 from .memory import MemorySource
@@ -25,4 +26,5 @@ __all__ = [
     "SessionsSource",
     "ToolsSource",
     "EmailSource",
+    "CalendarSource",
 ]

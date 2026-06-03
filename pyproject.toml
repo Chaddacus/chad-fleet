@@ -21,6 +21,7 @@ members = [
     "packages/voice-drafter",
     "packages/state-aggregator",
     "packages/email-mcp",
+    "packages/calendar-mcp",
     "packages/notifier-hub/core",
     "packages/notifier-hub/adapters/dashboard-inbox",
     "packages/notifier-hub/adapters/ntfy",

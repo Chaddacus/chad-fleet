@@ -2,6 +2,7 @@
 
 export interface FleetState {
   apps: AppSnapshot[];
+  calendar?: CalendarEvent[];
   email?: EmailMessage[];
   generated_at: string;
   inbox_recent: InboxItem[];
@@ -32,6 +33,17 @@ export interface AppSnapshot {
   }[];
   owner_brand: string;
   state: string;
+}
+/**
+ * One upcoming calendar event — read-fast list view (read via the calendar connector).
+ */
+export interface CalendarEvent {
+  all_day?: boolean;
+  end?: string;
+  id: string;
+  location?: string;
+  start?: string;
+  summary?: string;
 }
 /**
  * One inbox message — read-fast list view (no body; full body via the email-mcp read tool).
