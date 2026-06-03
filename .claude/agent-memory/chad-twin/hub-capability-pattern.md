@@ -27,13 +27,18 @@ call_tool over stdio returns live messages. Gotcha: `StdioServerParameters` does
 spawned server. SMTP send path validated (`scripts/smtp_validate_probe.py`: SMTP_SSL:465 login OK, no
 send). STILL boundary-gated: actual send + archive (mutate/emit on the live account).
 
-**calendar-mcp (S5, 2026-06-02):** the SAME triple, CalDAV connector. env `CALENDAR_CALDAV_URL/USER/
-PASSWORD` (app-password, same `_clean_password` U+00A0 fix). `caldav` is an optional extra
-(lazy-imported in `CalDavBackend`), so the aggregator installs without it; unconfigured/missing-lib ⇒
-[]. stdio MCP `calendar_list`/`calendar_create`. CalendarSource wired into aggregator (`calendar_count`).
-Auth model chosen = CalDAV+app-password (mirrors email, no OAuth ceremony, owned). STRUCTURAL +
-unit-tested (injected fake); **live CalDAV UNVERIFIED** until a calendar app-password is in the vault —
-the real `CalDavBackend` vobject parsing / `save_event` iCal path is untested against a live server.
+**calendar-mcp (S5):** the SAME triple. **Primary backend = Google Calendar API via a SERVICE
+ACCOUNT** (Chad chose Google directly over CalDAV, 2026-06-02). env `GOOGLE_CALENDAR_SA_JSON` (full
+SA key JSON) + `GOOGLE_CALENDAR_ID` (his gmail = the calendar shared with the SA). `CalDavBackend` is
+a demoted fallback behind the same `CalendarBackend` seam; `get_backend()` prefers Google. google
+client libs (`google-api-python-client`, `google-auth`) are BASE deps of calendar-mcp (the real
+connector dep); `caldav` is an optional extra. stdio MCP `calendar_list`/`calendar_create`.
+**LIVE-VERIFIED 2026-06-02**: read (real event off chad3124@gmail.com) + create round-trip
+(`scripts/calendar_action_probe.py`: insert→read-back→delete, no residue), and the running launchd
+aggregator surfaces `calendar_count` from the live calendar. Setup that worked: GCP project
+`chad-fleet-calendar` → enable Calendar API → SA `hub-calendar@...iam.gserviceaccount.com` → JSON key
+→ share the calendar with the SA email ("Make changes to events") → 2 vault secrets. Service accounts
+read/write a shared consumer-Gmail calendar fine; they CANNOT invite guests on consumer Gmail.
 
 **Gmail app-password gotcha (live-verified fix):** Google's UI copies app passwords with
 non-breaking spaces (U+00A0) between the 4-char groups; imaplib's ascii LOGIN encoder throws
