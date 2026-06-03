@@ -19,9 +19,21 @@ swappable:
 
 **email-mcp specifics:** env `EMAIL_IMAP_HOST/PORT/USER/PASSWORD`, `EMAIL_SMTP_HOST/PORT`. Unconfigured
 ⇒ `get_backend()` returns None ⇒ source returns [] (hub runs without email). Run email-mcp tests with
-`cd packages/email-mcp && uv run --extra dev python -m pytest tests/` (its own env; the root .venv
-lacks pytest + the package). The real `ImapBackend`/SMTP + MCP wire protocol are UNVERIFIED until a
-live account + the `mcp` package exist — structural-only so far.
+`cd packages/email-mcp && uv run --extra dev python -m pytest tests/` (its own env). `mcp` is an
+optional extra (`server`), lazy-imported in server.py, kept off the aggregator's read-path install.
+**MCP wire is now PROVEN** (2026-06-02 via `scripts/email_mcp_wire_probe.py`): init→list_tools→
+call_tool over stdio returns live messages. Gotcha: `StdioServerParameters` does NOT inherit
+`os.environ` — a captain dispatching the MCP must pass `env=dict(os.environ)` so EMAIL_* reach the
+spawned server. SMTP send path validated (`scripts/smtp_validate_probe.py`: SMTP_SSL:465 login OK, no
+send). STILL boundary-gated: actual send + archive (mutate/emit on the live account).
+
+**calendar-mcp (S5, 2026-06-02):** the SAME triple, CalDAV connector. env `CALENDAR_CALDAV_URL/USER/
+PASSWORD` (app-password, same `_clean_password` U+00A0 fix). `caldav` is an optional extra
+(lazy-imported in `CalDavBackend`), so the aggregator installs without it; unconfigured/missing-lib ⇒
+[]. stdio MCP `calendar_list`/`calendar_create`. CalendarSource wired into aggregator (`calendar_count`).
+Auth model chosen = CalDAV+app-password (mirrors email, no OAuth ceremony, owned). STRUCTURAL +
+unit-tested (injected fake); **live CalDAV UNVERIFIED** until a calendar app-password is in the vault —
+the real `CalDavBackend` vobject parsing / `save_event` iCal path is untested against a live server.
 
 **Gmail app-password gotcha (live-verified fix):** Google's UI copies app passwords with
 non-breaking spaces (U+00A0) between the 4-char groups; imaplib's ascii LOGIN encoder throws
