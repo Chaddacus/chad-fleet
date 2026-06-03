@@ -1,0 +1,13 @@
+# view-registry (:8108). Standalone package (not a workspace member). Build context = repo root.
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+WORKDIR /app
+
+COPY packages/view-registry packages/view-registry
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN uv venv "$VIRTUAL_ENV" \
+ && uv pip install --python "$VIRTUAL_ENV/bin/python" ./packages/view-registry
+ENV PATH="/opt/venv/bin:$PATH"
+
+EXPOSE 8108
+CMD ["uvicorn", "view_registry.api:app", "--host", "0.0.0.0", "--port", "8108"]
